@@ -6,6 +6,7 @@ import { App } from './App'
 import './index.css'
 import { Ingest } from './pages/Ingest'
 import { JobProgress } from './pages/JobProgress'
+import { LiveWatch } from './pages/LiveWatch'
 import { Review } from './pages/Review'
 import { Settings } from './pages/Settings'
 
@@ -17,6 +18,7 @@ const router = createBrowserRouter([
       { index: true, element: <Ingest /> },
       { path: 'jobs/:jobId', element: <JobProgress /> },
       { path: 'jobs/:jobId/clips', element: <Review /> },
+      { path: 'live', element: <LiveWatch /> },
       { path: 'settings', element: <Settings /> },
     ],
   },
