@@ -323,8 +323,16 @@ class LiveManager:
     # -- lifecycle -------------------------------------------------------------
 
     async def start(self) -> None:
-        """Load persisted streams and launch their watchers. Idempotent."""
+        """Load persisted streams and launch their watchers. Idempotent.
+
+        A no-op while the feature flag ``live.enabled`` is off: watchers,
+        capture subprocesses, and clip workers must not exist at all in that
+        state, not merely idle — a disabled feature should cost nothing.
+        """
         if self._started:
+            return
+        if not self._live.enabled:
+            log.info("Live Watch disabled in settings; manager not started.")
             return
         self._started = True
         loop = asyncio.get_running_loop()
