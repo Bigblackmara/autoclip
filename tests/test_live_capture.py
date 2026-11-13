@@ -24,13 +24,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from autoclip.live.buffer import RingBuffer, segment_name
 from autoclip.live.capture import (
-    CaptureError,
     DRAIN_GRACE_S,
     SEGMENT_TIME_S,
     TAILER_POLL_S,
+    CaptureError,
     StreamCapture,
     index_from_name,
     is_segment_name,
@@ -240,9 +239,7 @@ class TestStartContract:
             spawned.append(FakeProc())
             return spawned[-1]
 
-        cap = make_capture(
-            RingBuffer(tmp_path / "buf"), resolver=slow_resolver, spawn=spawn
-        )
+        cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=slow_resolver, spawn=spawn)
         starter = threading.Thread(target=cap.start)
         starter.start()
         # Let the resolver block, then stop() before it returns.
@@ -609,9 +606,7 @@ class TestResolutionFunctions:
         class FakeStream:
             url = "http://real/hls.m3u8"
 
-        fake_session = types.SimpleNamespace(
-            streams=lambda url: {"best": FakeStream()}
-        )
+        fake_session = types.SimpleNamespace(streams=lambda url: {"best": FakeStream()})
         streamlink_pkg = types.ModuleType("streamlink")
         streamlink_session = types.ModuleType("streamlink.session")
         streamlink_session.Streamlink = lambda: fake_session
@@ -634,8 +629,7 @@ class TestKillProcessTree:
         monkeypatch.setattr(
             subprocess,
             "run",
-            lambda cmd, **kwargs: commands.append(list(cmd))
-            or subprocess.CompletedProcess(cmd, 0),
+            lambda cmd, **kwargs: commands.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0),
         )
         kill_process_tree(1234)
         assert commands == [["taskkill", "/PID", "1234", "/T", "/F"]]

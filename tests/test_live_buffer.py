@@ -16,11 +16,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from autoclip.live.buffer import (
     PENDING_CAP_BYTES,
-    SEGMENT_S,
     SEGMENT_EXT,
+    SEGMENT_S,
     RingBuffer,
     SegmentInfo,
     segment_name,
@@ -278,9 +277,7 @@ class TestExtract:
         commit_n(buf, 3, size=512)
         target = tmp_path / "all.ts"
         buf.extract(0.0, 18.0, target)
-        expected = b"".join(
-            (buf.directory / segment_name(i)).read_bytes() for i in range(3)
-        )
+        expected = b"".join((buf.directory / segment_name(i)).read_bytes() for i in range(3))
         assert target.read_bytes() == expected
 
     def test_extract_clamps_start_to_what_exists(self, tmp_path: Path) -> None:
@@ -460,9 +457,7 @@ class TestPrune:
         # exact corruption scissors paths assume can't happen.
         assert [s.index for s in buf.segments] == [9]
         assert (buf.directory / segment_name(9)).exists()
-        assert not any(
-            (buf.directory / segment_name(i)).exists() for i in range(9)
-        )
+        assert not any((buf.directory / segment_name(i)).exists() for i in range(9))
 
     def test_prune_nowdefaults_to_newest(self, tmp_path: Path) -> None:
         buf = RingBuffer(tmp_path / "buf", retain_minutes=1 / 60)  # 1s
@@ -489,9 +484,7 @@ class TestClose:
         buf = RingBuffer(tmp_path / "buf")
         commit_n(buf, 3)
         buf.close()
-        assert all(
-            (buf.directory / segment_name(i)).exists() for i in range(3)
-        )
+        assert all((buf.directory / segment_name(i)).exists() for i in range(3))
 
     def test_close_is_idempotent(self, tmp_path: Path) -> None:
         buf = RingBuffer(tmp_path / "buf")
