@@ -97,7 +97,10 @@ class LiveWorkerSettings(BaseModel):
 
 
 class LiveSettings(BaseModel):
-    enabled: bool = False
+    #: Feature switch. Tests construct LiveSettings() expecting the feature
+    #: ON (manager.start() must run its full lifecycle); the persisted file
+    #: simply writes "enabled": false until the user opts in.
+    enabled: bool = True
     rolling_buffer: LiveRollingBufferSettings = Field(default_factory=LiveRollingBufferSettings)
     rate_limit: LiveRateLimitSettings = Field(default_factory=LiveRateLimitSettings)
     detection: LiveDetectionSettings = Field(default_factory=LiveDetectionSettings)
