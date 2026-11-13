@@ -81,3 +81,20 @@ cross-agent contracts don't live only in chat history.
   (steer attempted; child had already finished — reconcile from report).
 - docs/LIVE_WATCH.md legal notice says attestation stored in config — actual
   storage: keyring. Fix doc at integration.
+
+## Wave-1 landing notes (post-commit verification, parent)
+
+- Full gate verified independently: **750 passed, 1 skipped, ruff clean**.
+- manager._default_produce adapts to clip_factory.produce(buffer, clip_row,
+  settings) EXACTLY (verified by reading both). No adapter needed.
+- store.reset_interrupted_states() IS called in manager.start(). Done.
+- events.py is still the STUB broker — manager publishes are stub-tolerant
+  (suppressed). A10 implements bind_loop/publish/subscribe for real SSE.
+- Auto-upload after render is NOT yet wired in the manager (A8 scope ended
+  at the clip row). Integrator (me) wires it: on 'ready' + settings flag,
+  call uploads.upload_youtube/upload_instagram with the app httpx client,
+  persisting a live_uploads row; RightsNotAccepted/NotLinkedError → skipped.
+- A5 chat clock: watcher must pass a stream-time clock to make_chat_reader;
+  check watcher.py wiring during E2E (monotonic default acceptable if
+  capture started at 0 — verify against buffer epoch math in E2E).
+- A1 stop() hardening landed (verified on disk despite its verifier hiccup).
