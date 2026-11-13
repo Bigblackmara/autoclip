@@ -189,9 +189,13 @@ class StreamCapture:
         self._stop_flag.set()
         self._kill_tree()
         current = threading.current_thread()
+        # Bounded join: the tailer polls at most one more interval and the
+        # waiter exits with the process it watches; anything past this is a
+        # leak the caller should see, not wait on silently.
+        join_timeout = self.drain_grace_s + max(self.poll_s, 1.0)
         for t in (self._tailer, self._waiter):
             if t is not None and t is not current:
-                t.join(timeout=max(self.drain_grace_s * 2, 5.0))
+                t.join(timeout=join_timeout)
         self._stop_done.set()
 
     def wait(self, timeout: float | None = None) -> int | None:
@@ -388,8 +392,12 @@ class StreamCapture:
             kill_process_tree(proc.pid)
         except Exception:
             log.exception("tree kill failed for pid %s; falling back to kill()", proc.pid)
-            with contextlib.suppress(OSError):
-                proc.kill()
+        # Also signal the direct child: idempotent after taskkill /T (the
+        # process is either gone or dying), and it is what unblocks a wait()
+        # promptly on POSIX where killpg covers the group without marking
+        # this Popen handle exited.
+        with contextlib.suppress(OSError, AttributeError):
+            proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
