@@ -78,6 +78,14 @@ gpu = [
   "nvidia-cublas-cu12>=12.4; platform_system != 'Darwin'",
   "nvidia-cudnn-cu12>=9.1; platform_system != 'Darwin'",
 ]
+# Live Watch — watching and clipping live streams. streamlink is the capture
+# engine; yt-dlp (already a hard dependency) is the fallback. websocket-client
+# arrives transitively through streamlink and is what the Twitch chat reader
+# uses, so no extra entry is needed for it.
+live = [
+  "streamlink>=6.7",
+]
+
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
@@ -123,6 +131,7 @@ markers = [
   "slow: tests that run the real pipeline (deselect with '-m \"not slow\"')",
   "golden: reframe acceptance-bar tests against the golden video set",
   "e2e: full-pipeline run against real media (needs AUTOCLIP_E2E_MEDIA)",
+  "live: Live Watch tests needing a fake live source or real streamlink",
 ]
 
 [tool.mypy]
