@@ -21,10 +21,20 @@ class TokenBucket:
         self._last = time.monotonic()
 
     def try_acquire(self, n: float = 1.0) -> bool:
-        raise NotImplementedError("A4: implement")
+        """Try to spend ``n`` tokens; True when the budget allows it."""
+        self._refill()
+        if self.tokens >= n:
+            self.tokens -= n
+            return True
+        return False
 
     def _refill(self) -> None:
-        raise NotImplementedError("A4: implement")
+        now = time.monotonic()
+        elapsed = now - self._last
+        if elapsed <= 0:
+            return
+        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.rate)
+        self._last = now
 
 
 class PerStreamCooldown:
@@ -35,10 +45,21 @@ class PerStreamCooldown:
         self._last_clip_at: dict[str, float] = {}
 
     def can_trigger(self, stream_id: str, *, now: float | None = None) -> bool:
-        raise NotImplementedError("A4: implement")
+        """True when ``stream_id`` may trigger (past its cooldown)."""
+        last = self._last_clip_at.get(stream_id)
+        if last is None:
+            return True
+        current = now if now is not None else time.monotonic()
+        return (current - last) >= self.cooldown_s
 
     def mark_clip(self, stream_id: str, *, now: float | None = None) -> None:
-        raise NotImplementedError("A4: implement")
+        """Start a fresh cooldown for ``stream_id``."""
+        self._last_clip_at[stream_id] = now if now is not None else time.monotonic()
 
     def remaining(self, stream_id: str, *, now: float | None = None) -> float:
-        raise NotImplementedError("A4: implement")
+        """Seconds until ``stream_id`` may trigger again (0 when clear)."""
+        last = self._last_clip_at.get(stream_id)
+        if last is None:
+            return 0.0
+        current = now if now is not None else time.monotonic()
+        return max(0.0, self.cooldown_s - (current - last))
