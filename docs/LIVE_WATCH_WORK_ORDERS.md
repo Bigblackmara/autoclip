@@ -238,3 +238,91 @@ Report: chosen storage location + shape (A8 and A10 read it).
 Reports: each worker returns (a) what landed, (b) tests added + pass status,
 (c) stubs/assumptions, (d) anything the integrator must change. No prose
 essays — bullet lists. Write files, run the gates, report.
+
+# Live Watch — worker orders (Wave 2, independent tranche)
+
+Same rules as Wave 1: write ONLY your files, gates identical.
+
+## A7 — uploads (YouTube + Instagram, official APIs only)
+WRITE: backend/autoclip/live/uploads/youtube.py, .../instagram.py, .../tokens.py,
+backend/autoclip/live/uploads/__init__.py (docstring there), tests/test_live_uploads.py
+- tokens.py: OAuth token JSON blobs in the OS keyring via autoclip.config
+  set_secret/get_secret (keys: live_youtube_tokens, live_instagram_tokens,
+  live_youtube_client_id, live_youtube_client_secret, live_instagram_tokens).
+  Client id/secret are USER-PROVIDED (their own Google Cloud / Meta app) and
+  also live in the keyring. NEVER in config.json, never logged. Manual refresh
+  with httpx (no new deps: google-api-python-client is FORBIDDEN).
+- youtube.py: resumable upload via Data API v3
+  (POST uploadType=resumable → PUT chunks with httpx streaming client).
+  scope https://www.googleapis.com/auth/youtube.upload. Return URL + media id.
+  A rights-attestation gate: refuse to upload unless keyring flag
+  live_rights_attestation="accepted:<date>" set by the UI (A10 wires the
+  acceptance endpoint; keyring file stores just the attestation string).
+- instagram.py: IG Graph API Reels resumable upload flow
+  (POST /{ig-user-id}/media upload_type=resumable → start/append/finish
+  phases → publish). Requires an IG professional account + app review IRL;
+  code the documented flow, mock everything in tests.
+- async API surface used by manager + REST: upload_youtube(path, meta) ->
+  UploadResult, upload_instagram(path, meta) -> UploadResult,
+  youtube_status()/instagram_status() -> {connected, account}.
+  Tests: httpx.MockTransport only — zero network.
+
+## A8b — clip production (buffer range → finished vertical clip)
+WRITE: backend/autoclip/live/clip_factory.py, tests/test_live_clip_factory.py
+- produce(buffer, clip_row, settings, on_progress=None) -> ProduceResult:
+  (1) buffer.extract(window) → raw.ts in live/clips/<id>/
+  (2) ffmpeg remux/copy → normalized mp4 (exact_asset copy: container only)
+  (3) reuse pipeline: transcribe.transcribe on extracted audio,
+      reframe.build_crop_path (9:16 ReframeConfig), captions+export via
+      pipeline.export.export_clip with a synthesized ExportRequest
+      (style from live clip row, loudness from export settings)
+  (4) final.mp4 (+ .srt sidecar) written under live/clips/<id>/, paths
+  returned in ProduceResult for the manager's DB update.
+- A manager-injected produce_callable pattern is used by A8: the REAL
+  function here must match that signature exactly:
+  produce(buffer, clip_row, settings, on_progress=None) -> ProduceResult
+- Tests: pipeline stages monkeypatched for orchestration tests; one real
+  ffmpeg remux test (synthetic testsrc+sine .ts input, local encode of a
+  2-second clip) marked with pytest.mark.slow if it uses x264 — verify it
+  stays OUT of the fast suite (`-m "not slow"`).
+
+## F1 — streams dashboard component
+WRITE ONLY: frontend/src/live/StreamsPanel.tsx (self-contained; inline any
+sub-components; import only react, ../live/api, ../components/ErrorNote if
+helpful). Export `export function StreamsPanel()`.
+- streams table: label/url, state pill colored by state (watching green,
+  clipping amber, reconnecting purple, error red, waiting_for_live slate,
+  off gray), actions pause/resume/remove(confirm); global status strip from
+  liveApi.status(); add-stream form (url + label, disabled while pending).
+- SSE updates via subscribeLiveEvents applying 'state' events per row.
+- Match existing style tokens (bg-ink-900, text-ink-100, border-ink-800,
+  text-sodium-500, font-display — see pages/Settings.tsx + index.css).
+- Gate: npx tsc -p tsconfig.app.json --noEmit (NOT vite build — the
+  integrator owns the production build; parallel builds collide on dist).
+
+## F2 — clips gallery component
+WRITE ONLY: frontend/src/live/ClipsPanel.tsx. Export `export function ClipsPanel()`.
+- card grid of LiveClip (reverse-chron): 9:16 video thumb (clipMediaUrl,
+  preload=none, muted, click-to-play), title, score badge, duration, hook,
+  status badge, per-clip uploads row (listUploads), actions: upload to
+  YouTube/Instagram (uploadClip; surfaced errors), open in new tab, discard.
+- 'clip'/'clip_status' SSE events prepend/patch cards. Rights-notice line
+  pinned at the top (spec hard rule).
+- Same style tokens as F1. Gate: npx tsc -p tsconfig.app.json --noEmit.
+
+## F3 — live settings section
+WRITE ONLY: frontend/src/live/LiveSettingsSection.tsx. Export
+`export function LiveSettingsSection()`.
+- Field components copied inline (Settings.tsx's Field/NumberField/Select
+  are NOT exported — inline equivalents, do not edit Settings.tsx).
+- Sections: enable toggle, rolling buffer, rate limits, detection (audio +
+  chat), uploads (auto_upload toggles + prefixes + OAuth connect buttons
+  calling startYouTubeAuth/startInstagramAuth — open redirect_url in a new
+  tab — + status via youTubeAuthStatus/instagramAuthStatus, and a rights
+  attestation note), workers.
+- Dirty tracking + Save via liveApi.getSettings/putSettings.
+- Gate: npx tsc -p tsconfig.app.json --noEmit.
+
+Integration (integrator-owned, later): LiveWatch.tsx composes StreamsPanel +
+ClipsPanel + LiveSettingsSection; A10 REST layer; C1 CLI; app.py lifespan
+hook for LiveManager; README + docs updates; E2E.
