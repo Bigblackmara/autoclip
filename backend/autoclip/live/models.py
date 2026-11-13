@@ -15,6 +15,7 @@ other workers code against; A9 adds from_row() and store functions.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -46,6 +47,20 @@ class LiveStreamRow:
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> LiveStreamRow:
+        return cls(
+            id=row["id"],
+            url=row["url"],
+            label=row["label"],
+            enabled=bool(row["enabled"]),
+            state=row["state"],
+            state_detail=row["state_detail"],
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
 
 @dataclass
 class LiveClipRow:
@@ -69,6 +84,30 @@ class LiveClipRow:
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> LiveClipRow:
+        return cls(
+            id=row["id"],
+            stream_id=row["stream_id"],
+            status=row["status"],
+            trigger_start_s=row["trigger_start_s"],
+            trigger_end_s=row["trigger_end_s"],
+            clip_start_s=row["clip_start_s"],
+            clip_end_s=row["clip_end_s"],
+            title=row["title"],
+            score=row["score"],
+            reason=row["reason"],
+            hook=row["hook"],
+            judge_model=row["judge_model"],
+            transcript_path=row["transcript_path"],
+            rendered_path=row["rendered_path"],
+            caption_style=row["caption_style"],
+            ratio=row["ratio"],
+            error=row["error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
 
 @dataclass
 class LiveUploadRow:
@@ -81,3 +120,17 @@ class LiveUploadRow:
     error: str | None = None
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> LiveUploadRow:
+        return cls(
+            id=row["id"],
+            clip_id=row["clip_id"],
+            platform=row["platform"],
+            status=row["status"],
+            upload_url=row["upload_url"],
+            platform_media_id=row["platform_media_id"],
+            error=row["error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )

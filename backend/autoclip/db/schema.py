@@ -104,9 +104,70 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
     conn.executescript(_V1)
 
 
+_V2 = """
+-- Live Watch (work order A9). Columns match the frozen row dataclasses in
+-- autoclip/live/models.py exactly; from_row() reads them by name.
+-- Status columns deliberately carry NO CHECK constraints: statuses evolve
+-- with the feature and the store layer validates them in Python, so a new
+-- status must never require a migration.
+CREATE TABLE live_streams (
+    id           TEXT PRIMARY KEY,
+    url          TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    state        TEXT NOT NULL DEFAULT 'waiting_for_live',
+    state_detail TEXT NOT NULL DEFAULT '',
+    last_error   TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX idx_live_streams_state ON live_streams(state);
+
+CREATE TABLE live_clips (
+    id              TEXT PRIMARY KEY,
+    stream_id       TEXT NOT NULL REFERENCES live_streams(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'detecting',
+    trigger_start_s REAL NOT NULL DEFAULT 0,
+    trigger_end_s   REAL NOT NULL DEFAULT 0,
+    clip_start_s    REAL NOT NULL DEFAULT 0,
+    clip_end_s      REAL NOT NULL DEFAULT 0,
+    title           TEXT NOT NULL DEFAULT '',
+    score           INTEGER NOT NULL DEFAULT 0,
+    reason          TEXT NOT NULL DEFAULT '',
+    hook            TEXT NOT NULL DEFAULT '',
+    judge_model     TEXT NOT NULL DEFAULT '',
+    transcript_path TEXT NOT NULL DEFAULT '',
+    rendered_path   TEXT NOT NULL DEFAULT '',
+    caption_style   TEXT NOT NULL DEFAULT 'bold_pop',
+    ratio           TEXT NOT NULL DEFAULT '9:16',
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX idx_live_clips_stream ON live_clips(stream_id, created_at);
+
+CREATE TABLE live_uploads (
+    id                TEXT PRIMARY KEY,
+    clip_id           TEXT NOT NULL REFERENCES live_clips(id) ON DELETE CASCADE,
+    platform          TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    upload_url        TEXT NOT NULL DEFAULT '',
+    platform_media_id TEXT NOT NULL DEFAULT '',
+    error             TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE INDEX idx_live_uploads_clip ON live_uploads(clip_id);
+"""
+
+
+def _migration_v2(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V2)
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1, _migration_v2]
 
 SCHEMA_VERSION = len(MIGRATIONS)
 
