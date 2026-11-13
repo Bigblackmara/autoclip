@@ -861,6 +861,7 @@ class TestWireShapesMatchFrontend:
             "max_disk_mb",
             "pre_roll_s",
             "post_roll_s",
+            "judge_context_s",
         }
         assert set(body["rate_limit"]) == {
             "judge_per_minute",

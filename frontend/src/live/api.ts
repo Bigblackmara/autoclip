@@ -89,6 +89,7 @@ export interface LiveSettingsData {
     max_disk_mb: number
     pre_roll_s: number
     post_roll_s: number
+    judge_context_s: number
   }
   rate_limit: {
     judge_per_minute: number

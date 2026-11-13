@@ -21,6 +21,12 @@ class LiveRollingBufferSettings(BaseModel):
     pre_roll_s: float = 20.0
     #: Seconds captured after the moment ends (post-roll).
     post_roll_s: float = 10.0
+    #: How much stream time the LLM judge gets to READ around a trigger —
+    #: a wider window gives the judge setup/context for a better verdict.
+    #: This is independent of pre_roll/post_roll (what gets RENDERED):
+    #: the judge window is transcription-only input; the final clip is
+    #: re-extracted from clip_start_s/clip_end_s at render time.
+    judge_context_s: float = 240.0
 
 
 class LiveRateLimitSettings(BaseModel):

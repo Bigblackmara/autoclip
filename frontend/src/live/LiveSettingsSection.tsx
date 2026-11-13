@@ -338,6 +338,13 @@ export function LiveSettingsSection() {
             onCommit={(v) => setBuffer({ pre_roll_s: v })}
           />
           <NumberField
+            label="Judge context (s)"
+            hint="How much lead-up the AI judge reads before a trigger. Higher = smarter picks, slightly slower judging."
+            value={draft.rolling_buffer.judge_context_s}
+            min={0}
+            onCommit={(v) => setBuffer({ judge_context_s: v })}
+          />
+          <NumberField
             label="Post-roll (s)"
             hint="Seconds kept after the moment ends, so clips don't cut the punchline."
             value={draft.rolling_buffer.post_roll_s}

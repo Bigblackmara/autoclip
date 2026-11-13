@@ -1032,25 +1032,39 @@ class StreamWatcher:
             return ""
 
     def _trim_window(
-        self, judgement: LiveJudgement, words: list, clip_start_s: float, clip_end_s: float
+        self,
+        judgement: LiveJudgement,
+        words: list,
+        clip_start_s: float,
+        clip_end_s: float,
+        judge_start_s: float | None = None,
     ) -> tuple[float, float]:
         """Apply the judge's word-offset trim advice to the render window.
 
-        Offsets are relative to the window's first word (A6 contract) and
-        word times are relative to the extraction, so a trimmed second is
-        just ``clip_start_s + word time``. Advice that would tighten below
-        TRIM_MIN_S, or land outside the window, is ignored wholesale — a
-        judge with bad taste in pacing shouldn't shrink a clip into nothing.
+        Offsets are relative to the JUDGE window's first word (which may
+        start earlier than the render window when ``judge_context_s`` gave
+        the judge extra lead-up), so a trim point is first converted to
+        stream time via ``judge_start_s + word time``, then clamped into the
+        render window. Advice that would tighten below TRIM_MIN_S, or trim
+        to a range entirely outside the render window, is ignored wholesale
+        — a judge with bad taste in pacing shouldn't shrink a clip into
+        nothing or blow past the pre-roll the buffer holds.
         """
         start_off = judgement.start_word_offset
         end_off = judgement.end_word_offset
         if (start_off is None and end_off is None) or not words:
             return clip_start_s, clip_end_s
+        base_s = judge_start_s if judge_start_s is not None else clip_start_s
         start, end = clip_start_s, clip_end_s
         if start_off is not None and 0 <= start_off < len(words):
-            start = clip_start_s + float(getattr(words[start_off], "start", 0.0))
+            start = base_s + float(getattr(words[start_off], "start", 0.0))
         if end_off is not None and 0 <= end_off < len(words):
-            end = clip_start_s + float(getattr(words[end_off], "end", 0.0))
+            end = base_s + float(getattr(words[end_off], "end", 0.0))
+        if judge_start_s is not None:
+            # The advice referred to a wider window: clamp into the render
+            # range instead of trusting it to fall inside.
+            start = max(start, clip_start_s)
+            end = min(end, clip_end_s)
         if end - start < TRIM_MIN_S or start < clip_start_s - 1e-6 or end > clip_end_s + 1e-6:
             return clip_start_s, clip_end_s
         return start, end
@@ -1118,14 +1132,44 @@ class StreamWatcher:
             directory = clip_dir(clip_id)
             source_path = directory / JUDGE_WINDOW_NAME
             audio_path = directory / JUDGE_AUDIO_NAME
+            # The judge reads a WIDER window than the eventual clip: it needs
+            # the setup that led to the moment, not just the moment. The
+            # final render window (clip_start_s..clip_end_s) is re-extracted
+            # from the buffer at render time, so this judgment window never
+            # bounds the clip. Anchor back from the trigger so the context
+            # covers the lead-up; the buffer clamps to whatever it holds.
+            context_s = getattr(rolling, "judge_context_s", 0.0) or 0.0
+            judge_end_s = min(clip_end_s, trigger_end_s + max(rolling.post_roll_s, 5.0))
+            judge_start_s = max(0.0, trigger_end_s - context_s) if context_s > 0 else clip_start_s
             try:
                 # extract() validates + pins + concatenates + unpins in one
                 # call (A1); a pruned or epoch-crossing range raises a clear
                 # error the candidate path records verbatim.
-                await asyncio.to_thread(self._buffer.extract, clip_start_s, clip_end_s, source_path)
+                await asyncio.to_thread(
+                    self._buffer.extract, judge_start_s, judge_end_s, source_path
+                )
                 await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
             except Exception as exc:
-                raise RuntimeError(f"window extraction failed: {exc}") from exc
+                if context_s > 0:
+                    # The 4-minute lookback can predate the buffer after a
+                    # fresh start or reconnect; the candidate is still
+                    # viable on the plain render window — retry tight rather
+                    # than losing the moment.
+                    log.info(
+                        "Wide judge window unavailable on %s (%s); retrying clip window.",
+                        self.id,
+                        exc,
+                    )
+                    judge_start_s = clip_start_s
+                    try:
+                        await asyncio.to_thread(
+                            self._buffer.extract, clip_start_s, clip_end_s, source_path
+                        )
+                        await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
+                    except Exception as exc2:
+                        raise RuntimeError(f"window extraction failed: {exc2}") from exc2
+                else:
+                    raise RuntimeError(f"window extraction failed: {exc}") from exc
 
             transcript = await asyncio.to_thread(self._deps.transcribe, audio_path)
             words = list(getattr(transcript, "words", None) or [])
@@ -1165,7 +1209,9 @@ class StreamWatcher:
                 )
                 return
 
-            final_start, final_end = self._trim_window(judgement, words, clip_start_s, clip_end_s)
+            final_start, final_end = self._trim_window(
+                judgement, words, clip_start_s, clip_end_s, judge_start_s
+            )
             # Verdict passed: mark the cooldown so this stream cools down even
             # if the enqueue below drops the item under queue/disk pressure.
             self._cooldown_mark()

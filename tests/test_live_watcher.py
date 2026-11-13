@@ -524,8 +524,11 @@ async def test_signal_drain_fires_candidate_and_full_pipeline(primed_db: int) ->
         assert item.clip_start_s == pytest.approx(100.0)  # 120 - pre_roll 20
         assert item.clip_end_s == pytest.approx(130.0)  # 120 + post_roll 10
         assert item.window_bytes == len(b"fake-window")
-        # The buffer extracted exactly the pre/post-roll window.
-        assert buffer.extract_calls and buffer.extract_calls[0] == (100.0, 130.0)
+        # The judge reads a WIDER window than the clip: judge_context_s (240s
+        # default) of lead-up, clamped by the buffer to what it holds, ending
+        # at the same post-roll edge as the clip window. The clip itself is
+        # re-extracted at render time from clip_start_s/clip_end_s.
+        assert buffer.extract_calls and buffer.extract_calls[0] == (0.0, 130.0)
         await wait_until(lambda: watcher.state is StreamState.WATCHING)
     finally:
         await stop_watcher(watcher, task)
