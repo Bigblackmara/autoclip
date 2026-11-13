@@ -482,6 +482,15 @@ class LiveManager:
 
     # -- snapshots for the API ---------------------------------------------------
 
+    @property
+    def started(self) -> bool:
+        """Whether start() has actually launched watchers and workers.
+
+        Distinct from the ``live.enabled`` flag: it is False both before
+        start() and when start() was a no-op because the feature is off.
+        """
+        return self._started
+
     def status(self) -> dict:
         """Whole-feature snapshot: enabled flag, per-stream views, queue caps."""
         streams = []

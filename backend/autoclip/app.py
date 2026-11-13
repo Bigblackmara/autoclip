@@ -59,11 +59,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         log.info("Job worker disabled by %s=1.", ENV_NO_WORKER)
 
+    # Live Watch rides the same worker flag: its manager owns long-lived
+    # capture subprocesses, so it must not exist in a no-worker process
+    # either. manager.start() is itself a no-op while the live.enabled
+    # setting is off, so this line costs nothing for users not using it.
+    from .live.manager import manager as live_manager
+
+    live_started = False
+    if worker_enabled:
+        await live_manager.start()
+        live_started = live_manager.started
+
     log.info("AutoClip %s ready. Artifacts in %s", __version__, paths.root())
 
     try:
         yield
     finally:
+        if live_started:
+            await live_manager.stop()
         if worker_enabled:
             await queue.stop()
 
