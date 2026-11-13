@@ -63,7 +63,7 @@ from typing import Any
 
 from . import events
 from .buffer import PENDING_CAP_BYTES
-from .models import LiveStreamRow, utcnow
+from .models import LiveStreamRow, LiveUploadRow, utcnow
 from .settings import LiveSettings, LiveStreamConfig
 from .states import StreamState
 from .watcher import (
@@ -702,6 +702,101 @@ class LiveManager:
         queue.put_nowait(item)
         return True
 
+    async def _maybe_auto_upload(self, item: ClipWorkItem, clip_row: Any, title: str) -> None:
+        """Upload a freshly ready clip when the user opted in per platform.
+
+        Opt-in comes from settings.live.uploads.{youtube,instagram}.auto_upload.
+        Each failure class becomes a durable row — rights not attested or
+        platform not linked record ``skipped`` (user action needed, not an
+        error), while token/API failures record ``failed`` — plus an
+        ``upload`` event so the UI wall explains itself.
+        """
+        rendered_path = getattr(clip_row, "rendered_path", "") or ""
+        if not rendered_path:
+            return
+        uploads_cfg = getattr(self._live, "uploads", None)
+        wanted: list[tuple[str, dict]] = []
+        yt = getattr(uploads_cfg, "youtube", None) if uploads_cfg else None
+        ig = getattr(uploads_cfg, "instagram", None) if uploads_cfg else None
+        if yt is not None and getattr(yt, "auto_upload", False):
+            wanted.append(
+                (
+                    "youtube",
+                    {
+                        "title": f"{getattr(yt, 'title_prefix', '')}{title or 'Untitled clip'}",
+                    },
+                )
+            )
+        if ig is not None and getattr(ig, "auto_upload", False):
+            wanted.append(
+                (
+                    "instagram",
+                    {
+                        "caption": f"{getattr(ig, 'caption_prefix', '')}{title or ''}".strip(),
+                    },
+                )
+            )
+        for platform, _extra in wanted:
+            row_id = new_stream_id()
+            try:
+                from .uploads import instagram as _ig_mod
+                from .uploads import youtube as _yt_mod
+                from .uploads.tokens import UploadMeta as _Meta
+            except Exception:
+                log.exception("Upload modules unavailable; skipping auto-upload.")
+                return
+            upload_row = LiveUploadRow(
+                id=row_id, clip_id=item.clip_id, platform=platform, status="uploading"
+            )
+            store_call(self._store.create_upload, upload_row)
+
+            def _run_upload(up_coro: Any) -> Any:
+                import asyncio as _a
+
+                return _a.run(up_coro)
+
+            try:
+                meta = _Meta(title=title or "Untitled clip")
+                if platform == "youtube":
+                    up_coro = _yt_mod.upload_youtube(rendered_path, meta)
+                else:
+                    up_coro = _ig_mod.upload_instagram(rendered_path, meta)
+                result = await asyncio.to_thread(_run_upload, up_coro)
+            except Exception as exc:
+                name = type(exc).__name__
+                skipped = name in ("RightsNotAccepted", "NotLinkedError")
+                status = "skipped" if skipped else "failed"
+                store_call(
+                    self._store.update_upload,
+                    row_id,
+                    status=status,
+                    error=f"{name}: {exc}"[:512],
+                )
+                self._publish(
+                    CLIPS_CHANNEL,
+                    "upload",
+                    {"clip_id": item.clip_id, "platform": platform, "status": status},
+                )
+                log.info("Auto-upload %s for clip %s: %s", status, item.clip_id, exc)
+                continue
+            store_call(
+                self._store.update_upload,
+                row_id,
+                status="done",
+                upload_url=str(getattr(result, "url", "") or ""),
+                platform_media_id=str(getattr(result, "media_id", "") or ""),
+            )
+            self._publish(
+                CLIPS_CHANNEL,
+                "upload",
+                {
+                    "clip_id": item.clip_id,
+                    "platform": platform,
+                    "status": "done",
+                    "url": str(getattr(result, "url", "") or ""),
+                },
+            )
+
     def _pending_clip_bytes(self) -> int:
         """Bytes held by not-yet-rendered clips (queue windows + transcripts).
 
@@ -813,6 +908,11 @@ class LiveManager:
                 "title": title,
             },
         )
+        # Auto-upload is opt-in per platform (settings.live.uploads) and
+        # runs after the clip is durably "ready" so a failure here never
+        # touches the render itself. All upload errors are swallowed into
+        # rows + events: one bad token must not stall the render worker.
+        await self._maybe_auto_upload(item, clip_row, title)
 
 
 def _stream_row_from_config(cfg: LiveStreamConfig) -> LiveStreamRow:
