@@ -146,6 +146,7 @@ Everything the UI does is also on the CLI:
 | `autoclip styles` | list caption presets |
 | `autoclip config show` | print settings |
 | `autoclip update-ytdlp` | update yt-dlp after a YouTube change |
+| `autoclip live` | manage the live watch list and its clips |
 
 ### Caption styles
 
@@ -157,6 +158,22 @@ Everything the UI does is also on the CLI:
 | `boxed` | high-contrast text on a solid block |
 
 Fonts are bundled under the SIL Open Font License, so nothing is fetched at runtime.
+
+## Live Watch
+
+Watch live streams around the clock and cut their viral moments into caption-burned vertical clips while the stream is still going — several streams at once, detection running continuously against each stream's own rolling baseline (audio energy + Twitch chat), an LLM gate that scores the window before a single clip is rendered, and the same transcribe → reframe → captions → export stages a batch clip uses.
+
+**You are responsible for having the rights or permission to clip and repost each streamer's content, and for following each platform's terms of service.** Uploads refuse to run until you accept that notice, and the acceptance is a dated flag in your OS keyring — next to the OAuth tokens, which never touch a config file.
+
+```bash
+uv pip install -e ".[live]"     # streamlink, the capture resolver
+autoclip live add https://twitch.tv/someone --label "someone"
+autoclip serve
+```
+
+Optional uploads go out through the official YouTube and Instagram APIs using your own OAuth app — one exception to the "no direct posting" stance below, and only ever with apps you own and accounts you control.
+
+Detection runs on your configured LLM provider (Ollama still supported), per-stream judge budgets cap the spend, and everything the loop does is bounded: rolling buffers (5 min / 512 MB per stream), a clip queue that drops overflow with a recorded reason, and a global disk ceiling. See [docs/LIVE_WATCH.md](docs/LIVE_WATCH.md) for the full loop, settings, and — honestly — what is verified so far and what isn't yet.
 
 ## Troubleshooting
 
@@ -206,7 +223,7 @@ Also unverified: whether the clip *picks* are good. That's a judgement call abou
 
 Deliberate, not oversights:
 
-- **No direct posting** to TikTok/Instagram/YouTube. Their APIs are approval-gated; AutoClip exports files.
+- **No direct posting** to TikTok/Instagram/YouTube. Their APIs are approval-gated; AutoClip exports files. *(One exception: Live Watch's optional uploading, which runs through the official YouTube/Instagram APIs via the user's own OAuth apps when the user has the rights — see [Live Watch](#live-watch).)*
 - **No cloud version, no accounts, no telemetry.**
 - **No timeline editor** beyond trim handles and caption edits.
 - **No DRM circumvention**, ever.

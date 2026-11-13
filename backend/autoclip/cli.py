@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -699,6 +700,347 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+# ---------------------------------------------------------------------------
+# live — the Live Watch command group.
+#
+# The CLI is a read-and-configure surface, never a manager host: starting
+# capture involves watcher tasks, subprocesses, and an asyncio loop, and a
+# forgotten terminal session must never be the thing keeping a 24/7 watch
+# alive. `autoclip serve` owns the manager lifecycle; these commands only
+# touch the persistent records (the registry + the store + config), which
+# `serve` picks up on its next start/reconnect.
+# ---------------------------------------------------------------------------
+
+live_app = typer.Typer(invoke_without_command=True)
+app.add_typer(live_app, name="live")
+
+
+@live_app.callback()
+def live(ctx: typer.Context) -> None:
+    """Watch live streams and clip their viral moments. Run with `autoclip serve`."""
+    if ctx.invoked_subcommand is None:
+        _live_status()
+
+
+#: Stream states under which a capture subprocess is alive right now;
+#: everything else is pending (waiting_for_live), user-paused (off), or
+#: terminal. The vocabulary lives in live/states.py and is the one thing
+#: the manager, API, and this CLI all agree on.
+_LIVE_WATCHING_STATES = frozenset(("connecting", "watching", "clipping", "reconnecting"))
+
+#: Rich colour per stream state — the same mapping the streams panel (F1)
+#: uses for its state pills, so the terminal and the web read identically.
+_LIVE_STATE_COLOURS = {
+    "watching": "green",
+    "clipping": "yellow",
+    "reconnecting": "magenta",
+    "error": "red",
+    "off": "bright_black",
+}
+
+#: Clip-row statuses, for the `live clips` colouring. Same vocabulary the
+#: store's live_clips.status column carries (detecting → ready/rejected).
+_LIVE_CLIP_COLOURS = {
+    "ready": "green",
+    "detecting": "cyan",
+    "queued": "cyan",
+    "rendering": "cyan",
+    "failed": "red",
+    "rejected": "bright_black",
+}
+
+
+def _live_settings() -> Any:
+    """LiveSettings as persisted in config.json's ``live`` section.
+
+    ``Settings`` deliberately has no ``live`` field yet (the section is
+    additive), so this reads the raw file — :func:`config.load` drops keys
+    the model doesn't know about. A missing, unreadable, or half-written
+    section degrades to the frozen defaults, exactly the contract
+    ``live/manager._load_settings`` applies on the serve side.
+    """
+    import json
+
+    from pydantic import ValidationError
+
+    from .live.settings import LiveSettings
+
+    raw: Any = None
+    path = paths.config_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            raw = data.get("live") if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            raw = None
+    if raw is None:
+        return LiveSettings()
+    try:
+        return LiveSettings.model_validate(raw)
+    except ValidationError:
+        console.print(
+            "[yellow]The live section of config.json is invalid — showing defaults.[/yellow]"
+        )
+        return LiveSettings()
+
+
+def _live_status() -> None:
+    """The default view: every registered stream, its state, and the caps."""
+    from . import db
+    from .live import registry
+    from .live import store as live_store
+
+    paths.ensure_layout()
+    db.init()
+
+    streams: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # Registration order — the registry is the watch list `serve` loads
+    # watchers from — then any DB rows it doesn't know, so a stream added
+    # while the server was down still shows up.
+    try:
+        registered = registry.list_streams()
+    except Exception:
+        registered = []  # a registry read failure must not hide the DB view
+    for cfg in registered:
+        seen.add(cfg.id)
+        row = live_store.get_stream(cfg.id)
+        streams.append(
+            {
+                "id": cfg.id,
+                "label": cfg.label,
+                "url": cfg.url,
+                "enabled": cfg.enabled,
+                "state": row.state if row else ("off" if not cfg.enabled else "waiting_for_live"),
+                "detail": row.state_detail if row else "",
+            }
+        )
+    for row in live_store.list_streams():
+        if row.id not in seen:
+            streams.append(
+                {
+                    "id": row.id,
+                    "label": row.label,
+                    "url": row.url,
+                    "enabled": row.enabled,
+                    "state": row.state,
+                    "detail": row.state_detail,
+                }
+            )
+
+    table = Table(
+        title="Live Watch streams", show_header=True, header_style="bold", title_justify="left"
+    )
+    table.add_column("ID", width=16)
+    table.add_column("Label", width=18)
+    table.add_column("State", width=18)
+    table.add_column("URL")
+
+    watching = 0
+    for stream in streams:
+        state = stream["state"]
+        if state in _LIVE_WATCHING_STATES:
+            watching += 1
+        colour = _LIVE_STATE_COLOURS.get(state, "cyan")
+        cell = f"[{colour}]{state}[/{colour}]"
+        if not stream["enabled"] and state != "off":
+            cell += " [dim](paused)[/dim]"
+        table.add_row(stream["id"], stream["label"] or "—", cell, stream["url"])
+
+    console.print(table)
+
+    settings = _live_settings()
+    feature = "[green]on[/green]" if settings.enabled else "[red]off[/red]"
+    console.print(
+        f"[green]{watching}[/green] stream(s) actively watched · "
+        f"{len(streams)} registered · feature {feature}"
+    )
+    console.print(
+        f"[dim]caps: {settings.workers.max_concurrent_streams} concurrent streams · "
+        f"{settings.workers.clip_queue_workers} render worker(s) · "
+        f"clip queue {settings.workers.clip_queue_max}[/dim]"
+    )
+
+
+def _live_find(stream_id: str) -> tuple[Any, Any]:
+    """One stream's (registry entry, store row) — either side may be None."""
+    from .live import registry
+    from .live import store as live_store
+
+    return registry.get(stream_id), live_store.get_stream(stream_id)
+
+
+def _live_require(stream_id: str) -> tuple[Any, Any]:
+    """Both views of an existing stream, or exit with the shared not-found error."""
+    cfg, row = _live_find(stream_id)
+    if cfg is None and row is None:
+        console.print(f"[red]No Live Watch stream with id '{stream_id}'.[/red]")
+        raise typer.Exit(1)
+    return cfg, row
+
+
+@live_app.command("status")
+def live_status() -> None:
+    """Print the Live Watch status table (the default view for bare `autoclip live`)."""
+    _live_status()
+
+
+@live_app.command("add")
+def live_add(
+    url: str = typer.Argument(..., help="Stream URL to watch (Twitch, YouTube Live, Kick...)."),
+    label: str = typer.Option("", "--label", "-l", help="Human-readable name for the stream."),
+) -> None:
+    """Register a stream on the watch list; `autoclip serve` starts watching it.
+
+    Registration is pure configuration — the registry entry the server
+    loads watchers from, plus the store row that will carry its runtime
+    state. Actually starting a watcher here would tie a 24/7 watch to the
+    lifetime of one terminal session, so the CLI deliberately leaves that
+    to `serve`.
+    """
+    from . import db
+    from .live import registry
+    from .live import store as live_store
+    from .live.models import LiveStreamRow
+    from .live.settings import LiveStreamConfig
+
+    paths.ensure_layout()
+    db.init()
+
+    url = url.strip()
+    if not url:
+        console.print("[red]The stream URL must not be empty.[/red]")
+        raise typer.Exit(2)
+
+    try:
+        # An empty id asks the registry to mint one — it owns id creation.
+        cfg = registry.upsert(LiveStreamConfig(id="", url=url, label=label))
+    except ValueError as exc:
+        console.print(f"[red]Could not register the stream.[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    live_store.upsert_stream(
+        LiveStreamRow(id=cfg.id, url=cfg.url, label=cfg.label, enabled=cfg.enabled)
+    )
+
+    console.print(f"[green]Added.[/green] {cfg.url}")
+    if cfg.label:
+        console.print(f"  label: {cfg.label}")
+    console.print(f"  id: {cfg.id}")
+    console.print("[dim]`autoclip serve` starts watching it on its next start or reconnect.[/dim]")
+
+
+@live_app.command("remove")
+def live_remove(
+    stream_id: str = typer.Argument(..., help="Stream id, as printed by `autoclip live`."),
+) -> None:
+    """Remove a stream: its registry entry, its DB row, and every clip of it go."""
+    from . import db
+    from .live import registry
+    from .live import store as live_store
+
+    paths.ensure_layout()
+    db.init()
+
+    _live_require(stream_id)
+    registry.delete(stream_id)
+    live_store.delete_stream(stream_id)
+
+    console.print(f"[green]Removed.[/green] {stream_id}")
+
+
+@live_app.command("pause")
+def live_pause(
+    stream_id: str = typer.Argument(..., help="Stream id, as printed by `autoclip live`."),
+) -> None:
+    """Stop watching a stream: capture stops, its configuration is kept."""
+    from . import db
+    from .live import registry
+    from .live import store as live_store
+    from .live.states import StreamState
+
+    paths.ensure_layout()
+    db.init()
+
+    _live_require(stream_id)
+    registry.set_enabled(stream_id, False)
+    live_store.update_stream_state(stream_id, state=StreamState.OFF.value)
+
+    console.print(f"[green]Paused.[/green] {stream_id}")
+    console.print(f"[dim]resume with [cyan]autoclip live resume {stream_id}[/cyan][/dim]")
+
+
+@live_app.command("resume")
+def live_resume(
+    stream_id: str = typer.Argument(..., help="Stream id, as printed by `autoclip live`."),
+) -> None:
+    """Resume a paused stream; `serve` launches a fresh watcher for it."""
+    from . import db
+    from .live import registry
+    from .live import store as live_store
+    from .live.states import StreamState
+
+    paths.ensure_layout()
+    db.init()
+
+    _live_require(stream_id)
+    registry.set_enabled(stream_id, True)
+    # Resume is a fresh watcher start in the manager's model — it launches
+    # from waiting_for_live, mirroring live/manager.resume_stream.
+    live_store.update_stream_state(stream_id, state=StreamState.WAITING_FOR_LIVE.value)
+
+    console.print(f"[green]Resumed.[/green] {stream_id}")
+
+
+@live_app.command("clips")
+def live_clips(
+    stream_id: str = typer.Option("", "--stream", "-s", help="Only clips from this stream."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Show at most this many clips."),
+) -> None:
+    """List the latest live clips, newest first."""
+    from . import db
+    from .live import store as live_store
+
+    paths.ensure_layout()
+    db.init()
+
+    rows = live_store.list_clips(stream_id=stream_id or None, limit=max(1, limit))
+
+    table = Table(title="Live clips", header_style="bold", title_justify="left")
+    table.add_column("ID", width=16)
+    table.add_column("Status", width=10)
+    table.add_column("Score", width=5, justify="right")
+    table.add_column("Length", width=6, justify="right")
+    table.add_column("Title")
+
+    for c in rows:
+        colour = _LIVE_CLIP_COLOURS.get(c.status, "white")
+        duration = max(0.0, c.clip_end_s - c.clip_start_s)
+        table.add_row(
+            c.id,
+            f"[{colour}]{c.status}[/{colour}]",
+            str(c.score),
+            f"{duration:.0f}s",
+            c.title or "(untitled)",
+        )
+
+    console.print(table)
+    if not rows:
+        console.print("[dim]No live clips yet — they appear as watched streams produce them.[/dim]")
+
+
+@live_app.command("settings")
+def live_settings() -> None:
+    """Print the live settings section from config.json."""
+    from . import db
+
+    paths.ensure_layout()
+    db.init()
+
+    settings = _live_settings()
+    console.print_json(settings.model_dump_json(indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover

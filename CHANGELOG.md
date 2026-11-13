@@ -32,6 +32,40 @@ being validated against a fixed golden video set — see
 - **End-to-end test** against real media, covering every stage with only the
   language model's answer scripted.
 
+### Added
+
+- **Live Watch** — watch several livestreams at once, around the clock, and clip
+  their viral moments while the stream is still going:
+  - Multiple concurrent stream watches (streamlink → ffmpeg capture, offline
+    channels parked and re-polled, reconnect with exponential backoff).
+  - A rolling on-disk buffer per stream (5 min / 512 MB defaults, 6 s segments,
+    continuously pruned) so the moment is still there when detection fires.
+  - Audio-energy and Twitch-chat detection, scored as z-spikes against each
+    stream's own baseline (Twitch chat is the public anonymous IRC gateway — no
+    account, no bot).
+  - An LLM judge gate on the configured provider (Ollama still supported; the
+    judge just runs one window at a time), returning a 0–100 score, title, and
+    trim advice before any clip is rendered. Windows with no speech are
+    rejected locally without spending a call.
+  - Clip production reusing the batch pipeline stages (transcribe → reframe →
+    captions → export) with a per-clip artifact directory, so a failed render
+    resumes at the failed stage.
+  - Optional YouTube/Instagram uploads through the official APIs using the
+    user's own OAuth apps — tokens and client credentials are keyring-only, and
+    uploads stay locked until the user accepts the content-rights notice
+    (attestation stored in the keyring, not config). One attempt per platform
+    per clip, recorded either way.
+  - A `live` CLI command group (`autoclip live add/remove/pause/resume/clips/…`)
+    that manages the watch list; `autoclip serve` owns the watching.
+  - A Live Watch tab in the web UI — streams dashboard, clips gallery, and live
+    settings — fed by REST + SSE under `/api/live`.
+  - Safety nets throughout: per-stream cooldown, per-stream judge budgets
+    (3/min, 60/hour, 500/day) that fail closed, a bounded render queue that
+    drops overflow with the reason recorded, per-stream buffer caps plus a
+    global pending-work disk ceiling, and full crash isolation per watcher.
+  - [docs/LIVE_WATCH.md](docs/LIVE_WATCH.md) — the user guide, including what
+    is verified so far and what isn't.
+
 ### Notable fixes during development
 
 Each of these was found by running the thing, not by reading it:
