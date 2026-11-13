@@ -131,3 +131,13 @@ accepted in the UI (stored in config).
 - Visual-only signals (scene-cut detection on live H.264 is noisy and costly).
 - Reframe tracking quality work (reuses existing reframe stage as-is).
 - Auto-publish beyond one manual/auto attempt per platform per clip.
+
+## Decisions during the build
+
+- **The LLM judge runs on an API provider, not Ollama** (user decision,
+  mid-build): detection quality follows model quality, and the 8 GB GPU is
+  better spent on Whisper/MediaPipe/NVENC. judge.py builds the provider the
+  standard way (providers.build_provider(active_provider, settings)) so the
+  user picks it in Settings like everywhere else; hosted concurrency mirrors
+  highlights.py (3 parallel judge calls, 1 if someone insists on Ollama).
+  Local Ollama remains supported — it's just not the default recommendation.
