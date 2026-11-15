@@ -83,7 +83,12 @@ place; asking for an index the model is reading off the page does not.
 
 Every stage writes its output to `work/{job_id}/`. A retry checks what exists and
 starts at the first missing artifact. When transcription took eleven minutes and
-the LLM call then hit a rate limit, that difference matters.
+the LLM call then hit a rate limit, that difference matters. Within the export
+stage the unit is the clip: a clip already exported at the job's ratio is
+skipped, so a failure at clip 7 doesn't re-render clips 1-6. Per-job choices
+(clip lengths and count, ratio, caption style, Whisper model) are snapshotted
+into the job; everything else, including provider model and base URL, is read
+fresh, so fixing a bad endpoint in settings and pressing Retry picks it up.
 
 ### Crop paths never interpolate across a cut
 

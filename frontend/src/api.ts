@@ -151,6 +151,20 @@ export interface Settings {
   keys_present: Record<string, boolean>
 }
 
+/**
+ * A settings update. Sections are partial on purpose: the server merges each
+ * section field by field, and sending only the changed field means two quick
+ * edits in one section can't overwrite each other with stale values.
+ */
+export interface SettingsPatch {
+  active_provider?: string
+  providers?: Record<string, Partial<Settings['providers'][string]>>
+  whisper?: Partial<Settings['whisper']>
+  clips?: Partial<Settings['clips']>
+  ingest?: Partial<Settings['ingest']>
+  export?: Partial<Settings['export']>
+}
+
 export interface SystemStatus {
   ready: boolean
   python_version: string
@@ -206,6 +220,16 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const detail = body.detail
       if (typeof detail === 'string') {
         message = detail
+      } else if (Array.isArray(detail)) {
+        // FastAPI request validation (422): [{loc: ['body', 'settings',
+        // 'max_clips'], msg: '...'}]. Without this the user saw only
+        // "422 Unprocessable Entity" with no hint of which field was wrong.
+        message = detail
+          .map((item: { loc?: unknown[]; msg?: string }) => {
+            const field = (item.loc ?? []).filter((part) => part !== 'body').join('.')
+            return field ? `${field}: ${item.msg ?? 'invalid'}` : (item.msg ?? 'invalid')
+          })
+          .join('\n')
       } else if (detail && typeof detail === 'object') {
         // The ingest endpoints return {message, hint} so the UI can show the
         // fix alongside the failure.
@@ -283,7 +307,7 @@ export const api = {
   providerStatus: () => request<ProviderStatus[]>('/api/providers/status'),
 
   getSettings: () => request<Settings>('/api/settings'),
-  putSettings: (patch: Partial<Settings>) =>
+  putSettings: (patch: SettingsPatch) =>
     request<Settings>('/api/settings', { method: 'PUT', body: JSON.stringify(patch) }),
 
   putSecret: (key: string, value: string) =>

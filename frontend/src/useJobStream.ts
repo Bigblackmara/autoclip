@@ -53,6 +53,12 @@ export function useJobStream(jobId: string | undefined) {
       if (['done', 'failed', 'cancelled'].includes(data.status)) close()
     })
 
+    // A queued job waiting behind another one gets "started" before its first
+    // progress frame; without this it read "queued" until prepare reported.
+    source.addEventListener('started', () => {
+      setJob((current) => (current ? { ...current, status: 'running' } : current))
+    })
+
     source.addEventListener('progress', (event) => {
       const data = JSON.parse((event as MessageEvent).data)
       setProgress({

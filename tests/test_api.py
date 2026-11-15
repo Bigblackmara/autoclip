@@ -310,6 +310,34 @@ class TestClips:
         assert response.status_code == 200
         assert response.json()["caption_style"] == "karaoke_fill"
 
+    def test_unedited_clips_report_the_jobs_ratio_and_style(
+        self, client: TestClient, source: Source
+    ) -> None:
+        # Per-job overrides are what the batch export rendered with, so the
+        # review page must pre-select them rather than 9:16 / bold_pop.
+        job = store.create_job(
+            Job(
+                id=new_id(),
+                source_id=source.id,
+                status="done",
+                settings={"export": {"ratio": "1:1", "caption_style": "karaoke_fill"}},
+            )
+        )
+        store.replace_clips(
+            job.id, [Clip(id=new_id(), job_id=job.id, rank=1, start_s=0.0, end_s=30.0)]
+        )
+
+        clip = client.get(f"/api/jobs/{job.id}/clips").json()[0]
+        assert (clip["ratio"], clip["caption_style"]) == ("1:1", "karaoke_fill")
+        assert client.get(f"/api/clips/{clip['id']}").json()["ratio"] == "1:1"
+
+        # Changing only the ratio must not reset the job's caption style.
+        patched = client.patch(f"/api/clips/{clip['id']}/captions", json={"ratio": "16:9"})
+        assert (patched.json()["ratio"], patched.json()["caption_style"]) == (
+            "16:9",
+            "karaoke_fill",
+        )
+
     def test_unknown_caption_style_is_rejected(
         self, client: TestClient, job_with_clips: Job
     ) -> None:

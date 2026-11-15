@@ -16,7 +16,7 @@ from ..db.models import Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import export as export_module
 from ..pipeline.reframe.croppath import CropPath, centre_crop
-from ..pipeline.runner import JobWorkspace
+from ..pipeline.runner import JobWorkspace, settings_for_job
 from ..pipeline.transcript import Transcript, Word
 from .schemas import (
     CaptionPatchIn,
@@ -33,10 +33,26 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["clips"])
 
 
-def _clip_out(clip) -> ClipOut:
+def _job_export_defaults(job_id: str) -> tuple[str, str]:
+    """The caption style and ratio a job actually rendered with.
+
+    A clip with no edits yet was exported with its job's settings (per-job
+    overrides layered on the saved ones), not with the hard-coded defaults —
+    reporting "bold_pop"/"9:16" there made the review page pre-select the
+    wrong ratio and style, so "Export this clip" re-rendered differently.
+    """
+    job = store.get_job(job_id)
+    export = settings_for_job(job).export if job else load_settings().export
+    return export.caption_style, export.ratio
+
+
+def _clip_out(clip, defaults: tuple[str, str] | None = None) -> ClipOut:
     edit = store.get_clip_edit(clip.id)
     exports = store.list_exports(clip.id)
-    return ClipOut.of(clip, edit=edit, exports=exports)
+    style, ratio = defaults or _job_export_defaults(clip.job_id)
+    return ClipOut.of(
+        clip, edit=edit, exports=exports, default_style=style, default_ratio=ratio
+    )
 
 
 async def list_clips_for_job(job_id: str) -> list[ClipOut]:
@@ -44,7 +60,8 @@ async def list_clips_for_job(job_id: str) -> list[ClipOut]:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     clips = await asyncio.to_thread(store.list_clips, job_id)
-    return [await asyncio.to_thread(_clip_out, clip) for clip in clips]
+    defaults = await asyncio.to_thread(_job_export_defaults, job_id)
+    return [await asyncio.to_thread(_clip_out, clip, defaults) for clip in clips]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)
@@ -153,6 +170,10 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
     existing = await asyncio.to_thread(store.get_clip_edit, clip_id)
     from ..db.models import ClipEdit
 
+    # The first edit of a clip must keep whatever the user didn't change at
+    # the job's values; falling back to "bold_pop"/"9:16" meant picking a
+    # ratio silently reset a job's karaoke captions (and vice versa).
+    default_style, default_ratio = await asyncio.to_thread(_job_export_defaults, clip.job_id)
     edit = ClipEdit(
         clip_id=clip_id,
         edited_words=(
@@ -160,8 +181,9 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
             if payload.words is not None
             else (existing.edited_words if existing else None)
         ),
-        caption_style=payload.caption_style or (existing.caption_style if existing else "bold_pop"),
-        ratio=payload.ratio or (existing.ratio if existing else "9:16"),
+        caption_style=payload.caption_style
+        or (existing.caption_style if existing else default_style),
+        ratio=payload.ratio or (existing.ratio if existing else default_ratio),
     )
     await asyncio.to_thread(store.upsert_clip_edit, edit)
 

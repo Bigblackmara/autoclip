@@ -148,6 +148,14 @@ Everything the UI does is also on the CLI:
 | `autoclip update-ytdlp` | update yt-dlp after a YouTube change |
 | `autoclip live` | manage the live watch list and its clips |
 
+### Batch jobs
+
+- **Options** on the New page (provider, Whisper model, clip count and lengths, speakers) apply to that job only, and the job really runs with them. Invalid values are caught before anything is downloaded.
+- **Cancel** stops a job at its next checkpoint, including mid-transcription and mid-render; it is recorded as *cancelled*, not failed. **Retry** works on failed and cancelled jobs, resumes at the stage that stopped, and skips clips that were already exported.
+- Exported files are named by rank, e.g. `01-the-title_9x16.mp4`, so clips with the same or emoji-only titles never overwrite each other. Re-exporting a clip at the same ratio replaces its file and its download entry.
+- The review page opens each clip at the ratio and caption style its job rendered with. After a ratio change or a trim, re-export frames the clip for its new shape and length (a centre crop) instead of stretching the old framing.
+- Audio-only sources (mp3, wav, m4a) render over a generated background.
+
 ### Caption styles
 
 | style | look |
@@ -188,6 +196,12 @@ Everything here is a real failure hit during development, not hypothetical.
 **Captions don't appear in exports, or ffmpeg says "No such filter: ass".** Your ffmpeg has no libass. `doctor` reports this and prints the right command for your platform. On macOS that means `brew install ffmpeg-full`, not `brew install ffmpeg`; on Windows the full Gyan build, not "essentials".
 
 **YouTube downloads fail with a bot check.** As of 2026, YouTube blocks most anonymous downloads and proof-of-origin tokens no longer clear it. Set **Settings → Ingest → cookies from browser** to a browser you're signed into, and **close that browser** first — it locks its cookie database while running. Uploading a file always works and needs none of this.
+
+**"YouTube refused to serve this video to your network."** YouTube answered with HTTP 403/429 or offered only storyboard images. This is almost always a VPN or datacenter address (Cloudflare WARP, Proton VPN and similar): turn the VPN off or exclude youtube.com from it, or set cookies from browser as above. If it persists, run `autoclip update-ytdlp`. The error shows yt-dlp's original message under the hint.
+
+**YouTube gives "no video formats" on a machine with Node but not Deno.** YouTube now requires its player challenge to be solved by a JavaScript runtime. AutoClip hands yt-dlp every runtime it finds on `PATH` (Deno, Node or Bun), so installing any one of them is enough. `autoclip update-ytdlp` installs `yt-dlp[default]` (which includes the challenge solver) and also works in uv-created environments that have no pip.
+
+**A job fails at Highlights with an API error.** When every transcript window fails, the job now shows the provider's own error (bad key, unknown model, wrong base URL, unreachable server) instead of "No clips were found". Fix it in **Settings** and press **Retry**: the transcript is reused, and provider model and base URL are read fresh on retry.
 
 **Exports are slower than expected.** Check `doctor` for GPU encoding. A build can list `h264_nvenc` and still be unusable if your driver is older than the NVENC API it was compiled against; AutoClip probes this and falls back to CPU encoding, which is identical quality and just slower.
 

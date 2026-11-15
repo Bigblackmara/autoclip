@@ -162,6 +162,8 @@ class ClipOut(BaseModel):
         *,
         edit: models.ClipEdit | None = None,
         exports: list[models.Export] | None = None,
+        default_style: str = "bold_pop",
+        default_ratio: str = "9:16",
     ) -> ClipOut:
         return cls(
             id=clip.id,
@@ -178,8 +180,8 @@ class ClipOut(BaseModel):
             reason=clip.reason,
             status=clip.status,
             user_trimmed=clip.user_trimmed,
-            caption_style=edit.caption_style if edit else "bold_pop",
-            ratio=edit.ratio if edit else "9:16",
+            caption_style=edit.caption_style if edit else default_style,
+            ratio=edit.ratio if edit else default_ratio,
             exports=[ExportOut.of(e) for e in (exports or [])],
         )
 

@@ -361,6 +361,14 @@ def get_clip_edit(clip_id: str) -> ClipEdit | None:
 
 def create_export(export: Export) -> Export:
     with connection() as conn:
+        # A re-export to the same file (same rank, title and ratio) overwrites
+        # it, so any older record for that path now describes a file that no
+        # longer exists: the review page listed it with the old style and
+        # size, yet its download served the new render.
+        conn.execute(
+            "DELETE FROM exports WHERE clip_id = ? AND path = ?",
+            (export.clip_id, export.path),
+        )
         conn.execute(
             """
             INSERT INTO exports (id, clip_id, path, ratio, style, size_bytes, created_at)

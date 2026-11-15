@@ -275,3 +275,19 @@ class TestTranscriptsEditsAndExports:
         store.create_export(Export(id=new_id(), clip_id=clip.id, path="out_1x1.mp4", ratio="1:1"))
 
         assert len(store.list_exports(clip.id)) == 2
+
+    def test_re_export_to_the_same_file_replaces_its_record(self, job: Job) -> None:
+        # The file was overwritten, so the old record (old style, old size)
+        # would list a download that now serves the new render.
+        clip = Clip(id=new_id(), job_id=job.id, start_s=0.0, end_s=30.0)
+        store.replace_clips(job.id, [clip])
+
+        store.create_export(
+            Export(id=new_id(), clip_id=clip.id, path="01-a_9x16.mp4", style="bold_pop")
+        )
+        store.create_export(
+            Export(id=new_id(), clip_id=clip.id, path="01-a_9x16.mp4", style="karaoke_fill")
+        )
+
+        records = store.list_exports(clip.id)
+        assert [r.style for r in records] == ["karaoke_fill"]

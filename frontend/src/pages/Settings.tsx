@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 
-import { api, type ProviderStatus, type Settings as SettingsData, type SystemStatus } from '../api'
+import {
+  api,
+  type ProviderStatus,
+  type Settings as SettingsData,
+  type SettingsPatch,
+  type SystemStatus,
+} from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 
 const SECRET_LABELS: Record<string, string> = {
@@ -25,14 +31,23 @@ export function Settings() {
 
   useEffect(reload, [])
 
-  const patch = async (update: Partial<SettingsData>) => {
+  /**
+   * Send only what changed. Spreading the whole section from this render's
+   * `settings` raced: blur the Language field and tick diarization quickly,
+   * and the second PUT carried the old language and reverted the first.
+   * Resolves false when the server refused, so fields can show the saved
+   * value again instead of the rejected one.
+   */
+  const patch = async (update: SettingsPatch): Promise<boolean> => {
     setError(null)
     try {
       setSettings(await api.putSettings(update))
       setSaved(true)
       setTimeout(() => setSaved(false), 1600)
+      return true
     } catch (err) {
       setError(err as Error)
+      return false
     }
   }
 
@@ -73,6 +88,7 @@ export function Settings() {
             <button
               key={provider.name}
               onClick={() => patch({ active_provider: provider.name })}
+              aria-pressed={provider.name === settings.active_provider}
               className={[
                 'block w-full border-l-2 py-3 pl-3 text-left transition-colors duration-200',
                 provider.name === settings.active_provider
@@ -103,14 +119,7 @@ export function Settings() {
             value={settings.providers[settings.active_provider]?.model ?? ''}
             placeholder="model name"
             onCommit={(value) =>
-              patch({
-                providers: {
-                  [settings.active_provider]: {
-                    ...settings.providers[settings.active_provider],
-                    model: value,
-                  },
-                },
-              })
+              patch({ providers: { [settings.active_provider]: { model: value } } })
             }
           />
           <Field
@@ -119,14 +128,7 @@ export function Settings() {
             value={settings.providers[settings.active_provider]?.base_url ?? ''}
             placeholder="https://…"
             onCommit={(value) =>
-              patch({
-                providers: {
-                  [settings.active_provider]: {
-                    ...settings.providers[settings.active_provider],
-                    base_url: value || null,
-                  },
-                },
-              })
+              patch({ providers: { [settings.active_provider]: { base_url: value || null } } })
             }
           />
         </div>
@@ -152,7 +154,7 @@ export function Settings() {
           <Select
             label="Whisper model"
             value={settings.whisper.model}
-            onChange={(value) => patch({ whisper: { ...settings.whisper, model: value } })}
+            onChange={(value) => patch({ whisper: { model: value } })}
             options={['tiny', 'base', 'small', 'medium', 'large-v3']}
           />
           <Field
@@ -160,7 +162,7 @@ export function Settings() {
             hint="Leave empty to detect automatically."
             value={settings.whisper.language}
             placeholder="auto"
-            onCommit={(value) => patch({ whisper: { ...settings.whisper, language: value } })}
+            onCommit={(value) => patch({ whisper: { language: value } })}
           />
         </div>
 
@@ -170,7 +172,7 @@ export function Settings() {
             checked={settings.whisper.diarization}
             disabled={!system?.diarization_available}
             onChange={(e) =>
-              patch({ whisper: { ...settings.whisper, diarization: e.target.checked } })
+              patch({ whisper: { diarization: e.target.checked } })
             }
             className="mt-0.5 size-4 accent-sodium-500"
           />
@@ -191,17 +193,19 @@ export function Settings() {
           <NumberField
             label="Min length (s)"
             value={settings.clips.min_duration_s}
-            onCommit={(value) => patch({ clips: { ...settings.clips, min_duration_s: value } })}
+            onCommit={(value) => patch({ clips: { min_duration_s: value } })}
           />
           <NumberField
             label="Max length (s)"
             value={settings.clips.max_duration_s}
-            onCommit={(value) => patch({ clips: { ...settings.clips, max_duration_s: value } })}
+            onCommit={(value) => patch({ clips: { max_duration_s: value } })}
           />
           <NumberField
             label="Max clips"
             value={settings.clips.max_clips}
-            onCommit={(value) => patch({ clips: { ...settings.clips, max_clips: value } })}
+            integer
+            min={1}
+            onCommit={(value) => patch({ clips: { max_clips: value } })}
           />
         </div>
       </Section>
@@ -213,9 +217,19 @@ export function Settings() {
             hint="YouTube blocks most anonymous downloads. Sign in in that browser and close it before downloading."
             value={settings.ingest.cookies_from_browser}
             onChange={(value) =>
-              patch({ ingest: { ...settings.ingest, cookies_from_browser: value } })
+              patch({ ingest: { cookies_from_browser: value } })
             }
-            options={['', 'chrome', 'firefox', 'edge', 'brave', 'chromium', 'safari']}
+            options={[
+              '',
+              'chrome',
+              'firefox',
+              'edge',
+              'brave',
+              'chromium',
+              'opera',
+              'vivaldi',
+              'safari',
+            ]}
             labels={{ '': 'None' }}
           />
         </div>
@@ -226,13 +240,13 @@ export function Settings() {
           <Select
             label="Default ratio"
             value={settings.export.ratio}
-            onChange={(value) => patch({ export: { ...settings.export, ratio: value } })}
+            onChange={(value) => patch({ export: { ratio: value } })}
             options={['9:16', '1:1', '16:9']}
           />
           <NumberField
             label="Loudness target (LUFS)"
             value={settings.export.loudness_lufs}
-            onCommit={(value) => patch({ export: { ...settings.export, loudness_lufs: value } })}
+            onCommit={(value) => patch({ export: { loudness_lufs: value } })}
           />
         </div>
 
@@ -241,9 +255,7 @@ export function Settings() {
             type="checkbox"
             checked={settings.export.prefer_hardware_encoder}
             onChange={(e) =>
-              patch({
-                export: { ...settings.export, prefer_hardware_encoder: e.target.checked },
-              })
+              patch({ export: { prefer_hardware_encoder: e.target.checked } })
             }
             className="mt-0.5 size-4 accent-sodium-500"
           />
@@ -262,7 +274,7 @@ export function Settings() {
           <input
             type="checkbox"
             checked={settings.export.write_srt}
-            onChange={(e) => patch({ export: { ...settings.export, write_srt: e.target.checked } })}
+            onChange={(e) => patch({ export: { write_srt: e.target.checked } })}
             className="size-4 accent-sodium-500"
           />
           Also write an .srt sidecar
@@ -328,10 +340,15 @@ function Field({
   hint?: string
   value: string
   placeholder?: string
-  onCommit: (value: string) => void
+  onCommit: (value: string) => Promise<boolean>
 }) {
   const [draft, setDraft] = useState(value)
   useEffect(() => setDraft(value), [value])
+
+  const commit = async () => {
+    if (draft === value) return
+    if (!(await onCommit(draft))) setDraft(value)
+  }
 
   return (
     <label className="block">
@@ -341,7 +358,7 @@ function Field({
         value={draft}
         placeholder={placeholder}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => draft !== value && onCommit(draft)}
+        onBlur={() => void commit()}
         onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
         spellCheck={false}
       />
@@ -353,14 +370,34 @@ function Field({
 function NumberField({
   label,
   value,
+  integer = false,
+  min,
   onCommit,
 }: {
   label: string
   value: number
-  onCommit: (value: number) => void
+  integer?: boolean
+  min?: number
+  onCommit: (value: number) => Promise<boolean>
 }) {
   const [draft, setDraft] = useState(String(value))
   useEffect(() => setDraft(String(value)), [value])
+
+  // Number('') is 0, not NaN: clearing "Max clips" used to save 0 clips. A
+  // blank, malformed or refused value snaps back to the saved one.
+  const commit = async () => {
+    const parsed = Number(draft)
+    const valid =
+      draft.trim() !== '' &&
+      Number.isFinite(parsed) &&
+      (!integer || Number.isInteger(parsed)) &&
+      (min === undefined || parsed >= min)
+    if (!valid) {
+      setDraft(String(value))
+      return
+    }
+    if (parsed !== value && !(await onCommit(parsed))) setDraft(String(value))
+  }
 
   return (
     <label className="block">
@@ -370,10 +407,9 @@ function NumberField({
         className="field numeric mt-1 text-sm"
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          const parsed = Number(draft)
-          if (!Number.isNaN(parsed) && parsed !== value) onCommit(parsed)
-        }}
+        min={min}
+        step={integer ? 1 : 'any'}
+        onBlur={() => void commit()}
         onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
       />
     </label>
@@ -395,6 +431,11 @@ function Select({
   options: string[]
   labels?: Record<string, string>
 }) {
+  // A value set outside this page (a local Whisper model path, a browser
+  // not listed here) must still show as selected; otherwise the select
+  // silently displays its first option as if that were saved.
+  const choices = options.includes(value) ? options : [...options, value]
+
   return (
     <label className="block">
       <span className="eyebrow">{label}</span>
@@ -403,7 +444,7 @@ function Select({
         value={value}
         onChange={(e) => onChange(e.target.value)}
       >
-        {options.map((option) => (
+        {choices.map((option) => (
           <option key={option} value={option} className="bg-ink-850">
             {labels[option] ?? option}
           </option>

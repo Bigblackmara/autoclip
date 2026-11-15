@@ -8,6 +8,7 @@ import {
   type Job,
   type JobSettingsOverrides,
   type ProviderStatus,
+  type Settings,
 } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 
@@ -21,15 +22,54 @@ export function Ingest() {
   const [overrides, setOverrides] = useState<JobSettingsOverrides>({})
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [dragging, setDragging] = useState(false)
+  const [defaults, setDefaults] = useState<Settings | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  // A ref, not the `busy` state: a file dropped while a URL fetch is in
+  // flight must be refused even if the drop handler closed over a stale value.
+  const busyRef = useRef(false)
 
   useEffect(() => {
-    api.listJobs(8).then(setJobs).catch(() => undefined)
     api.providerStatus().then(setProviders).catch(() => undefined)
+    api.getSettings().then(setDefaults).catch(() => undefined)
+  }, [])
+
+  // Recent jobs: refreshed while any of them is still queued or running, so
+  // the list doesn't keep showing "12%" for a job that finished long ago.
+  // The poll stops by itself once every listed job has finished.
+  useEffect(() => {
+    let stopped = false
+    let timer: number | undefined
+    const load = async () => {
+      try {
+        const next = await api.listJobs(8)
+        if (stopped) return
+        setJobs(next)
+        if (next.some((job) => job.status === 'queued' || job.status === 'running')) {
+          timer = window.setTimeout(load, 3000)
+        }
+      } catch {
+        /* The list is a convenience; the job pages stream their own state. */
+      }
+    }
+    void load()
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+    }
   }, [])
 
   const start = useCallback(
     async (kind: 'url' | 'file', run: () => Promise<{ id: string }>) => {
+      if (busyRef.current) return
+      // Checked before ingesting: a bad override used to surface only after
+      // the whole video had been downloaded or uploaded.
+      const invalid = validateOverrides(overrides, defaults)
+      if (invalid) {
+        setError(new Error(invalid))
+        setAdvancedOpen(true)
+        return
+      }
+      busyRef.current = true
       setBusy(kind)
       setError(null)
       try {
@@ -39,10 +79,11 @@ export function Ingest() {
       } catch (err) {
         setError(err as Error)
       } finally {
+        busyRef.current = false
         setBusy(null)
       }
     },
-    [navigate, overrides],
+    [navigate, overrides, defaults],
   )
 
   const submitUrl = (event: React.FormEvent) => {
@@ -106,6 +147,7 @@ export function Ingest() {
             overrides={overrides}
             onChange={setOverrides}
             providers={providers}
+            defaults={defaults}
           />
         </section>
 
@@ -130,11 +172,19 @@ export function Ingest() {
                 ? 'border-sodium-500 bg-sodium-700/10'
                 : 'border-ink-700 hover:border-ink-600',
             ].join(' ')}
-            onClick={() => fileInput.current?.click()}
+            onClick={() => {
+              if (busy === null) fileInput.current?.click()
+            }}
             role="button"
             tabIndex={0}
+            aria-disabled={busy !== null}
+            aria-label="Choose a video or audio file to upload"
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') fileInput.current?.click()
+              if (e.key === 'Enter' || e.key === ' ') {
+                // Space would otherwise scroll the page as well.
+                e.preventDefault()
+                if (busy === null) fileInput.current?.click()
+              }
             }}
           >
             <span className="font-display text-2xl text-ink-200">
@@ -184,19 +234,27 @@ function AdvancedOptions({
   overrides,
   onChange,
   providers,
+  defaults,
 }: {
   open: boolean
   onToggle: () => void
   overrides: JobSettingsOverrides
   onChange: (next: JobSettingsOverrides) => void
   providers: ProviderStatus[]
+  defaults: Settings | null
 }) {
   const set = <K extends keyof JobSettingsOverrides>(key: K, value: JobSettingsOverrides[K]) =>
     onChange({ ...overrides, [key]: value })
 
   return (
     <div className="mt-8">
-      <button type="button" onClick={onToggle} className="btn btn-quiet -ml-1">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="btn btn-quiet -ml-1"
+        aria-expanded={open}
+        aria-controls="job-options"
+      >
         <span
           className="inline-block transition-transform duration-300"
           style={{ transform: open ? 'rotate(90deg)' : 'none' }}
@@ -213,7 +271,14 @@ function AdvancedOptions({
         className="grid transition-[grid-template-rows] duration-400 ease-[cubic-bezier(0.16,1,0.3,1)]"
         style={{ gridTemplateRows: open ? '1fr' : '0fr' }}
       >
-        <div className="overflow-hidden">
+        {/* `inert` while collapsed: the 0fr row hides the fields visually,
+            but without it they stayed in the tab order, invisible. */}
+        <div
+          id="job-options"
+          className="overflow-hidden"
+          // React 18 has no typed `inert` prop; an empty string sets the attribute.
+          {...(open ? {} : { inert: '' })}
+        >
           <div className="grid gap-x-8 gap-y-5 pt-5 sm:grid-cols-2">
             <Selector
               label="Provider"
@@ -244,7 +309,7 @@ function AdvancedOptions({
             <NumberField
               label="Max clips"
               value={overrides.max_clips}
-              placeholder="10"
+              placeholder={String(defaults?.clips.max_clips ?? 10)}
               min={1}
               max={50}
               onChange={(v) => set('max_clips', v)}
@@ -253,7 +318,7 @@ function AdvancedOptions({
               <NumberField
                 label="Min length (s)"
                 value={overrides.min_duration_s}
-                placeholder="20"
+                placeholder={String(defaults?.clips.min_duration_s ?? 20)}
                 min={5}
                 max={300}
                 onChange={(v) => set('min_duration_s', v)}
@@ -261,17 +326,20 @@ function AdvancedOptions({
               <NumberField
                 label="Max length (s)"
                 value={overrides.max_duration_s}
-                placeholder="90"
+                placeholder={String(defaults?.clips.max_duration_s ?? 90)}
                 min={5}
                 max={300}
                 onChange={(v) => set('max_duration_s', v)}
               />
             </div>
+            {/* Shows the saved default until touched, and sends an explicit
+                true/false once it is: "unchecked" used to mean "use the
+                default", so a job could not opt out when the default was on. */}
             <label className="flex items-center gap-3 text-sm text-ink-200 sm:col-span-2">
               <input
                 type="checkbox"
-                checked={overrides.diarization ?? false}
-                onChange={(e) => set('diarization', e.target.checked || undefined)}
+                checked={overrides.diarization ?? defaults?.whisper.diarization ?? false}
+                onChange={(e) => set('diarization', e.target.checked)}
                 className="size-4 accent-sodium-500"
               />
               Multiple speakers — label who is talking, and cut to them
@@ -281,6 +349,33 @@ function AdvancedOptions({
       </div>
     </div>
   )
+}
+
+/**
+ * Mirror the server's checks on per-job overrides (JobSettingsIn and the
+ * min < max rule in create_job), so a typo is caught before the download.
+ * Returns the problem, or null when the overrides are acceptable.
+ */
+function validateOverrides(
+  overrides: JobSettingsOverrides,
+  defaults: Settings | null,
+): string | null {
+  const { max_clips, min_duration_s, max_duration_s } = overrides
+  if (max_clips !== undefined && (!Number.isInteger(max_clips) || max_clips < 1 || max_clips > 50)) {
+    return 'Max clips must be a whole number from 1 to 50.'
+  }
+  for (const [label, value] of [
+    ['Min length', min_duration_s],
+    ['Max length', max_duration_s],
+  ] as const) {
+    if (value !== undefined && !(value > 0)) return `${label} must be more than 0 seconds.`
+  }
+  const min = min_duration_s ?? defaults?.clips.min_duration_s
+  const max = max_duration_s ?? defaults?.clips.max_duration_s
+  if (min !== undefined && max !== undefined && min >= max) {
+    return `Min length (${min}s) must be below max length (${max}s).`
+  }
+  return null
 }
 
 function Selector({

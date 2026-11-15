@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import {
@@ -29,6 +29,7 @@ export function Review() {
   const [wordsDirty, setWordsDirty] = useState(false)
   const [savingWords, setSavingWords] = useState(false)
   const [exporting, setExporting] = useState<Set<string>>(new Set())
+  const [exportingKept, setExportingKept] = useState(false)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
@@ -48,19 +49,40 @@ export function Review() {
     [clips, selectedId],
   )
 
+  // The clip whose words are currently loaded. Responses for any other clip
+  // are stale and must be dropped: flicking through the list let clip A's
+  // late words land on clip B, and "Save edits" then wrote A's captions
+  // onto B.
+  const currentClipId = useRef<string | null>(null)
+  currentClipId.current = selected?.id ?? null
+
   useEffect(() => {
     if (!selected) return
+    let stale = false
     setWordsDirty(false)
+    setWords([])
+    setCropPath(null)
     api
       .getClipWords(selected.id)
-      .then(setWords)
-      .catch(() => setWords([]))
+      .then((loaded) => {
+        if (!stale) setWords(loaded)
+      })
+      .catch(() => {
+        if (!stale) setWords([])
+      })
     // 404 is expected for audio-only sources and jobs that never reframed; the
     // player falls back to a centre crop, matching what the renderer does.
     api
       .getCropPath(selected.id)
-      .then(setCropPath)
-      .catch(() => setCropPath(null))
+      .then((loaded) => {
+        if (!stale) setCropPath(loaded)
+      })
+      .catch(() => {
+        if (!stale) setCropPath(null)
+      })
+    return () => {
+      stale = true
+    }
   }, [selected?.id])
 
   const patchClip = useCallback((updated: Clip) => {
@@ -77,9 +99,14 @@ export function Review() {
 
   const commitTrim = async (start: number, end: number) => {
     if (!selected) return
+    const clipId = selected.id
     try {
-      patchClip(await api.patchClip(selected.id, { start_s: start, end_s: end }))
-      setWords(await api.getClipWords(selected.id))
+      patchClip(await api.patchClip(clipId, { start_s: start, end_s: end }))
+      const trimmedWords = await api.getClipWords(clipId)
+      if (currentClipId.current === clipId) {
+        setWords(trimmedWords)
+        setWordsDirty(false)
+      }
     } catch (err) {
       setError(err as Error)
     }
@@ -87,10 +114,11 @@ export function Review() {
 
   const saveWords = async () => {
     if (!selected) return
+    const clipId = selected.id
     setSavingWords(true)
     try {
-      patchClip(await api.patchCaptions(selected.id, { words }))
-      setWordsDirty(false)
+      patchClip(await api.patchCaptions(clipId, { words }))
+      if (currentClipId.current === clipId) setWordsDirty(false)
     } catch (err) {
       setError(err as Error)
     } finally {
@@ -132,8 +160,16 @@ export function Review() {
   }
 
   const exportKept = async () => {
-    const targets = clips.filter((clip) => clip.status === 'kept')
-    for (const clip of targets) await exportClip(clip)
+    // Guarded: a second click used to queue a second full pass, rendering
+    // every kept clip twice.
+    if (exportingKept) return
+    setExportingKept(true)
+    try {
+      const targets = clips.filter((clip) => clip.status === 'kept')
+      for (const clip of targets) await exportClip(clip)
+    } finally {
+      setExportingKept(false)
+    }
   }
 
   const keptCount = clips.filter((clip) => clip.status === 'kept').length
@@ -165,8 +201,12 @@ export function Review() {
           <span className="numeric text-xs text-ink-500">
             {clips.length} clips · {keptCount} kept
           </span>
-          <button onClick={exportKept} disabled={keptCount === 0} className="btn btn-primary">
-            Export kept
+          <button
+            onClick={exportKept}
+            disabled={keptCount === 0 || exportingKept}
+            className="btn btn-primary"
+          >
+            {exportingKept ? 'Exporting…' : 'Export kept'}
           </button>
         </div>
       </div>
@@ -263,6 +303,7 @@ export function Review() {
                       <button
                         key={style.key}
                         onClick={() => setStyle(selected, style.key)}
+                        aria-pressed={style.key === selected.caption_style}
                         className={[
                           'block w-full border-l-2 py-2 pl-3 text-left transition-colors duration-200',
                           style.key === selected.caption_style
@@ -286,6 +327,7 @@ export function Review() {
                       <button
                         key={ratio}
                         onClick={() => setRatio(selected, ratio)}
+                        aria-pressed={ratio === selected.ratio}
                         className={[
                           'numeric btn',
                           ratio === selected.ratio ? 'btn-primary' : 'btn-ghost',
@@ -363,8 +405,15 @@ function ClipRow({
       onClick={onSelect}
       role="button"
       tabIndex={0}
+      aria-current={selected ? 'true' : undefined}
       onKeyDown={(e) => {
-        if (e.key === 'Enter') onSelect()
+        // Only keys aimed at the row itself: Enter on the keep/drop buttons
+        // inside it must not also re-select.
+        if (e.target !== e.currentTarget) return
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onSelect()
+        }
       }}
     >
       {/* The score is the thing you scan by, so it gets the display face. */}
@@ -393,7 +442,11 @@ function ClipRow({
           <span
             className={[
               'ml-auto flex gap-3 pr-2 transition-opacity duration-200',
-              selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+              // focus-within: keyboard users tabbing onto an invisible
+              // button could not see what they were about to press.
+              selected
+                ? 'opacity-100'
+                : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
             ].join(' ')}
           >
             <button
@@ -401,6 +454,8 @@ function ClipRow({
                 e.stopPropagation()
                 onKeep()
               }}
+              aria-pressed={clip.status === 'kept'}
+              aria-label={`Keep ${clip.title || 'clip'}`}
               className={`text-xs ${clip.status === 'kept' ? 'text-signal-good' : 'text-ink-400 hover:text-ink-100'}`}
             >
               {clip.status === 'kept' ? 'kept' : 'keep'}
@@ -410,6 +465,7 @@ function ClipRow({
                 e.stopPropagation()
                 onDiscard()
               }}
+              aria-label={`${clip.status === 'discarded' ? 'Restore' : 'Drop'} ${clip.title || 'clip'}`}
               className="text-xs text-ink-400 hover:text-signal-bad"
             >
               {clip.status === 'discarded' ? 'undo' : 'drop'}

@@ -20,6 +20,7 @@ export function JobProgress() {
   const navigate = useNavigate()
   const { job, progress } = useJobStream(jobId)
   const [cancelling, setCancelling] = useState(false)
+  const [retrying, setRetrying] = useState(false)
   const [actionError, setActionError] = useState<Error | null>(null)
 
   useEffect(() => {
@@ -42,20 +43,25 @@ export function JobProgress() {
     setActionError(null)
     try {
       await api.cancelJob(job.id)
+      // Stay "Cancelling…" on success: a running job only stops at its next
+      // cancel check, and re-enabling the button meanwhile invited repeat
+      // clicks on a job that was already on its way out. The button goes
+      // away when the stream reports "cancelled".
     } catch (err) {
       setActionError(err as Error)
-    } finally {
       setCancelling(false)
     }
   }
 
   const retry = async () => {
+    setRetrying(true)
     setActionError(null)
     try {
       await api.retryJob(job.id)
       window.location.reload()
     } catch (err) {
       setActionError(err as Error)
+      setRetrying(false)
     }
   }
 
@@ -87,8 +93,8 @@ export function JobProgress() {
             </button>
           )}
           {(job.status === 'failed' || job.status === 'cancelled') && (
-            <button onClick={retry} className="btn btn-primary">
-              Retry
+            <button onClick={retry} disabled={retrying} className="btn btn-primary">
+              {retrying ? 'Retrying…' : 'Retry'}
             </button>
           )}
           {job.status === 'done' && (

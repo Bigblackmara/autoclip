@@ -66,6 +66,42 @@ being validated against a fixed golden video set — see
   - [docs/LIVE_WATCH.md](docs/LIVE_WATCH.md) — the user guide, including what
     is verified so far and what isn't.
 
+### Fixed
+
+- **YouTube downloads**: yt-dlp is given every installed JavaScript runtime
+  (Deno, Node, Bun) for YouTube's player challenge, and `yt-dlp[default]` is a
+  dependency. HTTP 403/429 and "only images available" now explain that YouTube
+  refused the network (usually a VPN) instead of showing a raw error.
+  `autoclip update-ytdlp` falls back to uv when the environment has no pip.
+- **Batch jobs honour their own options**: clip lengths and count, ratio,
+  caption style and Whisper model chosen for a job were silently replaced by the
+  saved settings.
+- **Cancel and retry**: cancelling during transcription or a render is recorded
+  as *cancelled* (not failed), a cancelled job can be retried, and a retry skips
+  clips already exported.
+- **Providers**: Anthropic requests no longer 400 on current models;
+  OpenAI-compatible endpoints that reject `temperature` or `response_format`
+  are retried without it; Gemini can no longer hang the queue; Ollama gets a
+  context window large enough for the prompt. When every window fails, the job
+  shows the provider's error rather than "No clips were found".
+- **Exports**: files carry a rank prefix (`01-title_9x16.mp4`) so duplicate or
+  emoji titles can't overwrite each other; renders are written to a temporary
+  file and renamed, so a failed render never leaves a truncated MP4 or destroys
+  the previous one; after a ratio change or trim, re-export no longer stretches
+  framing computed for the old shape or length;
+  audio-only sources render over a generated background; captions show braces
+  and backslashes literally.
+- **Web UI**: the review page pre-selects each clip's job ratio and caption
+  style (and keeps the style when only the ratio changes); re-exporting to the
+  same file replaces its download entry instead of listing a stale one;
+  switching clips quickly can no longer load (and save) one clip's captions
+  onto another; "Export kept" and Cancel can't be double-fired; long multi-line
+  errors wrap and keep their line breaks; validation errors name the field;
+  job options are checked before the download starts; the per-job speakers
+  checkbox can turn diarization off; the recent-jobs list refreshes while a job
+  runs; settings edits send only the changed field, so quick successive edits
+  no longer revert each other, and clearing a number field no longer saves 0.
+
 ### Notable fixes during development
 
 Each of these was found by running the thing, not by reading it:
