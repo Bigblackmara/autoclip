@@ -648,6 +648,9 @@ def _resolve_with_ytdlp(url: str) -> str:
         "logger": _Quiet(),
         "socket_timeout": RESOLVE_TIMEOUT_S,
     }
+    from ..pipeline.ingest import js_runtime_options
+
+    options.update(js_runtime_options())
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)

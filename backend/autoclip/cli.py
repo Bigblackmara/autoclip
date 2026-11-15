@@ -612,16 +612,32 @@ def fetch_models() -> None:
 @app.command("update-ytdlp")
 def update_ytdlp() -> None:
     """Update yt-dlp, which YouTube changes force often."""
+    import shutil
     import subprocess
     import sys
 
     console.print("[cyan]Updating yt-dlp...[/cyan]")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
-        capture_output=True,
-        text=True,
-        check=False,
+    # The `default` extra carries yt-dlp-ejs, the solver YouTube's player
+    # challenge needs. Environments made by uv have no pip, so use uv there.
+    package = "yt-dlp[default]"
+    has_pip = (
+        subprocess.run(
+            [sys.executable, "-m", "pip", "--version"], capture_output=True, check=False
+        ).returncode
+        == 0
     )
+    uv = shutil.which("uv")
+    if has_pip:
+        command = [sys.executable, "-m", "pip", "install", "--upgrade", package]
+    elif uv:
+        command = [uv, "pip", "install", "--python", sys.executable, "--upgrade", package]
+    else:
+        console.print(
+            "[red]Update failed.[/red] This environment has neither pip nor uv. "
+            f"Install uv, or run: {sys.executable} -m ensurepip"
+        )
+        raise typer.Exit(1)
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         console.print(f"[red]Update failed.[/red]\n{result.stderr}")
         raise typer.Exit(1)

@@ -41,6 +41,32 @@ _BOT_CHECK_MARKERS = (
 )
 
 
+#: yt-dlp error fragments that mean YouTube refused this network address
+#: outright (rate limiting or a blocked VPN / datacenter range).
+_BLOCKED_MARKERS = (
+    "http error 403",
+    "http error 429",
+    "too many requests",
+    "only images are available",
+    "no video formats found",
+)
+
+#: JavaScript runtimes yt-dlp can use to solve YouTube's player challenge, in
+#: yt-dlp's own order of preference. Without one, YouTube serves storyboard
+#: images only and every real download fails.
+_JS_RUNTIMES = ("deno", "node", "bun")
+
+
+def js_runtime_options() -> dict:
+    """yt-dlp ``js_runtimes`` for whichever runtimes are installed.
+
+    yt-dlp only enables Deno by default, but most Windows machines have Node
+    instead, which works just as well once it is named here.
+    """
+    found = {name: {} for name in _JS_RUNTIMES if shutil.which(name)}
+    return {"js_runtimes": found} if found else {}
+
+
 class IngestError(RuntimeError):
     """Ingestion failed in a way worth explaining to the user."""
 
@@ -111,6 +137,7 @@ def ingest_youtube(
         "progress_hooks": [hook],
         "retries": 3,
         "fragment_retries": 3,
+        **js_runtime_options(),
     }
     if settings.cookies_from_browser:
         # yt-dlp expects a tuple; only the browser name is required.
@@ -175,6 +202,19 @@ def _translate_ytdlp_error(exc: Exception, settings: IngestSettings) -> IngestEr
                 "while AutoClip downloads."
             )
         return IngestError("YouTube blocked this download with a bot check.", hint=hint)
+
+    if any(marker in message for marker in _BLOCKED_MARKERS):
+        return IngestError(
+            "YouTube refused to serve this video to your network.",
+            hint=(
+                "YouTube rate-limits and blocks many VPN and datacenter addresses "
+                "(Cloudflare WARP, Proton VPN and similar). Turn the VPN off, or "
+                "exclude youtube.com from it, and try again — or set "
+                "`ingest.cookies_from_browser` so the download is signed in. If it "
+                "still fails, run `autoclip update-ytdlp`.\n\n"
+                f"Original error: {exc}"
+            ),
+        )
 
     if "private video" in message or "members-only" in message:
         return IngestError(
