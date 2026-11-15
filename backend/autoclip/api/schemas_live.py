@@ -6,9 +6,9 @@ chosen to match them exactly. Row dataclasses (``live.models``) stay the
 storage shape; these are the API boundary, the same split as
 ``api/schemas.py`` vs ``db/models.py``.
 
-Deviations from api.ts: none. The only additive fields are ``capturing`` /
-``detail`` on LiveStreamOut (F1's poll backfills via its own list call) —
-both optional with safe defaults so the frontend shape still validates.
+Additive fields beyond the original api.ts: ``clip_count`` on LiveStreamOut
+(ready clips of the stream) — optional with a safe default so the frontend
+shape still validates.
 """
 
 from __future__ import annotations
@@ -35,39 +35,47 @@ class LiveStreamOut(BaseModel):
     url: str
     label: str
     enabled: bool
+    #: ``off`` for a paused/disabled stream (and while Live Watch is off).
     state: str
     state_detail: str
     last_error: str | None = None
     created_at: str
     updated_at: str
+    #: Number of READY clips this stream produced.
+    clip_count: int = 0
 
     @classmethod
-    def of(cls, row: models.LiveStreamRow) -> LiveStreamOut:
+    def of(cls, row: models.LiveStreamRow, clip_count: int = 0) -> LiveStreamOut:
+        state = row.state if isinstance(row.state, str) else str(row.state)
         return cls(
             id=row.id,
             url=row.url,
             label=row.label,
             enabled=row.enabled,
-            state=row.state if isinstance(row.state, str) else str(row.state),
+            state=state if row.enabled else "off",
             state_detail=row.state_detail or "",
             last_error=row.last_error,
             created_at=row.created_at,
             updated_at=row.updated_at,
+            clip_count=int(clip_count or 0),
         )
 
     @classmethod
     def of_snapshot(cls, snapshot: dict) -> LiveStreamOut:
         """Build from ``manager.stream_snapshot()`` — the API-facing view."""
+        enabled = bool(snapshot.get("enabled", True))
+        state = snapshot.get("state") or "waiting_for_live"
         return cls(
             id=snapshot["id"],
             url=snapshot["url"],
             label=snapshot.get("label") or "",
-            enabled=bool(snapshot.get("enabled", True)),
-            state=snapshot.get("state") or "waiting_for_live",
+            enabled=enabled,
+            state=state if enabled else "off",
             state_detail=snapshot.get("detail") or "",
             last_error=snapshot.get("error"),
             created_at=snapshot.get("created_at") or "",
             updated_at=snapshot.get("updated_at") or "",
+            clip_count=int(snapshot.get("clip_count") or 0),
         )
 
 
@@ -191,9 +199,10 @@ class LiveCapsOut(BaseModel):
 
 
 class LiveStatusOut(BaseModel):
-    """``LiveStatus`` in api.ts: enabled, watching, clipping, caps."""
+    """``LiveStatus`` in api.ts: enabled, running, watching, clipping, caps."""
 
     enabled: bool
+    running: bool = False
     watching: int
     clipping: int
     caps: dict[str, float | int]

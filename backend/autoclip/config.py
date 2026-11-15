@@ -144,12 +144,40 @@ def load() -> Settings:
     return settings
 
 
+def _foreign_sections(path: Path) -> dict[str, Any]:
+    """Top-level keys of the existing file that :class:`Settings` does not own.
+
+    config.json is shared: feature sections such as Live Watch's ``live``
+    live beside the core settings without being part of this model
+    (``extra="ignore"`` drops them on load). A save must carry them through
+    untouched, or every Settings save would silently wipe them.
+    ``_fallback_secrets`` is excluded on purpose: it is owned by the
+    Settings object being saved, so a deleted fallback secret must not be
+    resurrected from the old file.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    owned = set(Settings.model_fields) | {"_fallback_secrets"}
+    return {key: value for key, value in raw.items() if key not in owned}
+
+
 def save(settings: Settings) -> None:
-    """Write settings to disk atomically, with owner-only permissions."""
+    """Write settings to disk atomically, with owner-only permissions.
+
+    Unknown top-level sections already in the file (e.g. ``live``) are
+    preserved verbatim.
+    """
     paths.ensure_layout()
     path = paths.config_path()
 
-    payload = settings.model_dump(mode="json")
+    payload = _foreign_sections(path)
+    payload.update(settings.model_dump(mode="json"))
     if settings._fallback_secrets:
         payload["_fallback_secrets"] = settings._fallback_secrets
 

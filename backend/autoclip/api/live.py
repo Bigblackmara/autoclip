@@ -18,16 +18,17 @@ Endpoint summary (from the frozen skeleton docstring, all kept):
     POST /api/live/streams/{id}/pause      pause
     POST /api/live/streams/{id}/resume     resume
     GET  /api/live/streams/{id}/events     SSE: state + clip events for stream
-    GET  /api/live/clips                   list live clips (all streams)
+    GET  /api/live/clips?status=a,b        list live clips (all streams)
     GET  /api/live/clips/{id}              one clip
     GET  /api/live/clips/{id}/media        the rendered mp4 (FileResponse)
+    POST /api/live/clips/{id}/retry        re-render a failed clip (409 if not)
     GET  /api/live/events                  SSE: global live feed (states+clips)
     GET  /api/live/uploads                 list upload records
     POST /api/live/clips/{id}/upload       {platform} manual upload trigger
-    POST /api/live/clips/{id}/discard      drop a clip without rendering
-    GET  /api/live/status                  {enabled, watching, clipping, caps}
+    POST /api/live/clips/{id}/discard      drop a clip (tombstone)
+    GET  /api/live/status                  {enabled, running, watching, clipping, caps}
     GET  /api/live/settings                LiveSettings (read)
-    PUT  /api/live/settings                LiveSettings (write, validated)
+    PUT  /api/live/settings                LiveSettings (write, validated, applied)
     POST /api/live/uploads/youtube/start   OAuth start (returns redirect URL)
     POST /api/live/uploads/instagram/start OAuth start (returns redirect URL)
     GET  /api/live/uploads/youtube/status   token present? account ok?
@@ -36,14 +37,22 @@ Endpoint summary (from the frozen skeleton docstring, all kept):
     POST /api/live/uploads/{platform}/credentials user's own app id/secret
     GET/POST /api/live/uploads/attestation        rights-acceptance state
 
+Gate: ``/status``, ``/streams`` (GET), settings and the store-backed reads
+always answer. Mutating manager endpoints answer 409 ("Live Watch is turned
+off…") while the feature is switched off, and 503 while it is on but the
+process runs without workers.
+
 Error mapping (integration-ledger §4): RightsNotAccepted → 400 "accept
-the rights notice", NotLinkedError → 409, UploadApiError → 502.
+the rights notice", NotLinkedError → 409, UploadApiError → 502. Upload
+refusals of the rights/linking pre-checks are NOT persisted (nothing was
+attempted); an upload already running or done for the clip/platform is 409.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import secrets as _secrets
@@ -70,23 +79,46 @@ router = APIRouter(prefix="/api/live", tags=["live"])
 
 #: The shared all-clips channel (watcher.py naming contract).
 CLIPS_CHANNEL = "live:-:clips"
+#: The shared stream-state channel (``stream_state`` events).
+STREAMS_CHANNEL = "live:-:streams"
+
+#: 409 detail while the feature switch is off (frontend contract).
+LIVE_OFF_DETAIL = "Live Watch is turned off. Turn it on in Live settings."
+NOT_RUNNING_DETAIL = "Live Watch is not running."
 
 
 # --------------------------------------------------------------------------
-# Manager access — lazy, 503 while the feature isn't running
+# Manager access — lazy; 409 while switched off, 503 while not running
 # --------------------------------------------------------------------------
+
+
+def _singleton():
+    from ..live.manager import manager
+
+    return manager
+
+
+def _manager_enabled(m) -> bool:
+    enabled = getattr(m, "enabled", None)
+    if isinstance(enabled, bool):
+        return enabled
+    with contextlib.suppress(Exception):
+        return bool(m.status().get("enabled", True))
+    return True
 
 
 async def _manager():
-    """The live manager singleton; 503 unless started.
+    """The live manager singleton, for endpoints that need it RUNNING.
 
-    A disabled or stopped live feature must say "not running" rather than
-    pretend to be an empty feature — the frozen docstring contract.
+    Switched off in settings → 409 with the "turn it on" detail; on but not
+    running (a no-worker process) → 503. Never pretends to be an empty
+    running feature.
     """
-    from ..live.manager import manager
-
+    manager = _singleton()
     if not manager.started:
-        raise HTTPException(status_code=503, detail="Live Watch is not running.")
+        if not _manager_enabled(manager):
+            raise HTTPException(status_code=409, detail=LIVE_OFF_DETAIL)
+        raise HTTPException(status_code=503, detail=NOT_RUNNING_DETAIL)
     return manager
 
 
@@ -125,9 +157,26 @@ def _status_payload(status: dict) -> dict:
     """
     caps = dict(status.get("caps") or {})
     streams = status.get("streams") or []
+    enabled = bool(status.get("enabled"))
+    running = bool(status.get("running", enabled))
+    if not enabled:
+        # Switched off: the strip says so and every number is zero.
+        return {
+            "enabled": False,
+            "running": False,
+            "watching": 0,
+            "clipping": 0,
+            "caps": {
+                "max_concurrent_streams": 0,
+                "clip_queue_len": 0,
+                "clip_queue_max": 0,
+                "disk_used_mb": 0.0,
+            },
+        }
     clipping = sum(1 for s in streams if isinstance(s, dict) and s.get("state") == "clipping")
     return {
-        "enabled": bool(status.get("enabled")),
+        "enabled": True,
+        "running": running,
         "watching": int(status.get("watching") or 0),
         "clipping": clipping,
         "caps": {
@@ -141,20 +190,31 @@ def _status_payload(status: dict) -> dict:
 
 @router.get("/status")
 async def live_status() -> dict:
-    """Whole-feature status strip for the streams panel header."""
-    m = await _manager()
+    """Whole-feature status strip — ALWAYS 200 (``enabled`` says if it's on)."""
+    m = _singleton()
     return _status_payload(m.status())
+
+
+def _snapshots(m) -> list[dict]:
+    lister = getattr(m, "list_stream_snapshots", None)
+    if lister is not None:
+        return list(lister())
+    return list(m.status().get("streams") or [])
 
 
 @router.get("/streams")
 async def list_streams() -> list[LiveStreamOut]:
-    """List every watched stream + its live state (the manager's view)."""
-    m = await _manager()
+    """Every watched stream + its live state — also while Live is off.
+
+    A stopped feature still has a watch list; its streams read ``off``.
+    """
+    m = _singleton()
     out: list[LiveStreamOut] = []
-    for snapshot in m.status().get("streams") or []:
+    # On the loop, not in a thread: the manager's state is loop-owned.
+    for snapshot in _snapshots(m):
         try:
-            out.append(LiveStreamOut.of_snapshot(m.stream_snapshot(snapshot["id"])))
-        except KeyError:
+            out.append(LiveStreamOut.of_snapshot(snapshot))
+        except (KeyError, TypeError, ValueError):
             continue  # removed between list and snapshot; the next poll has it
     return out
 
@@ -215,25 +275,16 @@ def _stored_live_section():
     section is NOT part of pydantic Settings (``extra="ignore"``), so the
     model round-trip would silently drop it.
     """
-    import json as _json
+    from ..live.settings import stored_live_section
 
-    from .. import paths
-
-    path = paths.config_path()
-    if not path.exists():
-        return None
-    try:
-        raw = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return raw.get("live") if isinstance(raw, dict) else None
+    return stored_live_section()
 
 
 def _read_settings_model():
-    """LiveSettings exactly as the manager would load it (same validation)."""
-    from ..live.manager import json_read_live_section
+    """LiveSettings exactly as the manager loads it (same parser)."""
+    from ..live.settings import parse_live_section
 
-    return json_read_live_section(_stored_live_section())
+    return parse_live_section(_stored_live_section())
 
 
 def _write_live_settings(validated) -> None:
@@ -273,15 +324,18 @@ async def get_live_settings() -> LiveSettingsOut:
 
 
 @router.put("/settings")
-async def put_live_settings(payload: dict) -> LiveSettingsOut:
-    """Full-body LiveSettings replace (frozen contract; F1/F3 send the whole).
+async def put_live_settings(payload: dict) -> dict:
+    """Full-body LiveSettings replace, persisted AND applied to the running feature.
 
     Validated through ``LiveSettings.model_validate`` before anything is
     written so an invalid tree can never corrupt config.json. A malformed
     body is a 400 with a readable ``detail`` string — the frontend decodes
-    ``detail`` strings from non-2xx responses (api.ts request()).
+    ``detail`` strings from non-2xx responses (api.ts request()). The
+    response is the stored settings plus ``"applied": true`` once the
+    running manager took them (enable/disable, budgets, thresholds,
+    workers, auto-upload); on an apply failure ``applied`` is false and
+    ``apply_error`` says why (the save itself stands).
     """
-    from ..live.manager import json_read_live_section
     from ..live.settings import LiveSettings
 
     try:
@@ -289,8 +343,20 @@ async def put_live_settings(payload: dict) -> LiveSettingsOut:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid live settings: {exc}") from exc
 
-    _write_live_settings(validated)
-    return LiveSettingsOut.of(json_read_live_section(_stored_live_section()))
+    await asyncio.to_thread(_write_live_settings, validated)
+    stored = _read_settings_model()
+    body = LiveSettingsOut.of(stored).model_dump()
+    m = _singleton()
+    apply = getattr(m, "apply_settings", None)
+    try:
+        if apply is not None:
+            await apply(stored)
+        body["applied"] = True
+    except Exception as exc:
+        log.exception("Applying live settings failed.")
+        body["applied"] = False
+        body["apply_error"] = str(exc) or type(exc).__name__
+    return body
 
 
 # --------------------------------------------------------------------------
@@ -299,12 +365,41 @@ async def put_live_settings(payload: dict) -> LiveSettingsOut:
 
 
 @router.get("/clips")
-async def list_clips(limit: int = 100) -> list[LiveClipOut]:
-    """Newest-first clips across every stream."""
+async def list_clips(limit: int = 100, status: str | None = None) -> list[LiveClipOut]:
+    """Newest-first clips across every stream.
+
+    ``status`` filters by a comma-separated list (``?status=ready,failed``).
+    Rejected clips carry their ``reason``.
+    """
     from ..live import store
 
-    rows = await asyncio.to_thread(store.list_clips, None, limit)
+    statuses = [s.strip() for s in (status or "").split(",") if s.strip()] or None
+    rows = await asyncio.to_thread(
+        lambda: store.list_clips(None, max(1, int(limit)), statuses=statuses)
+    )
     return [LiveClipOut.of(row) for row in rows]
+
+
+@router.post("/clips/{clip_id}/retry")
+async def retry_clip(clip_id: str) -> LiveClipOut:
+    """Re-enqueue a failed clip whose window is still on disk (409 otherwise)."""
+    from ..live import store
+    from ..live.manager import RetryRefused
+
+    row = await asyncio.to_thread(store.get_clip, clip_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    m = _singleton()
+    if not m.started:
+        detail = LIVE_OFF_DETAIL if not _manager_enabled(m) else NOT_RUNNING_DETAIL
+        raise HTTPException(status_code=409, detail=detail)
+    try:
+        updated = await m.retry_clip(clip_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Clip not found.") from exc
+    except RetryRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return LiveClipOut.of(updated)
 
 
 @router.get("/clips/{clip_id}")
@@ -335,7 +430,13 @@ async def clip_media(clip_id: str) -> FileResponse:
 
 @router.post("/clips/{clip_id}/discard")
 async def discard_clip(clip_id: str) -> LiveClipOut:
-    """Drop a clip without rendering: status → 'rejected' on the row."""
+    """Drop a clip: status → 'rejected' on the row — a TOMBSTONE.
+
+    Every worker checks it atomically before each status write, before the
+    render and before an auto-upload: a queued clip is never rendered, a
+    rendering one never surfaces as ready, a detecting one stops before
+    the paid judge call.
+    """
     from ..live import store
     from ..live.events import publish
 
@@ -380,41 +481,43 @@ def _upload_meta_for(row, platform: str):
     return UploadMeta(title=title, description=row.hook or "")
 
 
-async def _record_upload_outcome(
-    clip_id: str,
-    platform: str,
+async def _finish_upload_row(
+    row,
     *,
     result=None,
     error: str | None = None,
     status: str = "done",
 ) -> LiveUploadOut:
-    """Persist one live_uploads row and publish it on the clips channel.
+    """Settle the in-flight ``uploading`` row and publish it on the clips feed.
 
-    Mirrors the manager's auto-upload path (integration ledger §3): refusals
-    land as 'skipped' rows with the reason, platform failures as 'failed',
-    successes carry ``media_id``/``url`` into ``platform_media_id``/
-    ``upload_url``. F2 renders the row either from the POST response or
-    from the 'upload' SSE frame — same shape, both paths.
+    Platform failures land as 'failed' with the reason, successes carry
+    ``media_id``/``url`` into ``platform_media_id``/``upload_url``. F2
+    renders the row either from the POST response or from the 'upload' SSE
+    frame — same shape, both paths.
     """
     from ..live import store
     from ..live.events import publish
-    from ..live.models import LiveUploadRow, new_id, utcnow
 
-    row = LiveUploadRow(
-        id=new_id(),
-        clip_id=clip_id,
-        platform=platform,
-        status=status,
-        upload_url=(getattr(result, "url", "") or "") if result is not None else "",
-        platform_media_id=(getattr(result, "media_id", "") or "") if result is not None else "",
-        error=error,
-        created_at=utcnow(),
-        updated_at=utcnow(),
+    fields: dict = {"status": status, "error": error}
+    if result is not None:
+        fields["upload_url"] = getattr(result, "url", "") or ""
+        fields["platform_media_id"] = getattr(result, "media_id", "") or ""
+    await asyncio.to_thread(store.update_upload, row.id, **fields)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    stored = next(
+        (r for r in await asyncio.to_thread(store.list_uploads, row.clip_id) if r.id == row.id),
+        row,
     )
-    await asyncio.to_thread(store.create_upload, row)
-    out = LiveUploadOut.of(row)
+    out = LiveUploadOut.of(stored)
     publish(CLIPS_CHANNEL, "upload", out.model_dump())
     return out
+
+
+#: (clip_id, platform) pairs with a manual upload request in flight in this
+#: process — checked and claimed with no await in between, so a double
+#: click cannot slip two uploads past the DB check.
+_uploads_in_flight: set[tuple[str, str]] = set()
 
 
 def _upload_http_error(exc: Exception) -> HTTPException:
@@ -444,12 +547,16 @@ def _upload_http_error(exc: Exception) -> HTTPException:
 async def upload_clip(clip_id: str, payload: LiveUploadIn) -> LiveUploadOut:
     """Manual upload trigger → A7's upload_youtube / upload_instagram.
 
-    Returns the LiveUpload row (F2 renders it). The error hierarchy maps to
-    400/409/502 per the ledger; RIGHTS and NOT-LINKED refusals persist a
-    'skipped' row (ledger §3), platform failures a 'failed' one — the wall
-    shows why nothing was posted in both cases.
+    Returns the LiveUpload row (F2 renders it). 409 while an upload of this
+    clip to this platform is running or once one succeeded; a new attempt
+    is allowed after ``failed``/``skipped``. The rights and account-linking
+    pre-checks refuse with 400/409 WITHOUT persisting anything (nothing was
+    attempted, and a stored refusal would only block the retry); platform
+    failures persist a 'failed' row; errors map to 400/409/502 per the
+    ledger.
     """
     from ..live import store
+    from ..live.models import LiveUploadRow, new_id, utcnow
     from ..live.uploads import upload_instagram, upload_youtube
     from ..live.uploads.tokens import (
         NotLinkedError,
@@ -458,129 +565,196 @@ async def upload_clip(clip_id: str, payload: LiveUploadIn) -> LiveUploadOut:
     )
 
     platform = _check_platform(payload.platform)
-    row = await asyncio.to_thread(store.get_clip, clip_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Clip not found.")
-    if row.status != "ready" or not row.rendered_path:
-        raise HTTPException(status_code=409, detail="Only ready clips can be uploaded.")
-
-    fn = upload_youtube if platform == "youtube" else upload_instagram
-    meta = _upload_meta_for(row, platform)
-    try:
-        result = await fn(Path(row.rendered_path), meta)
-    except RightsNotAccepted as exc:
-        await _record_upload_outcome(clip_id, platform, error=str(exc), status="skipped")
-        raise _upload_http_error(exc) from exc
-    except NotLinkedError as exc:
-        await _record_upload_outcome(clip_id, platform, error=str(exc), status="skipped")
-        raise _upload_http_error(exc) from exc
-    except UploadError as exc:
-        await _record_upload_outcome(clip_id, platform, error=str(exc), status="failed")
-        raise _upload_http_error(exc) from exc
-    except Exception as exc:
-        await _record_upload_outcome(
-            clip_id, platform, error=str(exc) or type(exc).__name__, status="failed"
+    key = (clip_id, platform)
+    if key in _uploads_in_flight:
+        raise HTTPException(
+            status_code=409, detail=f"An upload of this clip to {platform} is already running."
         )
-        raise _upload_http_error(exc) from exc
-    return await _record_upload_outcome(clip_id, platform, result=result)
+    _uploads_in_flight.add(key)  # claimed before the first await
+    try:
+        row = await asyncio.to_thread(store.get_clip, clip_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Clip not found.")
+        if row.status != "ready" or not row.rendered_path:
+            raise HTTPException(status_code=409, detail="Only ready clips can be uploaded.")
+        previous = await asyncio.to_thread(store.list_uploads, clip_id)
+        for upload in previous:
+            if upload.platform != platform:
+                continue
+            if upload.status == "uploading":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"An upload of this clip to {platform} is already running.",
+                )
+            if upload.status == "done":
+                raise HTTPException(
+                    status_code=409, detail=f"This clip was already uploaded to {platform}."
+                )
+
+        upload_row = LiveUploadRow(
+            id=new_id(),
+            clip_id=clip_id,
+            platform=platform,
+            status="uploading",
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        await asyncio.to_thread(store.create_upload, upload_row)
+        fn = upload_youtube if platform == "youtube" else upload_instagram
+        meta = _upload_meta_for(row, platform)
+        try:
+            result = await fn(Path(row.rendered_path), meta)
+        except (RightsNotAccepted, NotLinkedError) as exc:
+            # A pre-check refusal: nothing was sent. Not persisted.
+            await asyncio.to_thread(store.delete_upload, upload_row.id)
+            raise _upload_http_error(exc) from exc
+        except UploadError as exc:
+            await _finish_upload_row(upload_row, error=str(exc), status="failed")
+            raise _upload_http_error(exc) from exc
+        except Exception as exc:
+            await _finish_upload_row(
+                upload_row, error=str(exc) or type(exc).__name__, status="failed"
+            )
+            raise _upload_http_error(exc) from exc
+        return await _finish_upload_row(upload_row, result=result)
+    finally:
+        _uploads_in_flight.discard(key)
 
 
 # --------------------------------------------------------------------------
 # OAuth start / callback / credentials / status / attestation
 # --------------------------------------------------------------------------
 
-#: CSRF state tokens minted by /start, one per pending consent. In-memory:
-#: a restart invalidates pending consents, which is correct — state binds
-#: one consent round-trip, it doesn't need to survive one.
-_pending_states: dict[str, str] = {}
+#: CSRF state tokens minted by /start, one per pending consent, with the
+#: redirect_uri that consent was started for (the code exchange must send
+#: the identical value). In-memory: a restart invalidates pending consents,
+#: which is correct — state binds one consent round-trip.
+_pending_states: dict[str, tuple[str, str]] = {}
 
 
-def _redirect_uri(platform: str) -> str:
-    """The frozen callback location this server advertises as redirect_uri."""
-    return f"http://localhost:8000/api/live/uploads/{platform}/callback"
+def _redirect_uri(request: Request, platform: str) -> str:
+    """The callback location for THIS server, derived from the request.
+
+    Built from the request's base URL (scheme, host and port the browser
+    used), so a server on any port — or behind the dev proxy — advertises
+    a callback that actually reaches it. Register exactly this URL in your
+    OAuth app (the status endpoint reports it).
+    """
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/live/uploads/{platform}/callback"
 
 
 @router.post("/uploads/{platform}/start")
-async def start_upload_auth(platform: str) -> dict:
+async def start_upload_auth(platform: str, request: Request) -> dict:
     """Build the consent URL; CSRF state is minted and held here."""
     _check_platform(platform)
     uploads = _uploads_pkg()
     state = _secrets.token_urlsafe(16)
-    _pending_states[platform] = state
+    redirect_uri = _redirect_uri(request, platform)
+    _pending_states[platform] = (state, redirect_uri)
     try:
-        redirect = uploads.authorization_url(
-            platform, redirect_uri=_redirect_uri(platform), state=state
-        )
+        redirect = uploads.authorization_url(platform, redirect_uri=redirect_uri, state=state)
     except Exception as exc:
         _pending_states.pop(platform, None)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"redirect_url": redirect}
 
 
+#: The consent tab's page is static: no script, nothing loads from anywhere.
+CALLBACK_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+
+
+def _callback_response(status: str, message: str | None, status_code: int = 200) -> Response:
+    response = HTMLResponse(_callback_page(status, message), status_code=status_code)
+    response.headers["Content-Security-Policy"] = CALLBACK_CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @router.get("/uploads/{platform}/callback")
 async def upload_auth_callback(
-    platform: str, code: str = "", state: str = "", error: str = ""
+    platform: str, request: Request, code: str = "", state: str = "", error: str = ""
 ) -> Response:
     """Exchange the code, then bounce the browser to /live?connected=1.
 
     An HTML page (not JSON): this endpoint's client is the user's consent
     tab, not fetch(). A missing or mismatched state fails closed — a plain
-    400 page, no token exchange, no redirect.
+    400 page, no token exchange, no redirect. Everything echoed into the
+    page is HTML-escaped and the page ships a strict CSP: the query string
+    is attacker-controlled on an unauthenticated endpoint.
     """
     _check_platform(platform)
     uploads = _uploads_pkg()
 
     if error:
-        return HTMLResponse(
-            _callback_page("not connected", f"The platform refused the consent: {error}."),
-            status_code=400,
+        return _callback_response(
+            "not connected", f"The platform refused the consent: {error}.", 400
         )
     if not code:
-        return HTMLResponse(
-            _callback_page("not connected", "No authorization code was provided."),
-            status_code=400,
-        )
-    if state != _pending_states.get(platform):
-        return HTMLResponse(
-            _callback_page("not connected", "This authorization link has expired — start again."),
-            status_code=400,
+        return _callback_response("not connected", "No authorization code was provided.", 400)
+    pending = _pending_states.get(platform)
+    if pending is None or not state or not _secrets.compare_digest(state, pending[0]):
+        return _callback_response(
+            "not connected", "This authorization link has expired — start again.", 400
         )
     _pending_states.pop(platform, None)
 
     try:
-        await uploads.exchange_code(platform, code, redirect_uri=_redirect_uri(platform))
+        await uploads.exchange_code(platform, code, redirect_uri=pending[1])
     except Exception as exc:
         log.warning("OAuth code exchange failed for %s: %s", platform, exc)
-        return HTMLResponse(
-            _callback_page("not connected", f"Connecting failed: {type(exc).__name__}."),
-            status_code=502,
-        )
-    return HTMLResponse(_callback_page("connected", None))
+        return _callback_response("not connected", f"Connecting failed: {type(exc).__name__}.", 502)
+    return _callback_response("connected", None)
 
 
 def _callback_page(status: str, message: str | None) -> str:
-    """Minimal page that bounces the consent tab back to the Live page."""
+    """Minimal page that bounces the consent tab back to the Live page.
+
+    Every interpolated value is HTML-escaped (``message`` carries query
+    parameters verbatim).
+    """
     target = "/live?connected=1" if status == "connected" else "/live"
-    note = f"\n  <p>{message}</p>" if message else ""
+    safe_target = html.escape(target, quote=True)
+    safe_status = html.escape(status, quote=True)
+    note = f"\n  <p>{html.escape(message, quote=True)}</p>" if message else ""
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en"><head><meta charset="utf-8">'
         "<title>AutoClip Live Watch</title>\n"
-        f'  <meta http-equiv="refresh" content="0; url={target}">\n'
+        f'  <meta http-equiv="refresh" content="0; url={safe_target}">\n'
         "</head><body>\n"
-        f"  <p>AutoClip Live — {status}.</p>{note}\n"
-        f'  <p><a href="{target}">Continue to Live Watch</a></p>\n'
+        f"  <p>AutoClip Live — {safe_status}.</p>{note}\n"
+        f'  <p><a href="{safe_target}">Continue to Live Watch</a></p>\n'
         "</body></html>"
     )
 
 
 @router.get("/uploads/{platform}/status")
-async def upload_platform_status(platform: str) -> dict:
-    """``{connected, account}`` — A7's status dicts, verbatim."""
+async def upload_platform_status(platform: str, request: Request) -> dict:
+    """A7's ``{connected, account}`` plus ``redirect_uri`` and ``has_credentials``.
+
+    ``redirect_uri`` is the exact callback URL to register in the OAuth app;
+    ``has_credentials`` says whether that app's client id/secret are stored.
+    """
     _check_platform(platform)
     uploads = _uploads_pkg()
     fn = uploads.youtube_status if platform == "youtube" else uploads.instagram_status
-    return await fn()
+    body = dict(await fn())
+    try:
+        has_credentials = (
+            await asyncio.to_thread(uploads.load_client_credentials, platform)
+        ) is not None
+    except Exception:
+        log.warning("Could not read %s client credentials.", platform, exc_info=True)
+        has_credentials = False
+    body["redirect_uri"] = _redirect_uri(request, platform)
+    body["has_credentials"] = has_credentials
+    return body
 
 
 @router.post("/uploads/{platform}/credentials")
@@ -651,11 +825,27 @@ _FRONTEND_EVENT: dict[str, str] = {
     "clip_failed": "clip_status",
     "clip_ready": "clip_status",
     "clip_producing": "clip_status",
+    "clip_rendering": "clip_status",
     # stream lifecycle → state patches (F1 streamPatch)
     "stream_added": "state",
     "stream_removed": "state",
     "stream_paused": "state",
     "stream_resumed": "state",
+    # every stream state change, on the global feed
+    "stream_state": "stream_state",
+}
+
+#: Clip lifecycle event → the row status it announces. Every clip event on
+#: the wire carries ``status`` so a patch never has to guess.
+_CLIP_EVENT_STATUS: dict[str, str] = {
+    "clip_detecting": "detecting",
+    "clip_queued": "queued",
+    "clip_producing": "rendering",
+    "clip_rendering": "rendering",
+    "clip_ready": "ready",
+    "clip_failed": "failed",
+    "clip_rejected": "rejected",
+    "clip_dropped": "rejected",
 }
 
 
@@ -722,6 +912,12 @@ def _state_patch(event: dict, channels: list[str]) -> dict:
     """
     data = dict(event.get("data") or {})
     name = str(event.get("type") or "")
+    status = _CLIP_EVENT_STATUS.get(name)
+    if status is not None:
+        data["status"] = status
+    if name == "stream_state":
+        data["type"] = "stream_state"
+        data["enabled"] = bool(data.get("enabled", True))
     if name == "state" and isinstance(data, dict):
         renamed = {}
         for key, value in data.items():
@@ -752,13 +948,14 @@ async def _pump(channel: str, queue: asyncio.Queue) -> None:
 
 @router.get("/events")
 async def global_events(request: Request) -> EventSourceResponse:
-    """The global feed: the shared clips channel (all streams' clip events).
+    """The global feed: every stream's clip events AND state changes.
 
-    Per-stream state traffic rides the frontend's 5s poll; the manager's
-    state publishes go to each stream's own channel where its dedicated
-    endpoint (/streams/{id}/events) picks them up.
+    Clip events arrive as ``clip_status`` (with ``status``) / ``upload``;
+    stream state changes as ``stream_state`` frames whose data is
+    ``{"type": "stream_state", "stream_id", "state", "enabled", ...}``.
+    A heartbeat frame keeps idle connections alive.
     """
-    return EventSourceResponse(_sse_generator(request, [CLIPS_CHANNEL]))
+    return EventSourceResponse(_sse_generator(request, [CLIPS_CHANNEL, STREAMS_CHANNEL]))
 
 
 @router.get("/streams/{stream_id}/events")

@@ -529,6 +529,39 @@ class TestYouTubeUpload:
         sent = bodies_of(transport)
         assert sent[1] == clip_file.read_bytes()  # failing PUT: the whole file
         assert sent[3] == clip_file.read_bytes()[1000:]  # resumed PUT: tail only
+        # The first PUT carries the whole file and says so; the resumed PUT
+        # MUST declare which bytes it carries (bytes off-(n-1)/n).
+        first, resumed = transport.requests[1], transport.requests[3]
+        assert "Content-Range" not in first.headers
+        assert first.headers["Content-Length"] == str(size)
+        assert resumed.headers["Content-Range"] == f"bytes 1000-{size - 1}/{size}"
+        assert resumed.headers["Content-Length"] == str(size - 1000)
+
+    async def test_probe_reporting_everything_received_fetches_the_result(
+        self, fake_keyring, attested, linked_youtube, clip_file
+    ) -> None:
+        size = clip_file.stat().st_size
+        steps = ["503", "probe-complete", "final"]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(
+                    200, headers={"Location": "https://upload.session/xyz?token=t1"}
+                )
+            step = steps.pop(0)
+            if step == "503":
+                return httpx.Response(503)
+            if step == "probe-complete":
+                return httpx.Response(200, json={"id": "ignored"})
+            assert request.headers.get("Content-Range") == f"bytes */{size}"
+            assert b"".join(request.stream) == b""
+            return httpx.Response(200, json={"id": "vid10", "snippet": {"channelTitle": "C"}})
+
+        transport = RecordingTransport(handler)
+        result = await uploads.upload_youtube(
+            clip_file, uploads.UploadMeta(title="t"), client=mock_client(transport)
+        )
+        assert result.media_id == "vid10"
 
     async def test_non_retriable_rejection_surfaces_the_redacted_error(
         self, fake_keyring, attested, linked_youtube, clip_file

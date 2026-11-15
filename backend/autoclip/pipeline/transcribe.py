@@ -82,6 +82,55 @@ def _model_load_error(exc: Exception, device: str, compute_type: str) -> Transcr
     return TranscriptionError(f"Could not load the Whisper model: {message}")
 
 
+class WhisperModelCache:
+    """Keeps loaded Whisper models alive between transcriptions (opt-in).
+
+    Loading a model costs seconds and, on the GPU, a VRAM allocation; a
+    caller that transcribes many short windows (Live Watch's judge) must not
+    pay that per call. The batch pipeline does not pass a cache, so its
+    one-model-per-job lifecycle (and VRAM release) is unchanged.
+
+    Keys are ``(factory, model, device, compute_type)``; at most
+    ``max_models`` stay resident (least recently used is dropped first).
+    """
+
+    def __init__(self, max_models: int = 1) -> None:
+        import threading
+        from collections import OrderedDict
+
+        self.max_models = max(1, int(max_models))
+        self._models: OrderedDict[tuple, object] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def loader(self, factory: Callable[..., object]) -> Callable[..., object]:
+        """A drop-in for ``factory(model, device=..., compute_type=...)``."""
+
+        def load(model: str, *, device: str, compute_type: str) -> object:
+            key = (factory, model, device, compute_type)
+            with self._lock:
+                cached = self._models.get(key)
+                if cached is not None:
+                    self._models.move_to_end(key)
+                    return cached
+                instance = factory(model, device=device, compute_type=compute_type)
+                self._models[key] = instance
+                while len(self._models) > self.max_models:
+                    self._models.popitem(last=False)
+                return instance
+
+        return load
+
+    def evict(self, device: str | None = None) -> None:
+        """Drop cached models (only ``device``'s when given)."""
+        with self._lock:
+            for key in [k for k in self._models if device is None or k[2] == device]:
+                self._models.pop(key, None)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._models)
+
+
 def transcribe(
     audio: Path,
     settings: WhisperSettings | None = None,
@@ -89,8 +138,12 @@ def transcribe(
     duration_s: float | None = None,
     on_progress: Callable[[float], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    model_cache: WhisperModelCache | None = None,
 ) -> Transcript:
     """Transcribe an audio file into a :class:`Transcript` with word timings.
+
+    ``model_cache`` (optional) reuses a loaded model across calls; a GPU
+    runtime failure evicts the cached CUDA model before the CPU retry.
 
     Preconditions:
         audio is a decodable audio file, ideally 16 kHz mono as produced by
@@ -111,7 +164,91 @@ def transcribe(
             "faster-whisper is not installed. Run `autoclip doctor` for details."
         ) from exc
 
+    factory = WhisperModel if model_cache is None else model_cache.loader(WhisperModel)
     device, compute_type = resolve_compute(settings)
+    run = {
+        "audio": audio,
+        "settings": settings,
+        "duration_s": duration_s,
+        "on_progress": on_progress,
+        "cancelled": cancelled,
+    }
+    try:
+        transcript = _run_whisper(factory, device=device, compute_type=compute_type, **run)
+    except _GPURuntimeFailure as exc:
+        if model_cache is not None:
+            # A CUDA model that failed at encode would fail the same way next
+            # time; only the CPU fallback may stay resident.
+            model_cache.evict(device)
+        # The GPU is present but its runtime is not (missing cuBLAS/cuDNN, a
+        # driver mismatch, out of memory). The CPU produces the same transcript,
+        # only slower — far better than failing a long job at 5 %.
+        cpu_type = _cpu_compute_type()
+        log.warning(
+            "Whisper could not run on the GPU (%s). Transcribing on the CPU instead "
+            "(compute_type=%s) — same result, slower. Run `autoclip doctor` to fix the GPU.",
+            exc,
+            cpu_type,
+        )
+        if on_progress:
+            on_progress(0.0)
+        transcript = _run_whisper(factory, device="cpu", compute_type=cpu_type, **run)
+
+    if on_progress:
+        on_progress(1.0)
+
+    log.info(
+        "Transcribed %d words in %d segments.", len(transcript.words), len(transcript.segments)
+    )
+    return transcript
+
+
+class _GPURuntimeFailure(RuntimeError):
+    """Whisper failed on CUDA for a reason the CPU does not share."""
+
+
+#: Lower-cased fragments of CTranslate2 / CUDA errors that mean "this GPU
+#: cannot run inference right now", as opposed to a bad file or a bad setting.
+_GPU_RUNTIME_MARKERS = (
+    "cublas",
+    "cudnn",
+    "cuda",
+    "cannot be loaded",
+    ".dll",
+    "libcu",
+    "out of memory",
+)
+
+
+def _is_gpu_runtime_failure(exc: BaseException) -> bool:
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _GPU_RUNTIME_MARKERS)
+
+
+def _cpu_compute_type() -> str:
+    """Best compute type for a CPU fallback, asked of CTranslate2 itself."""
+    from ..system import query_compute_types
+
+    return GPUInfo(accel="cpu", supported_compute_types=query_compute_types("cpu")).compute_type
+
+
+def _run_whisper(
+    whisper_model,
+    *,
+    audio: Path,
+    settings: WhisperSettings,
+    device: str,
+    compute_type: str,
+    duration_s: float | None,
+    on_progress: Callable[[float], None] | None,
+    cancelled: Callable[[], bool] | None,
+) -> Transcript:
+    """One full transcription attempt on one device.
+
+    GPU-runtime failures — at model load *or* at the first encode, which is
+    where a missing cuBLAS actually surfaces — are raised as
+    :class:`_GPURuntimeFailure` so the caller can retry on the CPU.
+    """
     log.info(
         "Transcribing with model=%s device=%s compute_type=%s",
         settings.model,
@@ -120,53 +257,65 @@ def transcribe(
     )
 
     try:
-        model = WhisperModel(settings.model, device=device, compute_type=compute_type)
+        model = whisper_model(settings.model, device=device, compute_type=compute_type)
     except Exception as exc:
+        if device == "cuda" and _is_gpu_runtime_failure(exc):
+            raise _GPURuntimeFailure(str(exc)) from exc
         raise _model_load_error(exc, device, compute_type) from exc
 
-    segments_iter, info = model.transcribe(
-        str(audio),
-        language=settings.language or None,
-        word_timestamps=True,
-        vad_filter=True,
-        # Trims long silences before decoding, which both speeds things up and
-        # stops Whisper hallucinating text into empty audio.
-        vad_parameters={"min_silence_duration_ms": 500},
-    )
-
-    total = duration_s or getattr(info, "duration", 0.0) or 0.0
     transcript = Transcript(
-        language=getattr(info, "language", "") or settings.language,
+        language=settings.language,
         model=settings.model,
         source="whisper",
     )
-
-    for segment in segments_iter:
-        if cancelled is not None and cancelled():
-            raise TranscriptionError("Transcription cancelled.")
-
-        first_word = len(transcript.words)
-        for word in getattr(segment, "words", None) or []:
-            text = (word.word or "").strip()
-            if not text:
-                continue
-            transcript.words.append(Word(text=text, start=float(word.start), end=float(word.end)))
-
-        # A segment with no word timings still carries text worth keeping for
-        # display, but it can't contribute to word-indexed clip boundaries.
-        last_word = max(first_word, len(transcript.words) - 1)
-        transcript.segments.append(
-            Segment(
-                text=(segment.text or "").strip(),
-                start=float(segment.start),
-                end=float(segment.end),
-                first_word=first_word,
-                last_word=last_word,
-            )
+    try:
+        segments_iter, info = model.transcribe(
+            str(audio),
+            language=settings.language or None,
+            word_timestamps=True,
+            vad_filter=True,
+            # Trims long silences before decoding, which both speeds things up and
+            # stops Whisper hallucinating text into empty audio.
+            vad_parameters={"min_silence_duration_ms": 500},
         )
 
-        if on_progress and total:
-            on_progress(min(1.0, float(segment.end) / total))
+        total = duration_s or getattr(info, "duration", 0.0) or 0.0
+        transcript.language = getattr(info, "language", "") or settings.language
+
+        for segment in segments_iter:
+            if cancelled is not None and cancelled():
+                raise TranscriptionError("Transcription cancelled.")
+
+            first_word = len(transcript.words)
+            for word in getattr(segment, "words", None) or []:
+                text = (word.word or "").strip()
+                if not text:
+                    continue
+                transcript.words.append(
+                    Word(text=text, start=float(word.start), end=float(word.end))
+                )
+
+            # A segment with no word timings still carries text worth keeping for
+            # display, but it can't contribute to word-indexed clip boundaries.
+            last_word = max(first_word, len(transcript.words) - 1)
+            transcript.segments.append(
+                Segment(
+                    text=(segment.text or "").strip(),
+                    start=float(segment.start),
+                    end=float(segment.end),
+                    first_word=first_word,
+                    last_word=last_word,
+                )
+            )
+
+            if on_progress and total:
+                on_progress(min(1.0, float(segment.end) / total))
+    except TranscriptionError:
+        raise
+    except Exception as exc:
+        if device == "cuda" and _is_gpu_runtime_failure(exc):
+            raise _GPURuntimeFailure(str(exc)) from exc
+        raise
 
     if not transcript.words:
         raise TranscriptionError(
@@ -175,12 +324,6 @@ def transcribe(
             "was extracted."
         )
 
-    if on_progress:
-        on_progress(1.0)
-
-    log.info(
-        "Transcribed %d words in %d segments.", len(transcript.words), len(transcript.segments)
-    )
     return transcript
 
 

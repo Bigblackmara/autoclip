@@ -265,47 +265,70 @@ def export_clip(
 
     # Input and output paths are ordinary argv arguments, so they stay absolute
     # and need no escaping regardless of the working directory.
-    args = [
-        # Seeking before -i decodes from the nearest keyframe and is far faster
-        # than an output-side seek; modern ffmpeg keeps it frame-accurate.
-        "-ss",
-        f"{request.start_s:.4f}",
-        "-t",
-        f"{request.duration_s:.4f}",
-        "-i",
-        str(request.source),
-        "-filter_complex",
-        filtergraph,
-        "-map",
-        "[vout]",
-        "-map",
-        "0:a?",
-        "-af",
-        build_audio_filtergraph(settings),
-        *encoder_args(settings),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        AUDIO_BITRATE,
-        "-ar",
-        str(AUDIO_SAMPLE_RATE),
-        "-movflags",
-        "+faststart",
-        str(request.destination),
-    ]
+    def render_args(video_args: list[str]) -> list[str]:
+        return [
+            # Seeking before -i decodes from the nearest keyframe and is far
+            # faster than an output-side seek; modern ffmpeg keeps it
+            # frame-accurate.
+            "-ss",
+            f"{request.start_s:.4f}",
+            "-t",
+            f"{request.duration_s:.4f}",
+            "-i",
+            str(request.source),
+            "-filter_complex",
+            filtergraph,
+            "-map",
+            "[vout]",
+            "-map",
+            "0:a?",
+            "-af",
+            build_audio_filtergraph(settings),
+            *video_args,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            AUDIO_BITRATE,
+            "-ar",
+            str(AUDIO_SAMPLE_RATE),
+            "-movflags",
+            "+faststart",
+            str(request.destination),
+        ]
 
-    try:
+    def run(video_args: list[str]) -> None:
         ffmpeg.run(
-            args,
+            render_args(video_args),
             total_duration_s=request.duration_s,
             on_progress=on_progress,
             cancelled=cancelled,
             cwd=render_cwd,
         )
+
+    video_args = encoder_args(settings)
+    try:
+        run(video_args)
     except ffmpeg.FFmpegError as exc:
-        raise ExportError(f"Could not render {request.destination.name}.\n{exc}") from exc
+        uses_gpu = "h264_nvenc" in video_args
+        if not uses_gpu or (cancelled is not None and cancelled()):
+            raise ExportError(f"Could not render {request.destination.name}.\n{exc}") from exc
+        # NVENC passed the start-up probe but can still fail at run time
+        # (encoder sessions or GPU memory exhausted by other work). The CPU
+        # encoder gives the same quality, only slower.
+        log.warning(
+            "The GPU encoder failed for %s (%s); rendering on the CPU instead.",
+            request.destination.name,
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
+        cpu_settings = settings.model_copy(update={"prefer_hardware_encoder": False})
+        try:
+            run(encoder_args(cpu_settings))
+        except ffmpeg.FFmpegError as cpu_exc:
+            raise ExportError(
+                f"Could not render {request.destination.name}.\n{cpu_exc}"
+            ) from cpu_exc
 
     if not request.destination.exists() or request.destination.stat().st_size == 0:
         raise ExportError(f"ffmpeg reported success but {request.destination.name} is empty.")

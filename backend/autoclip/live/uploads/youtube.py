@@ -183,15 +183,25 @@ async def _put_file(
     offset = 0
     last_error: UploadApiError | None = None
     for attempt in range(max_retries + 1):
+        headers = {
+            **_auth_header(bundle),
+            "Content-Type": session.content_type,
+        }
+        if offset >= session.size:
+            # The server already holds every byte: an empty status PUT
+            # returns the finished resource.
+            headers["Content-Range"] = f"bytes */{session.size}"
+            headers["Content-Length"] = "0"
+            content = b""
+        else:
+            # A resumed PUT MUST say which bytes it carries; without
+            # Content-Range the server reads the tail as the whole file.
+            headers["Content-Length"] = str(session.size - offset)
+            if offset > 0:
+                headers["Content-Range"] = f"bytes {offset}-{session.size - 1}/{session.size}"
+            content = _file_payload(session, offset)
         try:
-            response = await http.put(
-                session.session_uri,
-                content=_file_payload(session, offset),
-                headers={
-                    **_auth_header(bundle),
-                    "Content-Type": session.content_type,
-                },
-            )
+            response = await http.put(session.session_uri, content=content, headers=headers)
         except httpx.HTTPError as exc:
             raise UploadApiError(f"upload transport failed: {type(exc).__name__}") from exc
         if response.status_code < 400:

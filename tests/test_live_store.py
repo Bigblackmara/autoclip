@@ -31,12 +31,12 @@ def table_names() -> set[str]:
 
 
 class TestSchemaAndMigration:
-    def test_fresh_init_reaches_version_two(self, autoclip_home) -> None:
+    def test_fresh_init_reaches_the_current_version(self, autoclip_home) -> None:
         version = db.init()
 
-        assert version == db.SCHEMA_VERSION == 2
+        assert version == db.SCHEMA_VERSION == 3
         with db.connection() as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
     def test_fresh_init_creates_live_tables(self, autoclip_home) -> None:
         db.init()
@@ -59,9 +59,9 @@ class TestSchemaAndMigration:
 
         version = db.init()
 
-        assert version == 2
+        assert version == 3
         with db.connection() as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
             # v1 data survived the upgrade.
             assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
         assert {"live_streams", "live_clips", "live_uploads"} <= table_names()
@@ -73,7 +73,7 @@ class TestSchemaAndMigration:
         first = db.init()
         second = db.init()
 
-        assert first == second == 2
+        assert first == second == 3
         # Re-running migration must not clobber live data.
         loaded = store.get_stream(stream.id)
         assert loaded is not None
@@ -415,6 +415,168 @@ class TestConnectionConventions:
 
         assert not errors
         assert result.get("ok") is True
+
+
+class TestInterruptedWork:
+    """A restart must not leave clips or uploads hanging mid-flight forever."""
+
+    def test_in_flight_clips_become_failed_interrupted(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream())
+        busy = {
+            status: store.create_clip(_clip(stream.id, status=status))
+            for status in ("detecting", "queued", "rendering")
+        }
+        done = store.create_clip(_clip(stream.id, status="ready"))
+        rejected = store.create_clip(_clip(stream.id, status="rejected", reason="meh"))
+
+        store.reset_interrupted_states()
+
+        for row in busy.values():
+            loaded = store.get_clip(row.id)
+            assert loaded.status == "failed"
+            assert loaded.reason == "interrupted"
+            assert loaded.error == "interrupted"
+        assert store.get_clip(done.id).status == "ready"
+        assert store.get_clip(rejected.id).status == "rejected"
+        assert store.get_clip(rejected.id).reason == "meh"
+
+    def test_uploads_stuck_uploading_become_failed(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream())
+        clip = store.create_clip(_clip(stream.id, status="ready"))
+        stuck = store.create_upload(_upload(clip.id, status="uploading"))
+        done = store.create_upload(_upload(clip.id, status="done", platform="instagram"))
+
+        store.reset_interrupted_states()
+
+        rows = {r.id: r for r in store.list_uploads(clip.id)}
+        assert rows[stuck.id].status == "failed"
+        assert rows[stuck.id].error == "interrupted"
+        assert rows[done.id].status == "done"
+
+
+class TestTombstoneGuard:
+    def test_guarded_update_writes_live_rows(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream())
+        clip = store.create_clip(_clip(stream.id, status="queued"))
+        assert store.update_clip_guarded(clip.id, status="rendering") is True
+        assert store.get_clip(clip.id).status == "rendering"
+
+    def test_guarded_update_never_resurrects_a_discarded_clip(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream())
+        clip = store.create_clip(_clip(stream.id, status="rendering"))
+        store.update_clip(clip.id, status="rejected", reason="discarded by user")
+
+        assert store.update_clip_guarded(clip.id, status="ready", rendered_path="x.mp4") is False
+        loaded = store.get_clip(clip.id)
+        assert loaded.status == "rejected"
+        assert loaded.reason == "discarded by user"
+        assert loaded.rendered_path == ""
+
+    def test_guarded_update_of_a_missing_row_is_false(self, initialised_db: int) -> None:
+        assert store.update_clip_guarded("nope", status="ready") is False
+
+
+class TestJudgeBudgetBookkeeping:
+    def test_judge_calls_are_summed_per_stream_in_a_window(self, initialised_db: int) -> None:
+        a = store.upsert_stream(_stream())
+        b = store.upsert_stream(_stream())
+        first = store.create_clip(_clip(a.id))
+        second = store.create_clip(_clip(a.id))
+        other = store.create_clip(_clip(b.id))
+        store.add_judge_call(first.id)
+        store.add_judge_call(first.id)  # a repair retry: the second paid call
+        store.add_judge_call(second.id)
+        store.add_judge_call(other.id)
+        old = store.create_clip(_clip(a.id, created_at="2000-01-01T00:00:00+00:00"))
+        store.add_judge_call(old.id)
+
+        assert store.judge_calls_since(a.id, "2001-01-01T00:00:00+00:00") == 3
+        assert store.judge_calls_since(a.id, "1999-01-01T00:00:00+00:00") == 4
+        assert store.judge_calls_since(b.id, "2001-01-01T00:00:00+00:00") == 1
+        assert store.get_clip(first.id).judge_calls == 2
+
+
+class TestClipQueries:
+    def test_list_clips_filters_by_statuses(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream())
+        for status in ("ready", "failed", "rejected", "queued"):
+            store.create_clip(_clip(stream.id, status=status))
+        got = {r.status for r in store.list_clips(statuses=["ready", "failed"])}
+        assert got == {"ready", "failed"}
+        assert len(store.list_clips()) == 4
+
+    def test_clip_counts_count_ready_clips_per_stream(self, initialised_db: int) -> None:
+        a = store.upsert_stream(_stream())
+        b = store.upsert_stream(_stream())
+        store.create_clip(_clip(a.id, status="ready"))
+        store.create_clip(_clip(a.id, status="ready"))
+        store.create_clip(_clip(a.id, status="rejected"))
+        store.create_clip(_clip(b.id, status="failed"))
+        assert store.clip_counts() == {a.id: 2}
+
+    def test_set_stream_enabled_persists_flag_and_state(self, initialised_db: int) -> None:
+        stream = store.upsert_stream(_stream(state="watching"))
+        store.set_stream_enabled(stream.id, False, state="off")
+        loaded = store.get_stream(stream.id)
+        assert loaded.enabled is False and loaded.state == "off"
+        store.set_stream_enabled(stream.id, True)
+        assert store.get_stream(stream.id).enabled is True
+
+
+class TestMigrationAtomicity:
+    def test_v2_failure_rolls_back_completely(self, autoclip_home, monkeypatch) -> None:
+        """A crash half-way through v2 must not leave half the tables behind."""
+        from autoclip.db import schema
+
+        with db.connection() as conn:
+            conn.executescript(schema._V1)
+            conn.execute("PRAGMA user_version = 1")
+        real = schema._statements
+
+        def broken(script: str) -> list[str]:
+            statements = real(script)
+            return [*statements[:2], "CREATE TABLE broken (", *statements[2:]]
+
+        monkeypatch.setattr(schema, "_statements", broken)
+        with pytest.raises(Exception):  # noqa: B017 - any sqlite error will do
+            db.init()
+        with db.connection() as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert "live_streams" not in table_names()  # rolled back, not half-made
+
+        monkeypatch.setattr(schema, "_statements", real)
+        assert db.init() == db.SCHEMA_VERSION
+        assert {"live_streams", "live_clips", "live_uploads"} <= table_names()
+
+    def test_half_migrated_database_from_an_old_build_recovers(self, autoclip_home) -> None:
+        """The old non-atomic v2 could leave tables at user_version 1."""
+        from autoclip.db import schema
+
+        with db.connection() as conn:
+            conn.executescript(schema._V1)
+            conn.execute(
+                "CREATE TABLE live_streams (id TEXT PRIMARY KEY, url TEXT NOT NULL,"
+                " label TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,"
+                " state TEXT NOT NULL DEFAULT 'waiting_for_live',"
+                " state_detail TEXT NOT NULL DEFAULT '', last_error TEXT,"
+                " created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            conn.execute("PRAGMA user_version = 1")
+
+        assert db.init() == db.SCHEMA_VERSION
+        stream = store.upsert_stream(_stream())
+        clip = store.create_clip(_clip(stream.id))
+        assert store.get_clip(clip.id).judge_calls == 0
+
+    def test_v3_is_idempotent_when_the_column_exists(self, autoclip_home) -> None:
+        from autoclip.db import schema
+
+        db.init()
+        with db.connection() as conn:
+            conn.execute("PRAGMA user_version = 2")  # pretend v3 never ran
+        assert db.init() == db.SCHEMA_VERSION  # ALTER is skipped, no error
+        with db.connection() as conn:
+            assert "judge_calls" in schema._column_names(conn, "live_clips")
 
 
 # ---------------------------------------------------------------------------

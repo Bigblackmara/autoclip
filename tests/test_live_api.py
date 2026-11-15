@@ -46,9 +46,12 @@ class FakeManager:
 
     def __init__(self) -> None:
         self.started = False
+        self.enabled = True
         self.calls: list[tuple[str, tuple, dict]] = []
         self._rows: dict[str, LiveStreamRow] = {}
         self._snapshots: dict[str, dict] = {}
+        self.applied: list[Any] = []
+        self.retry_error: Exception | None = None
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -84,10 +87,23 @@ class FakeManager:
     def _runtime_error(self, stream_id: str) -> None:
         raise KeyError(stream_id)
 
+    async def apply_settings(self, settings: Any) -> dict:
+        self._record("apply_settings", settings)
+        self.applied.append(settings)
+        self.enabled = bool(settings.enabled)
+        return {"running": self.started}
+
+    async def retry_clip(self, clip_id: str) -> Any:
+        self._record("retry_clip", clip_id)
+        if self.retry_error is not None:
+            raise self.retry_error
+        store.update_clip(clip_id, status="queued", error=None)
+        return store.get_clip(clip_id)
+
     # -- snapshots ---------------------------------------------------------
     def status(self) -> dict:
         return {
-            "enabled": True,
+            "enabled": self.enabled,
             "running": self.started,
             "watching": 2,
             "streams": [self.stream_snapshot(sid) for sid in self._rows],
@@ -114,6 +130,7 @@ class FakeManager:
             "state": state,
             "detail": self._snapshots.get(stream_id, {}).get("detail", ""),
             "capturing": False,
+            "clip_count": self._snapshots.get(stream_id, {}).get("clip_count", 0),
         }
         if row.last_error:
             snapshot["error"] = row.last_error
@@ -176,15 +193,22 @@ def started_client(
 class TestNotRunning:
     """AUTOCLIP_NO_WORKER=1 → the lifespan never starts the manager."""
 
-    def test_status_is_503_with_the_frozen_detail(self, client: TestClient):
+    def test_status_is_always_200(self, client: TestClient):
         response = client.get("/api/live/status")
-        assert response.status_code == 503
-        assert response.json() == {"detail": "Live Watch is not running."}
+        assert response.status_code == 200
+        body = response.json()
+        assert body["enabled"] is True
+        assert body["running"] is False
+
+    def test_stream_list_still_answers(self, client: TestClient, fake_manager: FakeManager):
+        fake_manager._rows["s1"] = LiveStreamRow(id="s1", url="https://twitch.tv/x", label="X")
+        response = client.get("/api/live/streams")
+        assert response.status_code == 200
+        assert [s["id"] for s in response.json()] == ["s1"]
 
     @pytest.mark.parametrize(
         "method,path,body",
         [
-            ("GET", "/api/live/streams", None),
             ("POST", "/api/live/streams", {"url": "https://twitch.tv/x", "label": ""}),
             ("DELETE", "/api/live/streams/s1", None),
             ("POST", "/api/live/streams/s1/pause", None),
@@ -215,7 +239,7 @@ class TestStatus:
     def test_shape_matches_api_ts(self, started_client: tuple[TestClient, FakeManager]):
         client, _ = started_client
         body = client.get("/api/live/status").json()
-        assert set(body) == {"enabled", "watching", "clipping", "caps"}
+        assert set(body) == {"enabled", "running", "watching", "clipping", "caps"}
         assert set(body["caps"]) == {
             "max_concurrent_streams",
             "clip_queue_len",
@@ -257,6 +281,7 @@ class TestStreams:
             "last_error",
             "created_at",
             "updated_at",
+            "clip_count",
         }
         assert body["url"] == "https://twitch.tv/y"
         assert body["state"] == "waiting_for_live"
@@ -548,8 +573,8 @@ class TestUploads:
         response = client.post("/api/live/clips/clip-ok/upload", json={"platform": "youtube"})
         assert response.status_code == 400
         assert "rights" in response.json()["detail"].lower()
-        rows = store.list_uploads(clip_id="clip-ok")
-        assert rows[0].status == "skipped"
+        # A pre-check refusal attempted nothing: no row that would block a retry.
+        assert store.list_uploads(clip_id="clip-ok") == []
 
     def test_not_linked_is_409(
         self,
@@ -567,8 +592,7 @@ class TestUploads:
         )
         response = client.post("/api/live/clips/clip-ok/upload", json={"platform": "instagram"})
         assert response.status_code == 409
-        rows_status = [r.status for r in store.list_uploads(clip_id="clip-ok")]
-        assert rows_status == ["skipped"]
+        assert store.list_uploads(clip_id="clip-ok") == []
 
     def test_platform_api_error_is_502(
         self,
@@ -724,6 +748,7 @@ class TestCredentialsAndAttestation:
         self,
         started_client: tuple[TestClient, FakeManager],
         monkeypatch: pytest.MonkeyPatch,
+        fake_keyring,
     ):
         client, _ = started_client
 
@@ -732,7 +757,16 @@ class TestCredentialsAndAttestation:
 
         monkeypatch.setattr("autoclip.live.uploads.youtube_status", fake_status, raising=False)
         body = client.get("/api/live/uploads/youtube/status").json()
-        assert body == {"connected": True, "account": "My Channel"}
+        assert body == {
+            "connected": True,
+            "account": "My Channel",
+            "redirect_uri": "http://testserver/api/live/uploads/youtube/callback",
+            "has_credentials": False,
+        }
+        from autoclip.live import uploads
+
+        uploads.save_client_credentials("youtube", "id-1", "secret-1")
+        assert client.get("/api/live/uploads/youtube/status").json()["has_credentials"] is True
 
     def test_attestation_round_trip(
         self,
@@ -850,6 +884,7 @@ class TestWireShapesMatchFrontend:
             "last_error",
             "created_at",
             "updated_at",
+            "clip_count",
         }
 
     def test_settings_sections(self, started_client: tuple[TestClient, FakeManager]):
@@ -878,4 +913,383 @@ class TestWireShapesMatchFrontend:
             "clip_queue_max",
             "cpu_budget_percent",
             "ram_budget_gb",
+            "disk_budget_mb",
+            "min_free_disk_mb",
         }
+
+
+# --------------------------------------------------------------------------
+# Review fixes: off-gate, applied settings, XSS, uploads, retry, SSE
+# --------------------------------------------------------------------------
+
+LIVE_OFF = "Live Watch is turned off. Turn it on in Live settings."
+
+
+class TestLiveSwitchedOff:
+    @pytest.fixture
+    def off_client(self, client: TestClient, fake_manager: FakeManager) -> TestClient:
+        fake_manager.enabled = False
+        fake_manager._rows["s1"] = LiveStreamRow(id="s1", url="https://twitch.tv/x", label="X")
+        return client
+
+    def test_status_is_200_with_everything_zero(self, off_client: TestClient):
+        body = off_client.get("/api/live/status").json()
+        assert body == {
+            "enabled": False,
+            "running": False,
+            "watching": 0,
+            "clipping": 0,
+            "caps": {
+                "max_concurrent_streams": 0,
+                "clip_queue_len": 0,
+                "clip_queue_max": 0,
+                "disk_used_mb": 0.0,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            ("POST", "/api/live/streams", {"url": "https://twitch.tv/x", "label": ""}),
+            ("DELETE", "/api/live/streams/s1", None),
+            ("POST", "/api/live/streams/s1/pause", None),
+            ("POST", "/api/live/streams/s1/resume", None),
+        ],
+    )
+    def test_mutations_are_409_with_the_turn_it_on_detail(
+        self, off_client: TestClient, method: str, path: str, body: dict | None
+    ):
+        response = off_client.request(method, path, json=body)
+        assert response.status_code == 409
+        assert response.json() == {"detail": LIVE_OFF}
+
+    def test_the_watch_list_still_lists(self, off_client: TestClient):
+        response = off_client.get("/api/live/streams")
+        assert response.status_code == 200
+        assert [s["id"] for s in response.json()] == ["s1"]
+
+
+class TestSettingsApplied:
+    def test_put_applies_to_the_running_manager(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, fake = started_client
+        tree = client.get("/api/live/settings").json()
+        tree["enabled"] = False
+        tree["rate_limit"]["judge_min_score"] = 88
+        response = client.put("/api/live/settings", json=tree)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["applied"] is True
+        assert body["rate_limit"]["judge_min_score"] == 88
+        assert len(fake.applied) == 1
+        applied = fake.applied[0]
+        assert applied.enabled is False
+        assert applied.rate_limit.judge_min_score == 88
+
+    def test_apply_failure_is_reported_not_raised(
+        self, started_client: tuple[TestClient, FakeManager], monkeypatch: pytest.MonkeyPatch
+    ):
+        client, fake = started_client
+
+        async def boom(settings: Any) -> None:
+            raise RuntimeError("could not stop a capture")
+
+        monkeypatch.setattr(fake, "apply_settings", boom)
+        tree = client.get("/api/live/settings").json()
+        body = client.put("/api/live/settings", json=tree).json()
+        assert body["applied"] is False
+        assert "could not stop a capture" in body["apply_error"]
+
+    def test_core_settings_save_keeps_the_live_section(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, _ = started_client
+        tree = client.get("/api/live/settings").json()
+        tree["enabled"] = False
+        tree["rate_limit"]["judge_min_score"] = 91
+        client.put("/api/live/settings", json=tree)
+        # The core Settings page saves its own model; it must not wipe "live".
+        client.put("/api/settings", json={"whisper": {"model": "medium"}})
+        again = client.get("/api/live/settings").json()
+        assert again["enabled"] is False
+        assert again["rate_limit"]["judge_min_score"] == 91
+
+
+class TestCallbackHardening:
+    def test_error_parameter_is_escaped_and_csp_is_strict(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, _ = started_client
+        payload = "<script>alert(document.domain)</script>"
+        response = client.get(
+            "/api/live/uploads/youtube/callback", params={"error": payload, "state": "x"}
+        )
+        assert response.status_code == 400
+        assert payload not in response.text
+        assert "&lt;script&gt;alert(document.domain)&lt;/script&gt;" in response.text
+        csp = response.headers["content-security-policy"]
+        assert "default-src 'none'" in csp
+        assert "script-src" not in csp  # nothing may run
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    def test_quotes_cannot_break_out_of_attributes(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, _ = started_client
+        response = client.get(
+            "/api/live/uploads/youtube/callback", params={"error": '"><img src=x onerror=1>'}
+        )
+        assert "<img" not in response.text
+        assert "&quot;&gt;&lt;img" in response.text
+
+    def test_every_callback_response_carries_the_csp(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, _ = started_client
+        for params in ({}, {"code": "abc", "state": "forged"}):
+            response = client.get("/api/live/uploads/youtube/callback", params=params)
+            assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+class TestRedirectUriFollowsTheServer:
+    def test_start_and_exchange_use_the_request_base_url(
+        self, started_client: tuple[TestClient, FakeManager], monkeypatch: pytest.MonkeyPatch
+    ):
+        client, _ = started_client
+        seen: dict = {}
+
+        def fake_auth_url(platform, *, redirect_uri, state=None):
+            seen["start"] = redirect_uri
+            return f"https://accounts.example/{platform}?state={state}"
+
+        async def fake_exchange(platform, code, *, redirect_uri, client=None):
+            seen["exchange"] = redirect_uri
+
+        monkeypatch.setattr("autoclip.live.uploads.authorization_url", fake_auth_url, raising=False)
+        monkeypatch.setattr("autoclip.live.uploads.exchange_code", fake_exchange, raising=False)
+        start = client.post(
+            "/api/live/uploads/youtube/start", headers={"host": "127.0.0.1:8765"}
+        ).json()
+        import urllib.parse
+
+        query = urllib.parse.urlparse(start["redirect_url"]).query
+        state = urllib.parse.parse_qs(query)["state"][0]
+        expected = "http://127.0.0.1:8765/api/live/uploads/youtube/callback"
+        assert seen["start"] == expected
+        response = client.get(
+            "/api/live/uploads/youtube/callback", params={"code": "c", "state": state}
+        )
+        assert response.status_code == 200
+        assert seen["exchange"] == expected  # the exact URI the consent used
+
+
+class TestClipFiltersAndRetry:
+    def test_status_filter_takes_a_comma_list(self, started_client: tuple[TestClient, FakeManager]):
+        client, _ = started_client
+        for i, status in enumerate(("ready", "failed", "rejected", "queued")):
+            _make_clip(status=status, id=f"c-{i}", reason="meh" if status == "rejected" else "")
+        got = client.get("/api/live/clips?status=ready,failed").json()
+        assert {c["status"] for c in got} == {"ready", "failed"}
+        rejected = client.get("/api/live/clips?status=rejected").json()
+        assert [c["reason"] for c in rejected] == ["meh"]
+
+    def test_retry_unknown_clip_is_404(self, started_client: tuple[TestClient, FakeManager]):
+        client, _ = started_client
+        assert client.post("/api/live/clips/nope/retry").status_code == 404
+
+    def test_retry_requeues_through_the_manager(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        client, fake = started_client
+        _make_clip(id="c-f", status="failed", error="interrupted")
+        response = client.post("/api/live/clips/c-f/retry")
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert fake.calls[-1][0] == "retry_clip"
+
+    def test_retry_refusal_is_409_with_the_reason(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        from autoclip.live.manager import RetryRefused
+
+        client, fake = started_client
+        _make_clip(id="c-f", status="failed")
+        fake.retry_error = RetryRefused("This clip's window is no longer on disk.")
+        response = client.post("/api/live/clips/c-f/retry")
+        assert response.status_code == 409
+        assert "no longer on disk" in response.json()["detail"]
+
+    def test_retry_while_off_is_409(self, client: TestClient, fake_manager: FakeManager):
+        fake_manager.enabled = False
+        store.upsert_stream(LiveStreamRow(id="stream-1", url="u", label=""))
+        _make_clip(id="c-f", status="failed")
+        response = client.post("/api/live/clips/c-f/retry")
+        assert response.status_code == 409
+        assert response.json()["detail"] == LIVE_OFF
+
+
+class TestUploadGuards:
+    @pytest.fixture
+    def ready(self, started_client: tuple[TestClient, FakeManager]) -> TestClient:
+        client, _ = started_client
+        media = Path(self_media_dir()) / "final.mp4"
+        media.parent.mkdir(parents=True, exist_ok=True)
+        media.write_bytes(b"11" * 32)
+        _make_clip(id="clip-ok", status="ready", rendered_path=str(media))
+        return client
+
+    def _row(self, status: str, platform: str = "youtube") -> None:
+        from autoclip.live.models import LiveUploadRow
+
+        store.create_upload(
+            LiveUploadRow(
+                id=f"u-{status}-{platform}", clip_id="clip-ok", platform=platform, status=status
+            )
+        )
+
+    def test_running_upload_is_409(self, ready: TestClient, monkeypatch: pytest.MonkeyPatch):
+        faker = _UploadFaker()
+        monkeypatch.setattr("autoclip.live.uploads.upload_youtube", faker, raising=False)
+        self._row("uploading")
+        response = ready.post("/api/live/clips/clip-ok/upload", json={"platform": "youtube"})
+        assert response.status_code == 409
+        assert "already running" in response.json()["detail"]
+        assert faker.calls == []
+
+    def test_in_process_double_click_is_409(
+        self, ready: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        import autoclip.api.live as live_api_mod
+
+        faker = _UploadFaker()
+        monkeypatch.setattr("autoclip.live.uploads.upload_youtube", faker, raising=False)
+        live_api_mod._uploads_in_flight.add(("clip-ok", "youtube"))
+        try:
+            response = ready.post("/api/live/clips/clip-ok/upload", json={"platform": "youtube"})
+        finally:
+            live_api_mod._uploads_in_flight.discard(("clip-ok", "youtube"))
+        assert response.status_code == 409
+        assert faker.calls == []
+
+    def test_done_upload_is_409(self, ready: TestClient, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("autoclip.live.uploads.upload_youtube", _UploadFaker(), raising=False)
+        self._row("done")
+        response = ready.post("/api/live/clips/clip-ok/upload", json={"platform": "youtube"})
+        assert response.status_code == 409
+        assert "already uploaded" in response.json()["detail"]
+
+    @pytest.mark.parametrize("previous", ["failed", "skipped"])
+    def test_new_attempt_after_failed_or_skipped(
+        self, ready: TestClient, monkeypatch: pytest.MonkeyPatch, previous: str
+    ):
+        faker = _UploadFaker()
+        monkeypatch.setattr("autoclip.live.uploads.upload_youtube", faker, raising=False)
+        self._row(previous)
+        response = ready.post("/api/live/clips/clip-ok/upload", json={"platform": "youtube"})
+        assert response.status_code == 200
+        assert response.json()["status"] == "done"
+        assert len(faker.calls) == 1
+
+    def test_other_platform_is_independent(
+        self, ready: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr("autoclip.live.uploads.upload_instagram", _UploadFaker(), raising=False)
+        self._row("done", platform="youtube")
+        response = ready.post("/api/live/clips/clip-ok/upload", json={"platform": "instagram"})
+        assert response.status_code == 200
+
+
+class TestEventContract:
+    def test_clip_events_carry_their_status(self):
+        from autoclip.api.live import _state_patch
+
+        for event, status in [
+            ("clip_detecting", "detecting"),
+            ("clip_queued", "queued"),
+            ("clip_producing", "rendering"),
+            ("clip_ready", "ready"),
+            ("clip_failed", "failed"),
+            ("clip_rejected", "rejected"),
+            ("clip_dropped", "rejected"),
+        ]:
+            data = _state_patch({"type": event, "data": {"clip_id": "c1"}}, ["live:-:clips"])
+            assert data["status"] == status, event
+            assert data["clip_id"] == "c1"
+
+    def test_stream_state_is_mapped_and_shaped(self):
+        from autoclip.api.live import _frontend_event_name, _state_patch
+
+        assert _frontend_event_name("stream_state") == "stream_state"
+        data = _state_patch(
+            {
+                "type": "stream_state",
+                "data": {"stream_id": "s1", "state": "off", "enabled": False},
+            },
+            ["live:-:clips", "live:-:streams"],
+        )
+        assert data == {
+            "type": "stream_state",
+            "stream_id": "s1",
+            "state": "off",
+            "enabled": False,
+        }
+
+    def test_global_feed_delivers_stream_state_frames(
+        self, started_client: tuple[TestClient, FakeManager]
+    ):
+        import threading
+        import time as _time
+
+        from autoclip.live import events as live_events
+
+        client, _ = started_client
+
+        def publish_soon() -> None:
+            _time.sleep(0.5)
+            live_events.publish(
+                "live:-:streams",
+                "stream_state",
+                {"type": "stream_state", "stream_id": "s9", "state": "watching", "enabled": True},
+            )
+            live_events.publish("live:-:clips", "clip_ready", {"clip_id": "c9"})
+
+        threading.Thread(target=publish_soon, daemon=True).start()
+        with client.stream("GET", "/api/live/events") as response:
+            body = _read_sse_until(response, ("event: stream_state", "event: clip_status"), 8.0)
+        frames = _frames(body)
+        stream_frames = [d for e, d in frames if e == "stream_state"]
+        assert stream_frames == [
+            {"type": "stream_state", "stream_id": "s9", "state": "watching", "enabled": True}
+        ]
+        clip_frames = [d for e, d in frames if e == "clip_status"]
+        assert clip_frames and clip_frames[0]["status"] == "ready"
+
+
+def _read_sse_until(response, markers: tuple[str, ...], timeout: float) -> str:
+    import time as _time
+
+    body = ""
+    deadline = _time.monotonic() + timeout
+    for chunk in response.iter_text():
+        body += chunk
+        normalized = body.replace("\r\n", "\n")
+        if all(m in normalized for m in markers) and normalized.endswith("\n\n"):
+            break
+        if _time.monotonic() > deadline:
+            break
+    return body
+
+
+def _frames(body: str) -> list[tuple[str, dict]]:
+    out: list[tuple[str, dict]] = []
+    for block in body.replace("\r\n", "\n").split("\n\n"):
+        event, data = "", ""
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                event = line.removeprefix("event:").strip()
+            elif line.startswith("data:"):
+                data += line.removeprefix("data:").strip()
+        if event and data:
+            out.append((event, json.loads(data)))
+    return out

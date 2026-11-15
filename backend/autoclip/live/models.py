@@ -83,9 +83,13 @@ class LiveClipRow:
     error: str | None = None
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
+    #: LLM judge calls this candidate spent (a repair retry is a second one).
+    #: Migration v3; the per-stream judge budgets are derived from it.
+    judge_calls: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> LiveClipRow:
+        keys = row.keys()
         return cls(
             id=row["id"],
             stream_id=row["stream_id"],
@@ -106,6 +110,7 @@ class LiveClipRow:
             error=row["error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            judge_calls=int(row["judge_calls"] or 0) if "judge_calls" in keys else 0,
         )
 
 

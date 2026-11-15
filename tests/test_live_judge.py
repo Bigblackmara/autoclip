@@ -397,3 +397,63 @@ class TestNoSecretsInLogs:
         assert "sk-super-secret-value" not in provider.calls[0][1]
         assert "sk-super-secret-value" not in provider.calls[0][0]
         assert "sk-super-secret-value" not in repr(judgement)
+
+
+class TestScoreIsNotInflated:
+    """An integer 1 is a flat rejection, never a 100-point pass."""
+
+    @pytest.mark.parametrize("raw", [1, "1", 1.0])
+    def test_integer_one_stays_one(self, raw) -> None:
+        assert LiveJudgeOut.model_validate({"score": raw}).score == 1
+
+    @pytest.mark.parametrize("raw,expected", [(0.87, 87), ("0.5", 50), (0.05, 5)])
+    def test_non_integer_fractions_still_scale(self, raw, expected) -> None:
+        assert LiveJudgeOut.model_validate({"score": raw}).score == expected
+
+    def test_booleans_and_non_finite_values_are_unreadable(self) -> None:
+        assert LiveJudgeOut.model_validate({"score": True}).score == 50
+        assert LiveJudgeOut.model_validate({"score": float("nan")}).score == 50
+
+
+class TestBudgetedCalls:
+    """Every paid request — the repair retry included — asks the budget first."""
+
+    async def test_each_provider_call_is_announced(self) -> None:
+        provider = ScriptedJudgeProvider(["not json", VALID])
+        announced: list[int] = []
+
+        def before_call() -> bool:
+            announced.append(len(provider.calls))
+            return True
+
+        judgement = await judge_window("s", WORDS, {}, provider=provider, before_call=before_call)
+
+        assert judgement.score == 81
+        assert announced == [0, 1]  # before the first call, and before the repair
+
+    async def test_refused_repair_is_never_sent(self) -> None:
+        from autoclip.live.judge import JudgeBudgetExhausted
+
+        provider = ScriptedJudgeProvider(["not json", VALID])
+        answers = iter([True, False])
+
+        with pytest.raises(JudgeBudgetExhausted, match="repair"):
+            await judge_window("s", WORDS, {}, provider=provider, before_call=lambda: next(answers))
+        assert len(provider.calls) == 1
+
+    async def test_refused_first_call_sends_nothing(self) -> None:
+        from autoclip.live.judge import JudgeBudgetExhausted
+
+        provider = ScriptedJudgeProvider([VALID])
+        with pytest.raises(JudgeBudgetExhausted):
+            await judge_window("s", WORDS, {}, provider=provider, before_call=lambda: False)
+        assert provider.calls == []
+
+    async def test_empty_window_spends_nothing(self) -> None:
+        provider = ScriptedJudgeProvider([VALID])
+        asked: list[bool] = []
+        judgement = await judge_window(
+            "s", [], {}, provider=provider, before_call=lambda: asked.append(True) or True
+        )
+        assert judgement.score == 0
+        assert asked == [] and provider.calls == []

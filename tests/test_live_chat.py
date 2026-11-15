@@ -861,3 +861,52 @@ class TestConstantsContract:
 
     def test_rate_window_smaller_than_baseline(self) -> None:
         assert LiveChatSettings().baseline_window_s > RATE_WINDOW_S
+
+
+class TestStopClosesTheSocket:
+    """stop must not wait out a 15 s recv(): the socket is shut on stop."""
+
+    def test_stop_interrupts_a_blocked_recv(
+        self, no_real_websocket: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as _time
+
+        class BlockingSocket(FakeWebSocket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.shut = threading.Event()
+
+            def recv(self) -> str:
+                # A quiet channel: recv blocks until the socket is shut down
+                # (or a long "socket timeout" passes).
+                if self.shut.wait(timeout=10.0):
+                    raise FakeSocketClosed("socket shut down")
+                raise FakeTimeout()
+
+            def shutdown(self) -> None:
+                self.shut.set()
+
+        sockets: list[BlockingSocket] = []
+
+        class Quiet(FakeWSModule):
+            @staticmethod
+            def create_connection(url: str, timeout: float) -> FakeWebSocket:
+                sockets.append(BlockingSocket())
+                return sockets[-1]
+
+        monkeypatch.setattr(cs, "websocket", Quiet)
+        reader = cs.TwitchChatReader("chan", default_chat(), on_signal=lambda s: None)
+        stop = threading.Event()
+        runner = threading.Thread(target=reader.run, args=(stop,), daemon=True)
+        runner.start()
+        deadline = _time.monotonic() + 5
+        while not sockets and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert sockets, "the reader never connected"
+
+        started = _time.monotonic()
+        stop.set()
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+        assert _time.monotonic() - started < 2.0  # not the 10 s recv timeout
+        assert sockets[0].shut.is_set()

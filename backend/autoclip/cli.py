@@ -166,15 +166,21 @@ def doctor() -> None:
         accel_table.add_row("Driver", OK, gpu.driver_version)
 
     if gpu.name and not gpu.ctranslate2_cuda:
-        accel_table.add_row("CUDA for Whisper", FAIL, "CTranslate2 cannot see the GPU")
+        if gpu.cuda_libraries_missing:
+            missing = " and ".join(gpu.cuda_libraries_missing)
+            detail = f"GPU found, but {missing} cannot be loaded"
+        else:
+            missing = "the CUDA runtime"
+            detail = "CTranslate2 cannot see the GPU"
+        accel_table.add_row("CUDA for Whisper", FAIL, detail)
         remediation.append(
-            "An NVIDIA GPU is present but CTranslate2 can't use it — usually missing cuDNN. "
+            f"An NVIDIA GPU is present but Whisper can't use it — {missing} is missing. "
             "Install the CUDA runtime libraries with "
             "[cyan]uv pip install 'autoclip[gpu]'[/cyan], then re-run doctor. "
-            "Transcription will fall back to CPU until this is fixed."
+            "Transcription runs on the CPU (same result, slower) until this is fixed."
         )
     elif gpu.ctranslate2_cuda:
-        accel_table.add_row("CUDA for Whisper", OK, "CTranslate2 sees the GPU")
+        accel_table.add_row("CUDA for Whisper", OK, "GPU usable (cuBLAS and cuDNN load)")
 
     if gpu.supported_compute_types:
         accel_table.add_row(

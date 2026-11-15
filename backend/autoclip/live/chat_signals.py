@@ -565,6 +565,28 @@ class TwitchChatReader:
         # The scorer survives reconnects: rate baselines are expensive to
         # rebuild and remain meaningful after a short drop.
         self._scorer = ChatRateScorer(self._settings)
+        #: The live socket of the current session (closed by stop).
+        self._ws = None
+        self._ws_lock = threading.Lock()
+
+    def _close_on_stop(self, stop_event: threading.Event, finished: threading.Event) -> None:
+        """Shut the live socket down the moment ``stop_event`` is set.
+
+        ``recv()`` only returns on traffic or after the socket timeout (15 s),
+        so without this a stop waited up to that long — and the watcher's
+        teardown waited with it. Closing the socket makes recv() fail now.
+        """
+        while not stop_event.wait(0.25):
+            if finished.is_set():
+                return
+        with self._ws_lock:
+            ws = self._ws
+        if ws is None:
+            return
+        closer = getattr(ws, "shutdown", None) or getattr(ws, "close", None)
+        if closer is not None:
+            with contextlib.suppress(Exception):
+                closer()
 
     def run(self, stop_event: threading.Event) -> None:
         """Serve chat until ``stop_event`` is set. Structurally cannot raise."""
@@ -576,6 +598,19 @@ class TwitchChatReader:
             )
             self._report(ChatState.STOPPED, "chat reader stopped: no websocket library")
             return
+        finished = threading.Event()
+        threading.Thread(
+            target=self._close_on_stop,
+            args=(stop_event, finished),
+            name=f"chat-closer-{self.channel}",
+            daemon=True,
+        ).start()
+        try:
+            self._serve(stop_event)
+        finally:
+            finished.set()
+
+    def _serve(self, stop_event: threading.Event) -> None:
         attempt = 0
         while not stop_event.is_set():
             saw_traffic = False
@@ -613,6 +648,15 @@ class TwitchChatReader:
         self._session_read_traffic = False
         self._report(ChatState.CONNECTING, f"connecting to {self._ws_url} for #{self.channel}")
         ws = websocket.create_connection(self._ws_url, timeout=self._socket_timeout_s)
+        with self._ws_lock:
+            self._ws = ws
+        if stop_event.is_set():
+            # Stopped while connecting: the closer may have looked already.
+            with self._ws_lock:
+                self._ws = None
+            with contextlib.suppress(Exception):
+                ws.close()
+            return False
         saw_traffic = False
         tail = ""
         joined = False
@@ -659,6 +703,8 @@ class TwitchChatReader:
                         self._emit(signal)
             return saw_traffic or joined
         finally:
+            with self._ws_lock:
+                self._ws = None
             with contextlib.suppress(Exception):
                 ws.close()
 

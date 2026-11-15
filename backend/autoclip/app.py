@@ -65,19 +65,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # setting is off, so this line costs nothing for users not using it.
     from .live.manager import manager as live_manager
 
-    live_started = False
     if worker_enabled:
+        # Even while live.enabled is off this records that the host allows
+        # Live Watch, so switching it on in the settings starts it live.
         await live_manager.start()
-        live_started = live_manager.started
 
     log.info("AutoClip %s ready. Artifacts in %s", __version__, paths.root())
 
     try:
         yield
     finally:
-        if live_started:
-            await live_manager.stop()
         if worker_enabled:
+            # Idempotent; also covers a manager started later by a settings
+            # save, and withdraws the host's permission to start again.
+            await live_manager.shutdown()
             await queue.stop()
 
 

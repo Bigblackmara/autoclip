@@ -232,12 +232,36 @@ class RingBuffer:
             target = newest - math.floor(seconds / SEGMENT_S)
             return max(oldest, min(newest, target))
 
-    def extract(self, start_s: float, end_s: float, target: Path) -> Path:
+    def covered_until_s(self) -> float | None:
+        """Stream time up to which committed segments exist (None if empty).
+
+        ``(newest index + 1) * SEGMENT_S`` — the end of the newest committed
+        segment. A clip window ending after this has not been captured yet.
+        """
+        with self._lock:
+            if not self.segments:
+                return None
+            return (self.segments[-1].index + 1) * SEGMENT_S
+
+    def extract(
+        self,
+        start_s: float,
+        end_s: float,
+        target: Path,
+        *,
+        anchor_s: float | None = None,
+    ) -> Path:
         """Concatenate the range [start_s, end_s) of stream time into ``target``.
 
         Caller must hold a per-stream clipping lock so a prune race can't cut
         the segment set underneath us. The buffer prunes nothing while a
         extraction pin is held— see ``pin_oldest``.
+
+        ``anchor_s`` (the trigger moment) makes a window that straddles a
+        reconnect epoch usable: the range is clamped to the contiguous run of
+        the anchor's own epoch instead of raising. Without an anchor an
+        epoch-straddling range still raises (no way to tell which side
+        matters).
         """
         if end_s <= start_s:
             raise ValueError(f"end_s ({end_s}) must exceed start_s ({start_s})")
@@ -264,6 +288,10 @@ class RingBuffer:
                 )
             start_index = max(raw_start, oldest)
             end_index = min(raw_end, newest)
+            if anchor_s is not None:
+                start_index, end_index = self._clamp_to_anchor_epoch(
+                    start_index, end_index, anchor_s
+                )
             # Validate contiguity + same-epoch and pin in ONE lock instant:
             # releasing the lock between those steps would let a prune delete
             # the range we just chose.
@@ -361,6 +389,35 @@ class RingBuffer:
 
     # -- internals ----------------------------------------------------------
 
+    def _clamp_to_anchor_epoch(
+        self, start_index: int, end_index: int, anchor_s: float
+    ) -> tuple[int, int]:
+        """Shrink ``[start_index, end_index]`` to the anchor's epoch run.
+
+        A reconnect inside a clip window leaves two timelines in it; the one
+        holding the trigger moment is the clip. Called under the lock.
+        """
+        in_range = [s for s in self.segments if start_index <= s.index <= end_index]
+        if len({s.epoch for s in in_range}) <= 1:
+            return start_index, end_index
+        anchor_index = max(start_index, min(end_index, math.floor(max(anchor_s, 0.0) / SEGMENT_S)))
+        anchor = min(in_range, key=lambda s: (abs(s.index - anchor_index), -s.index))
+        position = in_range.index(anchor)
+        first = last = position
+        while first > 0 and in_range[first - 1].epoch == anchor.epoch:
+            first -= 1
+        while last < len(in_range) - 1 and in_range[last + 1].epoch == anchor.epoch:
+            last += 1
+        log.info(
+            "window %d..%d straddles a reconnect; clamped to epoch %d (%d..%d)",
+            start_index,
+            end_index,
+            anchor.epoch,
+            in_range[first].index,
+            in_range[last].index,
+        )
+        return in_range[first].index, in_range[last].index
+
     def _shielded(self, index: int) -> bool:
         """Whether any pin shields the segment at ``index`` (pin at or below it)."""
         return any(pin <= index for pin in self._pins)
@@ -378,6 +435,35 @@ class RingBuffer:
         self.segments.remove(seg)
         self._clipped_s += SEGMENT_S
         return seg.size_bytes
+
+
+def discard_segment_files(directory: Path) -> int:
+    """Delete every ``seg_*.ts`` file in ``directory``; returns files removed.
+
+    A fresh RingBuffer knows nothing about files a previous lifecycle left
+    behind, while a fresh ffmpeg numbers from 0 — so stale high-index files
+    would be committed as if new and every real segment refused as out of
+    order. A new watch lifecycle therefore starts from an empty folder.
+    Files still held open (Windows) are skipped, never fatal.
+    """
+    directory = Path(directory)
+    removed = 0
+    try:
+        entries = list(directory.iterdir())
+    except FileNotFoundError:
+        return 0
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith("seg_") and name.endswith(SEGMENT_EXT)):
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.debug("could not delete stale segment %s", entry, exc_info=True)
+    return removed
 
 
 def _concat(sources: list[Path], target: Path) -> None:
@@ -404,5 +490,6 @@ __all__ = [
     "SEGMENT_S",
     "RingBuffer",
     "SegmentInfo",
+    "discard_segment_files",
     "segment_name",
 ]

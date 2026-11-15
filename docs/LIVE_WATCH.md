@@ -101,12 +101,16 @@ and optionally trim advice. Windows scoring below `judge_min_score` (default
 70) are dropped with the score recorded. A window with no transcribed speech —
 silence, music, dead air — is rejected locally without spending a call.
 
-**Production.** An accepted window is re-extracted from the buffer with
-pre/post-roll, remuxed into a seekable MP4, and rendered through the standard
-pipeline: transcribe → reframe → captions → export. The result is a vertical
-clip with burned-in captions plus an `.srt` sidecar, in
-`~/.autoclip/live/clips/<clip_id>/`. Stage artifacts persist per clip, so a
-failed render resumes at the failed stage instead of re-transcribing.
+**Production.** The candidate waits until the buffer has captured its
+post-roll, and an accepted window is cut into the clip folder right away
+(`raw.ts`), so a queued clip no longer depends on the rolling buffer. It is
+remuxed into a seekable MP4 and rendered through the standard pipeline:
+transcribe → reframe → captions → export. The result is a vertical clip with
+burned-in captions plus an `.srt` sidecar, in
+`~/.autoclip/live/clips/<clip_id>/`. A failed render keeps its stage
+artifacts (resume, or `POST /api/live/clips/<id>/retry`); a successful one
+deletes its intermediates. The judge's window video and audio are deleted as
+soon as the transcript exists; only small JSON evidence is kept.
 
 **Upload.** Optional, per platform, off by default. Clips go out through the
 official APIs (YouTube Data API v3 resumable uploads; Instagram Graph API
@@ -199,6 +203,8 @@ Live settings live in config.json under `"live"` (absent = all defaults), and
 | `workers.max_concurrent_streams` | `5` | streams being captured simultaneously |
 | `workers.clip_queue_workers` | `1` | render workers; the GPU wants the whole machine, keep 1 |
 | `workers.clip_queue_max` | `10` | candidate queue depth; overflow is recorded as rejected |
+| `workers.disk_budget_mb` | `10240` | feature-wide budget for buffers + unfinished clips; oldest failed/rejected artifacts are freed first, still over → new candidates refused |
+| `workers.min_free_disk_mb` | `2048` | new candidates are refused while the disk has less free space |
 | `uploads.youtube.auto_upload` / `title_prefix` | `false` / `""` | per-platform upload opt-in |
 | `uploads.instagram.auto_upload` / `caption_prefix` | `false` / `""` | per-platform upload opt-in |
 
@@ -211,14 +217,18 @@ Two declared knobs aren't wired yet this version and are documented as such:
 A 24/7 watcher must not wreck the machine or the wallet:
 
 - **Cooldown** — 90 s per stream after any clipped moment (noise rarely waits).
-- **Judge budgets** — 3/minute, 60/hour, 500/day per stream. When a budget
-  cannot be checked, the candidate is **refused**, not guessed: the pacing
-  circuit fails closed.
+- **Judge budgets** — 3/minute, 60/hour, 500/day per stream, counted from
+  the `live_clips` table (a repair retry counts as a second call), so they
+  survive restarts. When a budget cannot be checked, the candidate is
+  **refused**, not guessed. A judged (or refused) spike is consumed: it never
+  buys a second verdict, and provider errors back every stream off.
 - **Queue bounds** — at most 10 candidates waiting, 1 render worker by default
   (the same "GPU wants the whole machine" philosophy as the batch queue).
   Overflow candidates are dropped *with a recorded reason*, never silently.
-- **Disk caps** — 512 MB per stream buffer (pruned continuously) plus a global
-  2 GiB ceiling on pending clip work before new candidates are refused.
+- **Disk caps** — 512 MB per stream buffer (pruned continuously), a 2 GiB
+  ceiling on pending clip work, the feature-wide `disk_budget_mb`, and a
+  free-space floor below which new candidates are refused. Removing a stream
+  deletes its buffer and clip folders.
 - **Crash isolation** — every watcher is its own task with its own
   subprocesses. One stream dying takes down only itself; the others and the
   app keep running.
@@ -268,10 +278,9 @@ rather than falling back to config storage.
   the picks are *good* is a judgement about your streams and your model that
   no test settles.
 
-One real caveat worth knowing: saving settings through the web UI's Settings
-page currently **drops the `live` section** of config.json (the settings model
-round-trips only the core sections). Hand-edit the file and re-check with
-`autoclip live settings` after any UI settings save.
+Saving the core Settings page keeps the `live` section intact, and a Live
+settings save (`PUT /api/live/settings`) is applied to the running server
+immediately — switching Live Watch off stops every capture.
 
 ## Scope
 

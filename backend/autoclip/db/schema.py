@@ -110,7 +110,9 @@ _V2 = """
 -- Status columns deliberately carry NO CHECK constraints: statuses evolve
 -- with the feature and the store layer validates them in Python, so a new
 -- status must never require a migration.
-CREATE TABLE live_streams (
+-- Every statement is IF NOT EXISTS: a database left half-migrated by an
+-- older build (which ran this script outside a transaction) re-runs cleanly.
+CREATE TABLE IF NOT EXISTS live_streams (
     id           TEXT PRIMARY KEY,
     url          TEXT NOT NULL,
     label        TEXT NOT NULL DEFAULT '',
@@ -121,9 +123,9 @@ CREATE TABLE live_streams (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
-CREATE INDEX idx_live_streams_state ON live_streams(state);
+CREATE INDEX IF NOT EXISTS idx_live_streams_state ON live_streams(state);
 
-CREATE TABLE live_clips (
+CREATE TABLE IF NOT EXISTS live_clips (
     id              TEXT PRIMARY KEY,
     stream_id       TEXT NOT NULL REFERENCES live_streams(id) ON DELETE CASCADE,
     status          TEXT NOT NULL DEFAULT 'detecting',
@@ -144,9 +146,9 @@ CREATE TABLE live_clips (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
-CREATE INDEX idx_live_clips_stream ON live_clips(stream_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_live_clips_stream ON live_clips(stream_id, created_at);
 
-CREATE TABLE live_uploads (
+CREATE TABLE IF NOT EXISTS live_uploads (
     id                TEXT PRIMARY KEY,
     clip_id           TEXT NOT NULL REFERENCES live_clips(id) ON DELETE CASCADE,
     platform          TEXT NOT NULL,
@@ -157,17 +159,67 @@ CREATE TABLE live_uploads (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
-CREATE INDEX idx_live_uploads_clip ON live_uploads(clip_id);
+CREATE INDEX IF NOT EXISTS idx_live_uploads_clip ON live_uploads(clip_id);
 """
 
 
+def _statements(script: str) -> list[str]:
+    """Split a DDL script into statements (``--`` comment lines dropped).
+
+    Safe for this module's scripts only: they hold no string literal or
+    trigger body containing a semicolon.
+    """
+    lines = [line for line in script.splitlines() if not line.lstrip().startswith("--")]
+    return [stmt.strip() for stmt in "\n".join(lines).split(";") if stmt.strip()]
+
+
+def _run_in_transaction(conn: sqlite3.Connection, statements: list[str]) -> None:
+    """Execute ``statements`` inside the caller's transaction.
+
+    ``executescript`` is deliberately avoided: it COMMITs first and then runs
+    in autocommit mode, so a crash half-way left some tables created and
+    ``user_version`` unchanged — and the next start died on "table already
+    exists". An explicit BEGIN makes the DDL and the ``user_version`` bump
+    that :func:`migrate` issues afterwards one atomic unit (SQLite DDL and
+    the user_version header are both transactional).
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    for statement in statements:
+        conn.execute(statement)
+
+
 def _migration_v2(conn: sqlite3.Connection) -> None:
-    conn.executescript(_V2)
+    _run_in_transaction(conn, _statements(_V2))
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migration_v3(conn: sqlite3.Connection) -> None:
+    """Live Watch: per-clip LLM judge call count (restart-proof judge budgets).
+
+    The per-stream minute/hour/day judge budgets are derived from
+    ``live_clips`` timestamps; ``judge_calls`` makes a repair retry count as
+    the second paid call it is. Idempotent: the column is only added when
+    missing.
+    """
+    statements: list[str] = []
+    if "judge_calls" not in _column_names(conn, "live_clips"):
+        statements.append(
+            "ALTER TABLE live_clips ADD COLUMN judge_calls INTEGER NOT NULL DEFAULT 0"
+        )
+    _run_in_transaction(conn, statements)
 
 
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1, _migration_v2]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _migration_v1,
+    _migration_v2,
+    _migration_v3,
+]
 
 SCHEMA_VERSION = len(MIGRATIONS)
 

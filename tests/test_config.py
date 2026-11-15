@@ -141,3 +141,30 @@ def test_config_file_is_written_under_autoclip_home(autoclip_home: Path) -> None
 
     assert paths.config_path() == autoclip_home.resolve() / "config.json"
     assert paths.config_path().exists()
+
+
+def test_save_preserves_sections_the_model_does_not_own() -> None:
+    """config.json is shared: a core Settings save must not wipe ``live``."""
+    paths.ensure_layout()
+    live = {"enabled": False, "rate_limit": {"judge_min_score": 90}}
+    paths.config_path().write_text(
+        json.dumps({"whisper": {"model": "base"}, "live": live, "future": [1, 2]}),
+        encoding="utf-8",
+    )
+
+    settings = config.load()
+    settings.whisper.model = "medium"
+    config.save(settings)
+
+    raw = json.loads(paths.config_path().read_text(encoding="utf-8"))
+    assert raw["live"] == live
+    assert raw["future"] == [1, 2]
+    assert raw["whisper"]["model"] == "medium"
+
+
+def test_save_does_not_resurrect_a_deleted_fallback_secret(no_keyring) -> None:
+    config.set_secret("anthropic", "sk-plaintext")
+    config.delete_secret("anthropic")
+
+    raw = json.loads(paths.config_path().read_text(encoding="utf-8"))
+    assert "_fallback_secrets" not in raw

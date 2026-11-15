@@ -110,10 +110,18 @@ class GPUInfo:
     vram_mb: int | None = None
     compute_capability: float | None = None
     driver_version: str | None = None
-    #: True when CTranslate2 reports a usable CUDA device — the check that
-    #: actually predicts whether faster-whisper will run on GPU. nvidia-smi
-    #: seeing a card is not sufficient (missing cuDNN is the usual culprit).
+    #: True when CTranslate2 reports a usable CUDA device AND the CUDA runtime
+    #: libraries it needs for inference can actually be loaded — the check
+    #: that predicts whether faster-whisper will run on GPU. nvidia-smi seeing
+    #: a card is not sufficient, and neither is CTranslate2's device count:
+    #: that only asks the driver, so a missing cuBLAS/cuDNN passes it and then
+    #: fails at the first inference with "cublas64_12.dll is not found".
     ctranslate2_cuda: bool = False
+
+    #: CUDA runtime libraries that are needed but could not be loaded (e.g.
+    #: ``["cuBLAS"]``). Non-empty means a GPU is present but unusable, so
+    #: transcription runs on the CPU until the libraries are installed.
+    cuda_libraries_missing: list[str] = field(default_factory=list)
 
     #: Compute types CTranslate2 reports for this device. Populated by the
     #: probe; empty only when CTranslate2 could not be queried.
@@ -295,13 +303,66 @@ def probe_gpu() -> GPUInfo:
         import ctranslate2
 
         if ctranslate2.get_cuda_device_count() > 0:
-            info.ctranslate2_cuda = True
-            info.accel = "cuda"
+            # The device count only asks the driver. cuBLAS and cuDNN are not
+            # touched until the first encode, so check they load now — a GPU
+            # we cannot run on must not be reported (or chosen) as usable.
+            info.cuda_libraries_missing = missing_cuda_libraries()
+            if not info.cuda_libraries_missing:
+                info.ctranslate2_cuda = True
+                info.accel = "cuda"
     except Exception:
         pass
 
     info.supported_compute_types = query_compute_types(info.device)
     return info
+
+
+#: Shared libraries CTranslate2's CUDA build loads at inference time, newest
+#: first. Any one name per component loading is enough.
+_CUDA_LIBRARIES: dict[str, dict[str, tuple[str, ...]]] = {
+    "win32": {
+        "cuBLAS": ("cublas64_12.dll", "cublas64_11.dll"),
+        "cuDNN": ("cudnn64_9.dll", "cudnn64_8.dll"),
+    },
+    "linux": {
+        "cuBLAS": ("libcublas.so.12", "libcublas.so.11"),
+        "cuDNN": ("libcudnn.so.9", "libcudnn.so.8"),
+    },
+}
+
+
+def missing_cuda_libraries() -> list[str]:
+    """Return the CUDA runtime components that cannot be loaded.
+
+    Mirrors how CTranslate2 resolves them: the pip-installed NVIDIA wheels
+    registered by :func:`autoclip.cuda.ensure_cuda_libraries`, then the normal
+    search path (a system-wide CUDA toolkit on PATH counts). Never raises.
+    """
+    import ctypes
+
+    platform_key = "win32" if sys.platform == "win32" else "linux"
+    attempts: tuple[dict, ...] = ({},)
+    if sys.platform == "win32":
+        # Default mode searches add_dll_directory() entries; winmode=0 is the
+        # classic LoadLibrary order, which includes PATH.
+        attempts = ({}, {"winmode": 0})
+
+    missing: list[str] = []
+    for component, names in _CUDA_LIBRARIES.get(platform_key, {}).items():
+        loaded = False
+        for name in names:
+            for kwargs in attempts:
+                try:
+                    ctypes.CDLL(name, **kwargs)
+                except OSError:
+                    continue
+                loaded = True
+                break
+            if loaded:
+                break
+        if not loaded:
+            missing.append(component)
+    return missing
 
 
 def query_compute_types(device: str) -> frozenset[str]:

@@ -7,7 +7,13 @@ so other workers' code keeps compiling against the skeleton as written.
 
 from __future__ import annotations
 
+import json
+import logging
+from typing import Any
+
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 
 class LiveRollingBufferSettings(BaseModel):
@@ -100,6 +106,15 @@ class LiveWorkerSettings(BaseModel):
     cpu_budget_percent: int = 50
     #: Memory budget (GB) advisory cap for heavy stages combined.
     ram_budget_gb: int = 8
+    #: Feature-wide disk budget (MB) for everything under ``live/`` except
+    #: finished (ready) clips: stream buffers, in-flight work, and the
+    #: leftovers of failed/rejected candidates. Over it, the oldest
+    #: non-ready artifacts are deleted first; still over it, new candidates
+    #: are refused.
+    disk_budget_mb: int = 10240
+    #: New candidates are refused while the disk holding ``live/`` has less
+    #: free space than this (MB) — a 24/7 watcher must never fill the disk.
+    min_free_disk_mb: int = 2048
 
 
 class LiveSettings(BaseModel):
@@ -122,3 +137,59 @@ class LiveStreamConfig(BaseModel):
     label: str = ""
     enabled: bool = True
     created_at: str = ""
+
+
+def stored_live_section() -> Any:
+    """The raw ``live`` value from config.json, or None when absent/corrupt.
+
+    Read from the raw file, not ``config.load()``: the live section is not a
+    field of the core Settings model (``extra="ignore"`` drops it on load).
+    """
+    from .. import paths
+
+    path = paths.config_path()
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return raw.get("live") if isinstance(raw, dict) else None
+
+
+def parse_live_section(raw: Any) -> LiveSettings:
+    """Validate a raw ``live`` value (or None) into LiveSettings.
+
+    Additive by design: a missing section, or one this version cannot
+    validate, lands on the frozen defaults instead of crashing startup.
+    """
+    if not isinstance(raw, dict):
+        return LiveSettings()
+    try:
+        return LiveSettings.model_validate(raw)
+    except Exception:
+        log.warning("live settings failed validation; using defaults.", exc_info=True)
+        return LiveSettings()
+
+
+def load_live_settings() -> LiveSettings:
+    """LiveSettings exactly as stored in config.json (defaults where absent)."""
+    return parse_live_section(stored_live_section())
+
+
+def update_in_place(target: BaseModel, source: BaseModel) -> None:
+    """Copy every field of ``source`` into ``target``, keeping sub-objects.
+
+    Watchers, detectors and the chat scorer hold references to the live
+    settings tree (and to its ``detection.audio``/``detection.chat``
+    sub-models); mutating the existing objects instead of swapping in a new
+    tree is what makes a settings save take effect in all of them at once.
+    ``source`` is already validated, so plain attribute assignment is safe.
+    """
+    for name in type(source).model_fields:
+        new = getattr(source, name)
+        old = getattr(target, name, None)
+        if isinstance(new, BaseModel) and isinstance(old, BaseModel) and type(old) is type(new):
+            update_in_place(old, new)
+        else:
+            setattr(target, name, new)

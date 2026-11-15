@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -107,14 +108,21 @@ class LiveJudgeOut(BaseModel):
     @field_validator("score", mode="before")
     @classmethod
     def _coerce_score(cls, value: Any) -> int:
-        """Accept floats and 0-1 fractions, which models emit despite the schema."""
-        if value is None:
+        """Accept floats and 0-1 fractions, which models emit despite the schema.
+
+        Only a NON-INTEGER value strictly between 0 and 1 reads as a fraction
+        (0.87 → 87). An integer ``1`` (or ``1.0``) is a score of 1, not 100:
+        scaling it would turn a flat rejection into a perfect pass.
+        """
+        if value is None or isinstance(value, bool):
             return 50
         try:
             number = float(value)
         except (TypeError, ValueError):
             return 50
-        if 0.0 < number <= 1.0:
+        if not math.isfinite(number):
+            return 50
+        if 0.0 < number < 1.0 and not number.is_integer():
             number *= 100
         return max(0, min(100, round(number)))
 
@@ -228,6 +236,16 @@ def _clamp_offset(value: int | None, last_index: int) -> int | None:
     return max(0, min(int(value), last_index))
 
 
+class JudgeBudgetExhausted(RuntimeError):
+    """The caller's judge budget refused a call; no LLM request was made."""
+
+
+def _spend(before_call: Callable[[], bool] | None, what: str) -> None:
+    """Ask the caller's budget for one paid call; raise when it says no."""
+    if before_call is not None and not before_call():
+        raise JudgeBudgetExhausted(f"judge budget exhausted before the {what}")
+
+
 async def judge_window(
     stream_label: str,
     words: list,  # list[Transcript.Word]
@@ -235,6 +253,7 @@ async def judge_window(
     *,
     provider=None,  # providers.LLMProvider
     temperature: float = 0.2,
+    before_call: Callable[[], bool] | None = None,
 ) -> LiveJudgement:
     """Render the window, call the provider once (with one repair retry).
 
@@ -243,14 +262,16 @@ async def judge_window(
     :func:`autoclip.providers.build_provider` — its model and API key come from
     settings/keyring and are never handled or logged here.
 
+    ``before_call`` is consulted before EVERY provider request — the repair
+    retry is a second paid call and must fit the budget like the first.
+    It returns False to refuse (:class:`JudgeBudgetExhausted` is raised,
+    nothing is sent); returning True records the call.
+
     Word offsets in the verdict are relative to the window's first word
     (``[0]``) and clamped to the window; ``None`` on an offset means "no trim
     advice for that edge". The input signals are echoed on the judgement as
     peak strengths so the store can record what evidence fired.
     """
-    if provider is None:
-        provider = build_provider()
-
     collected = _collect_signals(signals)
     strengths = {kind: strength for kind, (strength, _) in collected.items()}
 
@@ -265,6 +286,9 @@ async def judge_window(
             signals=strengths,
         )
 
+    if provider is None:
+        provider = build_provider()
+
     system = load_prompt(PROMPT_VERSION)
     user = render_judge_prompt(stream_label, words, signals)
 
@@ -273,6 +297,7 @@ async def judge_window(
     config.temperature = temperature
 
     name = provider.name or type(provider).__name__
+    _spend(before_call, "judge call")
     raw = await provider._complete(system, user, config)
     try:
         out = _parse(raw)
@@ -285,6 +310,7 @@ async def judge_window(
             "Respond again with ONLY the corrected JSON object. No prose, no "
             "markdown fences."
         )
+        _spend(before_call, "repair retry")
         raw = await provider._complete(system, repair, config)
         try:
             out = _parse(raw)

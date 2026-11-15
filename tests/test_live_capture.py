@@ -42,6 +42,17 @@ from autoclip.live.capture import (
 _WAIT_S = 10.0
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tree_kills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never run a real ``taskkill /PID 4242 /T /F`` against the host.
+
+    FakeProc carries a made-up PID; stop() on a live fake would otherwise
+    tree-kill whatever real process happens to own that PID. Tests that
+    exercise kill_process_tree itself import the real function directly.
+    """
+    monkeypatch.setattr("autoclip.live.capture.kill_process_tree", lambda pid: None)
+
+
 def wait_until(predicate: Callable[[], bool], timeout_s: float = _WAIT_S) -> bool:
     """Poll ``predicate`` until true or the deadline passes."""
     deadline = time.monotonic() + timeout_s
@@ -251,68 +262,90 @@ class TestStartContract:
 
 
 class TestTailerCommit:
-    """Closed files (stable across two polls) become committed segments."""
+    """A segment is committed once it is provably closed: N+1 exists, or
+    ffmpeg is gone. Size stability is NOT closure (live HLS arrives in
+    bursts, so a half-written file holds still between them)."""
 
-    def test_segment_committed_after_two_stable_polls(self, tmp_path: Path) -> None:
+    def test_segment_committed_once_its_successor_exists(self, tmp_path: Path) -> None:
         buffer = RingBuffer(tmp_path / "buf")
         cap = make_capture(buffer, resolver=lambda u: "http://x", spawn=lambda u: FakeProc())
         try:
             cap.start()
             seed_segment(buffer, 0)
+            time.sleep(0.2)
+            assert buffer.segments == []  # newest file: still being written
+            seed_segment(buffer, 1)
             assert wait_until(lambda: len(buffer.segments) >= 1)
             assert [s.index for s in buffer.segments] == [0]
         finally:
             cap.stop()
 
-    def test_growing_file_is_not_committed_prematurely(self, tmp_path: Path) -> None:
-        # The whole point of the two-poll rule: a file being appended right
-        # now must NOT land in the buffer until its size settles. Drive the
-        # poll logic deterministically instead of sleeping and hoping.
+    def test_stable_but_unfinished_segment_is_not_committed(self, tmp_path: Path) -> None:
+        # The live failure: a segment written in bursts holds its size
+        # still between bursts. However long it holds still, as the newest
+        # file of a running ffmpeg it is not closed.
         cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=lambda u: "http://x")
-        seen: dict[Path, int] = {}
-        committed: set[Path] = set()
+        cap._proc = FakeProc(alive_s=30)
         path = cap.buffer.directory / segment_name(0)
-
         path.write_bytes(b"S" * 100)
-        cap._poll_once(seen, committed)
-        assert committed == set()  # first sighting only
-        assert seen == {path: 100}
+        for _ in range(5):
+            assert cap._poll_once() is False
+        assert cap.buffer.segments == []
 
-        path.write_bytes(b"S" * 200)  # ffmpeg keeps appending
-        cap._poll_once(seen, committed)
-        assert committed == set()  # size changed between polls
-        assert seen == {path: 200}
+        path.write_bytes(b"S" * 400)  # the next burst lands
+        (cap.buffer.directory / segment_name(1)).write_bytes(b"S" * 10)  # muxer moved on
+        assert cap._poll_once() is True
+        # Committed with the size re-read at commit time — the whole file.
+        assert [(s.index, s.size_bytes) for s in cap.buffer.segments] == [(0, 400)]
 
-        cap._poll_once(seen, committed)  # stable now
-        assert committed == {path}
+    def test_final_segment_is_committed_once_ffmpeg_is_gone(self, tmp_path: Path) -> None:
+        cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=lambda u: "http://x")
+        (cap.buffer.directory / segment_name(0)).write_bytes(b"S" * 50)
+        assert cap._poll_once() is False
+        assert cap._poll_once(final=True) is True
         assert [s.index for s in cap.buffer.segments] == [0]
-        # And the stable file is not re-stat'ed afterwards.
-        assert seen == {}
 
     def test_zero_byte_file_is_never_committed(self, tmp_path: Path) -> None:
         # A zero-byte .ts is a muxer error artifact, not a segment.
         cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=lambda u: "http://x")
-        path = cap.buffer.directory / segment_name(0)
-        path.write_bytes(b"")
-        seen: dict[Path, int] = {}
-        committed: set[Path] = set()
-        cap._poll_once(seen, committed)
-        cap._poll_once(seen, committed)
-        cap._poll_once(seen, committed)
-        assert committed == set()
+        (cap.buffer.directory / segment_name(0)).write_bytes(b"")
+        cap._poll_once(final=True)
+        cap._poll_once(final=True)
         assert cap.buffer.segments == []
+        # ...and it does not block the sequence behind it.
+        (cap.buffer.directory / segment_name(1)).write_bytes(b"S" * 10)
+        cap._poll_once(final=True)
+        assert [s.index for s in cap.buffer.segments] == [1]
+
+    def test_files_outside_the_expected_sequence_are_never_committed(self, tmp_path: Path) -> None:
+        # Stale leftovers (a previous ffmpeg's numbering) must not be
+        # adopted: committing seg 950 would make every new segment look
+        # out of order — the "blind after restart" failure.
+        buffer = RingBuffer(tmp_path / "buf")
+        for i in range(950, 953):
+            seed_segment(buffer, i)
+        cap = make_capture(buffer, resolver=lambda u: "http://x")
+        cap._next_index = 0
+        cap._poll_once(final=True)
+        assert buffer.segments == []
+        seed_segment(buffer, 0)
+        seed_segment(buffer, 1)
+        cap._poll_once()
+        assert [s.index for s in buffer.segments] == [0]
 
     def test_commits_arrive_in_order(self, tmp_path: Path) -> None:
         buffer = RingBuffer(tmp_path / "buf")
         cap = make_capture(buffer, resolver=lambda u: "http://x", spawn=lambda u: FakeProc())
         try:
             cap.start()
-            for i in range(4):
+            for i in range(5):
                 seed_segment(buffer, i)
-                assert wait_until(lambda i=i: len(buffer.segments) > i)
+                # Segment i-1 is closed the moment segment i appears.
+                assert wait_until(lambda i=i: len(buffer.segments) >= i)
         finally:
             cap.stop()
         assert [s.index for s in buffer.segments] == [0, 1, 2, 3]
+        assert cap.committed == 4
 
     def test_non_segment_files_are_ignored(self, tmp_path: Path) -> None:
         buffer = RingBuffer(tmp_path / "buf")
@@ -334,12 +367,13 @@ class TestTailerCommit:
         try:
             cap.start()
             seed_segment(buffer, 0)
+            seed_segment(buffer, 1)
             assert wait_until(lambda: len(buffer.segments) == 1)
             # Force the failure: register the same index again by hand.
             with pytest.raises(ValueError):
                 buffer.commit_segment(0)
             # Tailer still alive and committing *new* files.
-            seed_segment(buffer, 1)
+            seed_segment(buffer, 2)
             assert wait_until(lambda: len(buffer.segments) == 2)
         finally:
             cap.stop()
@@ -491,6 +525,138 @@ class TestStop:
         threads = [t for t in (cap._tailer, cap._waiter) if t is not None]
         cap.stop()
         assert all(not t.is_alive() for t in threads)
+
+
+class _ChattyProc(FakeProc):
+    """A FakeProc with a real stderr pipe that floods like a noisy ffmpeg."""
+
+    def __init__(self, payload: bytes, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        import io
+
+        self.stderr = io.BufferedReader(io.BytesIO(payload))
+
+
+class TestCaptureRobustness:
+    """Freezes and orphans: the failure modes a 24/7 capture must survive."""
+
+    def test_stderr_is_drained_and_its_tail_kept(self, tmp_path: Path) -> None:
+        # An unread PIPE blocks ffmpeg once the OS buffer fills; the reader
+        # must consume it, and keep the last lines for error events.
+        noise = b"".join(f"warning {i}\n".encode() for i in range(5000)) + b"fatal: 403\n"
+        proc = _ChattyProc(noise, alive_s=30)
+        cap = make_capture(
+            RingBuffer(tmp_path / "buf"), resolver=lambda u: "x", spawn=lambda u: proc
+        )
+        try:
+            cap.start()
+            assert wait_until(lambda: "fatal: 403" in cap.stderr_tail)
+        finally:
+            cap.stop()
+
+    def test_error_event_carries_the_stderr_tail(self, tmp_path: Path) -> None:
+        events: list[tuple[str, str]] = []
+        proc = _ChattyProc(b"Server returned 403 Forbidden\n", alive_s=0.1, rc=1)
+        cap = make_capture(
+            RingBuffer(tmp_path / "buf"),
+            resolver=lambda u: "x",
+            spawn=lambda u: proc,
+            events=events,
+        )
+        try:
+            cap.start()
+            assert wait_until(lambda: any(k == "error" for k, _ in events))
+        finally:
+            cap.stop()
+        detail = next(d for k, d in events if k == "error")
+        assert "code 1" in detail and "403 Forbidden" in detail
+
+    def test_stalled_capture_is_killed_and_reported(self, tmp_path: Path) -> None:
+        # ffmpeg alive but nothing new for ~3 segments: kill + "error" so
+        # the watcher reconnects instead of sitting on a frozen capture.
+        events: list[tuple[str, str]] = []
+        proc = FakeProc(alive_s=30, kill_rc=1)
+        buffer = RingBuffer(tmp_path / "buf")
+        cap = StreamCapture(
+            "https://twitch.tv/x",
+            buffer,
+            on_event=lambda k, d: events.append((k, d)),
+            resolver=lambda u: "x",
+            spawn=lambda u: proc,
+            poll_s=0.02,
+            drain_grace_s=0.05,
+            stall_timeout_s=0.3,
+            first_segment_timeout_s=0.3,
+        )
+        try:
+            cap.start()
+            assert wait_until(lambda: any(k == "error" for k, _ in events))
+        finally:
+            cap.stop()
+        assert proc.killed.is_set()
+        detail = next(d for k, d in events if k == "error")
+        assert "stalled" in detail
+
+    def test_steady_segments_keep_the_watchdog_quiet(self, tmp_path: Path) -> None:
+        events: list[tuple[str, str]] = []
+        proc = FakeProc(alive_s=30)
+        buffer = RingBuffer(tmp_path / "buf")
+        cap = StreamCapture(
+            "https://twitch.tv/x",
+            buffer,
+            on_event=lambda k, d: events.append((k, d)),
+            resolver=lambda u: "x",
+            spawn=lambda u: proc,
+            poll_s=0.02,
+            stall_timeout_s=0.5,
+            first_segment_timeout_s=0.5,
+        )
+        try:
+            cap.start()
+            for i in range(8):
+                seed_segment(buffer, i)
+                time.sleep(0.1)
+            assert not proc.killed.is_set()
+        finally:
+            cap.stop()
+        assert not any(k == "error" for k, _ in events)
+        assert cap.committed == 7
+
+    def test_stop_during_popen_never_orphans_ffmpeg(self, tmp_path: Path) -> None:
+        # stop() landing between the stop-flag check and Popen returning
+        # used to leave a live process nobody managed.
+        spawned: list[FakeProc] = []
+        in_popen = threading.Event()
+
+        def slow_spawn(url: str) -> FakeProc:
+            in_popen.set()
+            time.sleep(0.3)  # a slow Popen (antivirus scan, loaded box)
+            spawned.append(FakeProc(alive_s=30))
+            return spawned[-1]
+
+        cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=lambda u: "x", spawn=slow_spawn)
+        starter = threading.Thread(target=cap.start)
+        starter.start()
+        assert in_popen.wait(timeout=_WAIT_S)
+        cap.stop()  # lands while Popen is still running
+        starter.join(timeout=_WAIT_S)
+        assert spawned, "the spawn should have completed"
+        assert spawned[0].killed.is_set(), "the process spawned during stop() was orphaned"
+        assert cap._tailer is None and cap._waiter is None
+
+    def test_argv_bounds_blocking_reads(self, tmp_path: Path, monkeypatch) -> None:
+        argv: list[str] = []
+        monkeypatch.setattr("autoclip.live.capture._ffmpeg_binary", lambda: "ffmpeg")
+        monkeypatch.setattr("autoclip.live.capture._new_process_group_flags", lambda: 0)
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda command, **kwargs: argv.extend(command) or FakeProc()
+        )
+        cap = make_capture(RingBuffer(tmp_path / "buf"), resolver=lambda u: "x")
+        cap._spawn_ffmpeg("http://media/x.m3u8")
+        cap.stop()
+        assert "-rw_timeout" in argv
+        assert argv.index("-rw_timeout") < argv.index("-i")
+        assert int(argv[argv.index("-rw_timeout") + 1]) >= 1_000_000
 
 
 class TestRealArgv:

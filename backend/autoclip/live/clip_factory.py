@@ -32,18 +32,20 @@ exception. The manager marks the row failed and surfaces ``str(exc)`` verbatim.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from ..config import Settings
 from ..pipeline import captions, export, ffmpeg, prepare, transcribe
 from ..pipeline.reframe import ReframeConfig, build_crop_path
 from ..pipeline.reframe.croppath import CropPath
 from ..pipeline.transcript import Transcript
+from . import gpu
 from .buffer import SEGMENT_S, RingBuffer
 from .models import LiveClipRow
 from .paths import clip_dir
@@ -206,10 +208,103 @@ def _window_matches(work: Path, clip_row: LiveClipRow) -> bool:
 
 
 def _write_window_manifest(work: Path, clip_row: LiveClipRow) -> None:
+    write_window_manifest(work, clip_row.clip_start_s, clip_row.clip_end_s)
+
+
+def write_window_manifest(work: Path, clip_start_s: float, clip_end_s: float) -> None:
+    """Record which window ``raw.ts`` in ``work`` was cut for."""
     (work / WINDOW_NAME).write_text(
-        json.dumps({"clip_start_s": clip_row.clip_start_s, "clip_end_s": clip_row.clip_end_s}),
+        json.dumps({"clip_start_s": clip_start_s, "clip_end_s": clip_end_s}),
         encoding="utf-8",
     )
+
+
+def _buffer_extract(
+    buffer: Any, start_s: float, end_s: float, target: Path, anchor_s: float | None
+) -> None:
+    """``buffer.extract`` with the trigger anchor when the buffer supports it.
+
+    The anchor lets a window that straddles a reconnect clamp to the
+    trigger's epoch instead of failing; minimal test buffers without the
+    keyword are called the old way.
+    """
+    if anchor_s is not None and _accepts_anchor(buffer):
+        buffer.extract(start_s, end_s, target, anchor_s=anchor_s)
+    else:
+        buffer.extract(start_s, end_s, target)
+
+
+def _accepts_anchor(buffer: Any) -> bool:
+    try:
+        return "anchor_s" in inspect.signature(buffer.extract).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def window_staged(clip_row: LiveClipRow) -> bool:
+    """True when ``raw.ts`` for exactly this row's window is on disk.
+
+    A staged window makes the clip renderable without the rolling buffer —
+    across a pause, a restart, or a retry an hour later.
+    """
+    work = clip_dir(clip_row.id)
+    return _valid_file(work / RAW_NAME) and _window_matches(work, clip_row)
+
+
+def stage_window(
+    buffer: Any,
+    clip_id: str,
+    clip_start_s: float,
+    clip_end_s: float,
+    *,
+    anchor_s: float | None = None,
+) -> Path:
+    """Cut the render window into ``live/clips/<id>/raw.ts`` right now.
+
+    Called at accept time, while the window is guaranteed to be in the
+    rolling buffer: a queued clip then no longer depends on the buffer
+    holding its pre-roll until a render worker gets to it (the buffer may
+    prune it, or be cleared by a pause/restart). ``produce()`` reuses the
+    staged file via the window manifest.
+    """
+    work = clip_dir(clip_id)
+    work.mkdir(parents=True, exist_ok=True)
+    raw = work / RAW_NAME
+    _buffer_extract(buffer, clip_start_s, clip_end_s, raw, anchor_s)
+    if not _valid_file(raw):
+        raise ClipProductionError(
+            f"live clip {clip_id} [extract]: the staged window is empty",
+            stage="extract",
+            clip_id=clip_id,
+        )
+    write_window_manifest(work, clip_start_s, clip_end_s)
+    return raw
+
+
+#: Render intermediates — big, and useless once the clip is ready.
+INTERMEDIATE_NAMES: tuple[str, ...] = (RAW_NAME, NORMALIZED_NAME, AUDIO_NAME)
+
+
+def cleanup_intermediates(clip_id: str) -> int:
+    """Delete a ready clip's render intermediates; returns bytes freed.
+
+    raw.ts, normalized.mp4 and audio.wav are only needed to resume a failed
+    render. The rendered .mp4/.srt, the transcript and the crop path stay.
+    """
+    work = clip_dir(clip_id)
+    freed = 0
+    for name in INTERMEDIATE_NAMES:
+        path = work / name
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.debug("could not delete %s", path, exc_info=True)
+            continue
+        freed += size
+    return freed
 
 
 def _wipe_derived(work: Path) -> None:
@@ -236,11 +331,19 @@ def _extract_window(
     queues behind the GPU.
     """
     tracker.begin("extract")
+    if buffer is None:
+        _fail(
+            "extract",
+            clip_row.id,
+            "the clip window was never staged and the stream's rolling buffer is gone"
+            " (stream paused or removed)",
+        )
     pin_index = int(clip_row.clip_start_s // SEGMENT_S)
     buffer.pin_oldest(pin_index)
     try:
         try:
-            buffer.extract(clip_row.clip_start_s, clip_row.clip_end_s, target)
+            anchor = clip_row.trigger_end_s if clip_row.trigger_end_s > 0 else None
+            _buffer_extract(buffer, clip_row.clip_start_s, clip_row.clip_end_s, target, anchor)
         except Exception as exc:
             _fail(
                 "extract",
@@ -421,9 +524,12 @@ def produce(
     if transcript is None:
         tracker.begin("transcribe")
         try:
-            transcript = transcribe.transcribe(
+            # Shared GPU slot + resident model: a render and a judge-phase
+            # transcription never load two Whisper models side by side.
+            transcript = gpu.transcribe(
                 audio,
                 settings.whisper,
+                transcribe_fn=transcribe.transcribe,
                 duration_s=duration,
                 on_progress=tracker.fraction("transcribe"),
             )
@@ -480,12 +586,13 @@ def produce(
     )
     tracker.begin("export")
     try:
-        export.export_clip(
-            request,
-            work_dir=work,
-            settings=settings.export.model_copy(update={"write_srt": True}),
-            on_progress=tracker.fraction("export"),
-        )
+        with gpu.gpu_slot():  # the hardware encoder is the other GPU stage
+            export.export_clip(
+                request,
+                work_dir=work,
+                settings=settings.export.model_copy(update={"write_srt": True}),
+                on_progress=tracker.fraction("export"),
+            )
     except Exception as exc:
         _fail("export", clip_row.id, f"could not render {destination.name}", exc)
 

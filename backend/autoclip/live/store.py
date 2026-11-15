@@ -49,20 +49,30 @@ from .models import LiveClipRow, LiveStreamRow, LiveUploadRow, utcnow
 
 __all__ = [
     "UNSET",
+    "add_judge_call",
+    "clip_counts",
     "create_clip",
     "create_upload",
     "delete_stream",
+    "delete_upload",
     "get_clip",
     "get_stream",
+    "judge_calls_since",
     "list_clips",
     "list_streams",
     "list_uploads",
     "reset_interrupted_states",
+    "set_stream_enabled",
     "update_clip",
+    "update_clip_guarded",
     "update_stream_state",
     "update_upload",
     "upsert_stream",
 ]
+
+#: The tombstone status: a clip the user discarded (or the pipeline
+#: rejected). Nothing may write a clip row back to life once it says this.
+TOMBSTONE_STATUS = "rejected"
 
 _Unset = type(UNSET)  # private class in db.store; typed here for isinstance checks
 
@@ -171,6 +181,23 @@ def update_stream_state(
         )
 
 
+def set_stream_enabled(stream_id: str, enabled: bool, *, state: str | None = None) -> None:
+    """Persist a stream's enabled flag (pause/resume), optionally its state too.
+
+    A paused stream must read ``enabled=0`` / ``state='off'`` from the DB
+    alone — the registry is not the only source the API and CLI consult.
+    """
+    fields: dict[str, Any] = {"enabled": int(bool(enabled)), "updated_at": utcnow()}
+    if state is not None:
+        fields["state"] = state
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with connection() as conn:
+        conn.execute(
+            f"UPDATE live_streams SET {assignments} WHERE id = ?",
+            (*fields.values(), stream_id),
+        )
+
+
 def delete_stream(stream_id: str) -> None:
     """Remove a stream; its clips and uploads go with it (ON DELETE CASCADE)."""
     with connection() as conn:
@@ -200,6 +227,7 @@ _CLIP_PATCHABLE = frozenset(
         "caption_style",
         "ratio",
         "error",
+        "judge_calls",
     }
 )
 
@@ -212,8 +240,8 @@ def create_clip(row: LiveClipRow) -> LiveClipRow:
                                      trigger_end_s, clip_start_s, clip_end_s,
                                      title, score, reason, hook, judge_model,
                                      transcript_path, rendered_path, caption_style,
-                                     ratio, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     ratio, error, created_at, updated_at, judge_calls)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row.id,
@@ -235,6 +263,7 @@ def create_clip(row: LiveClipRow) -> LiveClipRow:
                 row.error,
                 row.created_at,
                 row.updated_at,
+                int(row.judge_calls or 0),
             ),
         )
     return row
@@ -246,18 +275,41 @@ def get_clip(clip_id: str) -> LiveClipRow | None:
     return LiveClipRow.from_row(row) if row else None
 
 
-def list_clips(stream_id: str | None = None, limit: int = 200) -> list[LiveClipRow]:
-    """Newest-first clips, optionally scoped to one stream."""
+def list_clips(
+    stream_id: str | None = None,
+    limit: int = 200,
+    *,
+    statuses: list[str] | tuple[str, ...] | None = None,
+) -> list[LiveClipRow]:
+    """Newest-first clips, optionally scoped to one stream and/or statuses."""
     query = "SELECT * FROM live_clips"
+    clauses: list[str] = []
     params: list[Any] = []
     if stream_id is not None:
-        query += " WHERE stream_id = ?"
+        clauses.append("stream_id = ?")
         params.append(stream_id)
+    if statuses:
+        clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY created_at DESC, id DESC LIMIT ?"
     params.append(limit)
     with connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return [LiveClipRow.from_row(r) for r in rows]
+
+
+def clip_counts(statuses: tuple[str, ...] = ("ready",)) -> dict[str, int]:
+    """``{stream_id: number of clips}`` in ``statuses`` (ready clips by default)."""
+    placeholders = ", ".join("?" for _ in statuses)
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT stream_id, COUNT(*) AS n FROM live_clips WHERE status IN ({placeholders})"
+            " GROUP BY stream_id",
+            tuple(statuses),
+        ).fetchall()
+    return {r["stream_id"]: int(r["n"]) for r in rows}
 
 
 def update_clip(clip_id: str, **fields: Any) -> None:
@@ -270,6 +322,51 @@ def update_clip(clip_id: str, **fields: Any) -> None:
     ``updated_at``.
     """
     _patch_row("live_clips", clip_id, fields, _CLIP_PATCHABLE, _CLIP_NULLABLE)
+
+
+def update_clip_guarded(clip_id: str, **fields: Any) -> bool:
+    """Patch a clip unless it is tombstoned; True when the row was written.
+
+    The same semantics as :func:`update_clip`, plus one atomic condition:
+    a row whose status is ``rejected`` (discarded by the user, or rejected
+    by the pipeline) is never written again. The check and the write are
+    one ``UPDATE ... WHERE status != 'rejected'``, so a discard landing
+    between a worker's read and its write cannot be overwritten.
+    Returns False for a missing or tombstoned row (and for an empty patch).
+    """
+    return _patch_row(
+        "live_clips",
+        clip_id,
+        fields,
+        _CLIP_PATCHABLE,
+        _CLIP_NULLABLE,
+        unless_status=TOMBSTONE_STATUS,
+    )
+
+
+def add_judge_call(clip_id: str) -> None:
+    """Count one LLM judge call against a clip row (budget bookkeeping)."""
+    with connection() as conn:
+        conn.execute(
+            "UPDATE live_clips SET judge_calls = judge_calls + 1, updated_at = ? WHERE id = ?",
+            (utcnow(), clip_id),
+        )
+
+
+def judge_calls_since(stream_id: str, since: str) -> int:
+    """LLM judge calls ``stream_id``'s candidates spent since ``since`` (ISO).
+
+    The per-stream minute/hour/day judge budgets are derived from this, so
+    they survive restarts — an in-memory bucket refilled on every boot is
+    no ceiling at all.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(judge_calls), 0) AS n FROM live_clips"
+            " WHERE stream_id = ? AND created_at >= ?",
+            (stream_id, since),
+        ).fetchone()
+    return int(row["n"] or 0)
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +421,12 @@ def update_upload(upload_id: str, **fields: Any) -> None:
     _patch_row("live_uploads", upload_id, fields, _UPLOAD_PATCHABLE, _UPLOAD_NULLABLE)
 
 
+def delete_upload(upload_id: str) -> None:
+    """Remove one upload record (an attempt that never actually ran)."""
+    with connection() as conn:
+        conn.execute("DELETE FROM live_uploads WHERE id = ?", (upload_id,))
+
+
 # --------------------------------------------------------------------------
 # Shared patch machinery
 # --------------------------------------------------------------------------
@@ -335,16 +438,19 @@ def _patch_row(
     fields: dict[str, Any],
     patchable: frozenset[str],
     nullable: frozenset[str],
-) -> None:
+    *,
+    unless_status: str | None = None,
+) -> bool:
     """Apply a partial UPDATE with None-means-clear semantics.
 
     Table and column names come from this module's own constants only, never
     from caller input, so the f-string interpolation is safe. Unknown or
-    read-only names fail fast with ``ValueError``.
+    read-only names fail fast with ``ValueError``. ``unless_status`` adds an
+    atomic ``AND status != ?`` guard. Returns whether a row was written.
     """
     fields = dict(fields)
     if not fields:
-        return
+        return False
 
     unknown = sorted(set(fields) - patchable)
     if unknown:
@@ -362,14 +468,17 @@ def _patch_row(
             assignments[name] = value
 
     if len(assignments) == 1:  # only updated_at: nothing to write
-        return
+        return False
 
     set_clause = ", ".join(f"{name} = ?" for name in assignments)
+    where = "id = ?"
+    params: list[Any] = [*assignments.values(), key_value]
+    if unless_status is not None:
+        where += " AND status != ?"
+        params.append(unless_status)
     with connection() as conn:
-        conn.execute(
-            f"UPDATE {table} SET {set_clause} WHERE id = ?",
-            (*assignments.values(), key_value),
-        )
+        cursor = conn.execute(f"UPDATE {table} SET {set_clause} WHERE {where}", params)
+        return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------
@@ -404,10 +513,16 @@ def reset_interrupted_states() -> int:
     nothing left to reset except rows already in ``waiting_for_live``, which
     keep that state (only their stale detail is cleared).
 
+    Work that was in flight is not left hanging either: clips stuck in
+    ``detecting``/``queued``/``rendering`` become ``failed`` with reason
+    ``interrupted`` (a failed clip whose window was staged can be retried),
+    and upload attempts stuck in ``uploading`` become ``failed``.
+
     Requires :func:`autoclip.db.init` to have run (the manager always inits
     before starting watchers, so this is never a practical constraint).
     """
     placeholders = ", ".join("?" for _ in RESETTABLE_STATES)
+    now = utcnow()
     with connection() as conn:
         cursor = conn.execute(
             f"""
@@ -417,6 +532,37 @@ def reset_interrupted_states() -> int:
                 updated_at = ?
             WHERE state IN ({placeholders})
             """,
-            (utcnow(), *RESETTABLE_STATES),
+            (now, *RESETTABLE_STATES),
         )
-        return cursor.rowcount
+        streams = cursor.rowcount
+        clip_marks = ", ".join("?" for _ in INTERRUPTIBLE_CLIP_STATUSES)
+        conn.execute(
+            f"""
+            UPDATE live_clips
+            SET status = 'failed',
+                reason = ?,
+                error = ?,
+                updated_at = ?
+            WHERE status IN ({clip_marks})
+            """,
+            (INTERRUPTED, INTERRUPTED, now, *INTERRUPTIBLE_CLIP_STATUSES),
+        )
+        conn.execute(
+            """
+            UPDATE live_uploads
+            SET status = 'failed',
+                error = ?,
+                updated_at = ?
+            WHERE status = 'uploading'
+            """,
+            (INTERRUPTED, now),
+        )
+        return streams
+
+
+#: Clip statuses that mean "a worker was busy with this row" — a restart
+#: kills that worker, so the row can never progress on its own again.
+INTERRUPTIBLE_CLIP_STATUSES: tuple[str, ...] = ("detecting", "queued", "rendering")
+
+#: The reason/error recorded on work a restart (or stop) cut short.
+INTERRUPTED = "interrupted"

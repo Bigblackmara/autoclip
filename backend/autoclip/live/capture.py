@@ -20,11 +20,20 @@ Pipeline shape (and why it is two subprocesses at most, never a pipe chain):
    (streamlink | ffmpeg) would tie ffmpeg's lifetime to a third party's
    socket; two decoupled processes mean a reconnect restarts only resolution.
 
-3. **Tail.** A daemon thread polls the directory and commits any file whose
-   size holds steady across two polls. The segment muxer rounds to keyframes,
-   so "file exists" and "file is finished" are different moments — committing
-   early feeds truncated audio into analysis; the two-poll stability
-   heuristic is the frozen, portable way to tell them apart.
+3. **Tail.** A daemon thread commits segments strictly in sequence, starting
+   at the number this ffmpeg was told to start at: segment N is committed
+   only once segment N+1 exists (the segment muxer closes N before it opens
+   N+1), or once ffmpeg has exited (then every file is closed). A
+   size-stable-across-two-polls rule is NOT enough: live HLS arrives in
+   bursts, so a half-written segment holds still between bursts and was
+   committed at ~25 %, starving audio analysis. The size is re-read at
+   commit time. Files outside the expected sequence (stale leftovers, a
+   previous ffmpeg's late write) are never committed.
+
+   The tailer is also the stall watchdog: when ffmpeg is alive but no
+   segment has been committed for ``stall_timeout_s`` (≈3 segments), the
+   process is killed and an ``"error"`` event fires, so the watcher
+   reconnects instead of sitting on a frozen capture forever.
 
 Events go through ``on_event(kind, detail)`` with a *string* detail (the
 watcher marshals them onto its event loop and logs the text): ``"started"``
@@ -47,15 +56,15 @@ order pins it). Nothing here is speculative.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import subprocess
 import threading
 import time
 from collections.abc import Callable
-from pathlib import Path
 
-from .buffer import SEGMENT_EXT, SEGMENT_S, RingBuffer
+from .buffer import SEGMENT_EXT, SEGMENT_S, RingBuffer, segment_name
 
 log = logging.getLogger(__name__)
 
@@ -64,11 +73,25 @@ log = logging.getLogger(__name__)
 #: index → seconds for every downstream consumer.
 SEGMENT_TIME_S = SEGMENT_S
 
-#: Tailer poll interval. Two consecutive polls at this interval define
-#: "size stable → committed". One interval of commit latency is harmless
+#: Tailer poll interval. One interval of commit latency is harmless
 #: (downstream detectors see the segment a moment later); a premature commit
 #: is not harmless — so the loop errs slow, not fast.
 TAILER_POLL_S = 0.5
+
+#: ffmpeg ``-rw_timeout`` for the input, seconds: a read that blocks longer
+#: than this fails the input instead of hanging the process forever.
+RW_TIMEOUT_S = 15.0
+
+#: Stall watchdog: ffmpeg alive but no segment committed for this long
+#: (≈3 segments) means a frozen capture — kill it so the watcher reconnects.
+STALL_TIMEOUT_S = 3 * SEGMENT_S
+
+#: The first segment gets a longer grace: resolution, HLS startup and the
+#: first full segment all have to happen before anything can commit.
+FIRST_SEGMENT_TIMEOUT_S = 45.0
+
+#: How much of ffmpeg's stderr is kept for error events (last lines).
+STDERR_TAIL_LINES = 20
 
 #: After ffmpeg exits, the tailer keeps polling this long for stragglers: the
 #: final segment can appear in a directory listing a beat after the process
@@ -137,6 +160,8 @@ class StreamCapture:
         spawn: Callable[[str], subprocess.Popen] | None = None,
         poll_s: float = TAILER_POLL_S,
         drain_grace_s: float = DRAIN_GRACE_S,
+        stall_timeout_s: float | None = STALL_TIMEOUT_S,
+        first_segment_timeout_s: float | None = FIRST_SEGMENT_TIMEOUT_S,
     ) -> None:
         self.url = url
         self.buffer = buffer
@@ -146,13 +171,26 @@ class StreamCapture:
         self._custom_spawn = spawn
         self.poll_s = poll_s
         self.drain_grace_s = drain_grace_s
+        self.stall_timeout_s = stall_timeout_s
+        self.first_segment_timeout_s = first_segment_timeout_s
 
         self._proc: subprocess.Popen | None = None
         self._tailer: threading.Thread | None = None
         self._waiter: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
         self._stop_flag = threading.Event()
         self._started = False
         self._stop_done = threading.Event()
+        #: Serializes spawn against stop(): a stop() landing while Popen runs
+        #: must still see (and kill) the process it creates.
+        self._lock = threading.Lock()
+        #: Next segment index the tailer expects (strict sequence).
+        self._next_index = 0
+        #: Segments this capture committed (the watcher's health signal).
+        self.committed = 0
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=STDERR_TAIL_LINES)
+        #: Set when the stall watchdog killed ffmpeg; the exit event says so.
+        self._stall_detail = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -168,18 +206,28 @@ class StreamCapture:
         if self._started:
             raise RuntimeError("capture already started")
         stream_url = self._resolve()
-        # Re-check the stop flag after resolution: a stop() racing a slow
-        # resolver must not spawn a process nobody will ever manage.
-        if self._stop_flag.is_set():
-            return
-        self._spawn_ffmpeg(stream_url)
-        self._tailer = threading.Thread(target=self._tail_loop, name="capture-tailer", daemon=True)
-        self._tailer.start()
-        self._waiter = threading.Thread(
-            target=self._wait_ffmpeg_exit, name="capture-exit", daemon=True
-        )
-        self._waiter.start()
-        self._started = True
+        with self._lock:
+            # Re-check the stop flag after resolution: a stop() racing a slow
+            # resolver must not spawn a process nobody will ever manage.
+            if self._stop_flag.is_set():
+                return
+            self._next_index = self._next_start_number()
+            self._spawn_ffmpeg(stream_url)
+            if self._stop_flag.is_set():
+                # stop() landed while Popen ran: it is waiting on this lock
+                # and saw no process yet, so the kill is ours to do.
+                self._kill_tree()
+                return
+            self._started = True
+            self._start_stderr_reader()
+            self._tailer = threading.Thread(
+                target=self._tail_loop, name="capture-tailer", daemon=True
+            )
+            self._tailer.start()
+            self._waiter = threading.Thread(
+                target=self._wait_ffmpeg_exit, name="capture-exit", daemon=True
+            )
+            self._waiter.start()
         self._emit("started", f"capture started: {stream_url}")
 
     def stop(self) -> None:
@@ -187,16 +235,22 @@ class StreamCapture:
         if self._stop_done.is_set():
             return
         self._stop_flag.set()
-        self._kill_tree()
+        with self._lock:
+            self._kill_tree()
         current = threading.current_thread()
         # Bounded join: the tailer polls at most one more interval and the
         # waiter exits with the process it watches; anything past this is a
         # leak the caller should see, not wait on silently.
         join_timeout = self.drain_grace_s + max(self.poll_s, 1.0)
-        for t in (self._tailer, self._waiter):
+        for t in (self._tailer, self._waiter, self._stderr_reader):
             if t is not None and t is not current:
                 t.join(timeout=join_timeout)
         self._stop_done.set()
+
+    @property
+    def stderr_tail(self) -> str:
+        """The last lines ffmpeg wrote to stderr (for error reports)."""
+        return " | ".join(line for line in self._stderr_tail if line)
 
     def wait(self, timeout: float | None = None) -> int | None:
         """Block until ffmpeg exits; its returncode, or None on timeout."""
@@ -242,7 +296,7 @@ class StreamCapture:
         if self._custom_spawn is not None:
             self._proc = self._custom_spawn(stream_url)
             return
-        start_number = self._next_start_number()
+        start_number = self._next_index
         command = [
             _ffmpeg_binary(),
             "-hide_banner",
@@ -250,6 +304,10 @@ class StreamCapture:
             "-loglevel",
             "error",
             "-y",
+            # A read that blocks this long fails the input instead of
+            # freezing ffmpeg (and with it the whole stream) forever.
+            "-rw_timeout",
+            str(int(RW_TIMEOUT_S * 1_000_000)),
             "-i",
             stream_url,
             "-c",
@@ -301,76 +359,135 @@ class StreamCapture:
             # would make a stream removal look like the broadcaster signing
             # off (and the watcher would park it in waiting_for_live).
             return
-        if rc == 0:
+        if self._stall_detail:
+            self._emit("error", self._stall_detail)
+        elif rc == 0:
             self._emit("ended", "stream ended")
         else:
-            self._emit("error", f"ffmpeg exited with code {rc}")
+            reader = self._stderr_reader
+            if reader is not None:
+                # Let the reader collect ffmpeg's last words (bounded).
+                reader.join(timeout=1.0)
+            tail = self.stderr_tail
+            detail = f"ffmpeg exited with code {rc}"
+            self._emit("error", f"{detail}: {tail[-300:]}" if tail else detail)
+
+    def _start_stderr_reader(self) -> None:
+        """Drain ffmpeg's stderr PIPE (keep a tail for error events).
+
+        An unread PIPE fills its 4-8 KB OS buffer and then BLOCKS ffmpeg on
+        its next log line — a silent freeze. The reader owns the pipe and
+        closes it at EOF.
+        """
+        stream = getattr(self._proc, "stderr", None)
+        if stream is None:
+            return
+
+        def drain() -> None:
+            try:
+                for raw in iter(stream.readline, b""):
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", "replace")
+                    line = str(raw).strip()
+                    if line:
+                        self._stderr_tail.append(line[:500])
+            except (OSError, ValueError):
+                pass  # pipe closed under us at teardown
+            finally:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+
+        self._stderr_reader = threading.Thread(target=drain, name="capture-stderr", daemon=True)
+        self._stderr_reader.start()
 
     # -- internals: tail + commit -------------------------------------------
 
     def _tail_loop(self) -> None:
-        """Poll the directory, commit size-stable segments, then drain + exit.
+        """Commit closed segments in sequence; watch for stalls; drain + exit.
 
         Exits when stopped, or when ffmpeg has been dead for the drain grace
         period (final files flushed). Polling *while* ffmpeg is still alive
-        but has written nothing yet is the normal steady state — the loop's
-        own exit conditions never fire on a merely quiet stream.
+        but has written nothing yet is the normal steady state — until it
+        lasts longer than the stall timeout.
         """
-        seen: dict[Path, int] = {}
-        committed: set[Path] = set()
         ffmpeg_dead_since: float | None = None
+        last_progress = time.monotonic()
         while not self._stop_flag.is_set():
-            self._poll_once(seen, committed)
             proc = self._proc
-            if proc is not None and proc.poll() is not None:
-                now = time.monotonic()
+            dead = proc is not None and proc.poll() is not None
+            now = time.monotonic()
+            if self._poll_once(final=dead):
+                last_progress = now
+            if dead:
                 if ffmpeg_dead_since is None:
                     ffmpeg_dead_since = now
                 elif now - ffmpeg_dead_since >= self.drain_grace_s:
-                    self._poll_once(seen, committed)
+                    self._poll_once(final=True)
                     break
+            elif self._stalled(now - last_progress):
+                self._kill_stalled(now - last_progress)
             time.sleep(self.poll_s)
 
-    def _poll_once(self, seen: dict[Path, int], committed: set[Path]) -> None:
-        """One directory scan: track sizes, commit files stable across polls."""
-        try:
-            entries = list(self.buffer.directory.iterdir())
-        except FileNotFoundError:
+    def _stalled(self, idle_s: float) -> bool:
+        limit = self.stall_timeout_s if self.committed else self.first_segment_timeout_s
+        return bool(limit) and idle_s >= float(limit)  # type: ignore[arg-type]
+
+    def _kill_stalled(self, idle_s: float) -> None:
+        """No new segment for too long: kill ffmpeg; the waiter reports it."""
+        if self._stall_detail:
             return
-        for entry in entries:
-            path = Path(entry)
-            if not is_segment_name(path.name):
-                continue
-            if path in committed:
-                continue  # already in the buffer; don't stat it again
+        self._stall_detail = (
+            f"capture stalled: no new segment for {idle_s:.0f}s (ffmpeg killed, reconnecting)"
+        )
+        log.warning("tailer: %s", self._stall_detail)
+        with self._lock:
+            self._kill_tree()
+
+    def _poll_once(self, *, final: bool = False) -> bool:
+        """Commit every segment that is provably closed; True if any was.
+
+        Segment N is closed once N+1 exists (the muxer closes a segment
+        before it opens the next) or, with ``final``, once ffmpeg is gone.
+        Only the expected index is ever looked at, so leftovers and late
+        writes outside this ffmpeg's sequence are never committed.
+        """
+        directory = self.buffer.directory
+        progressed = False
+        while not self._stop_flag.is_set():
+            index = self._next_index
+            path = directory / segment_name(index)
+            if not path.exists():
+                break
+            if not final and not (directory / segment_name(index + 1)).exists():
+                break  # still being written
             try:
                 size = path.stat().st_size
             except OSError:
-                continue  # vanished mid-poll; harmless, retry next cycle
-            prev = seen.get(path)
-            if size > 0 and prev == size:
-                committed.add(path)
-                seen.pop(path, None)
-                self._commit_path(path)
-            else:
-                seen[path] = size
+                break  # vanished mid-poll; retry next cycle
+            self._next_index = index + 1
+            if size <= 0:
+                # A zero-byte .ts is a muxer error artifact, not a segment.
+                log.debug("tailer: skipping empty segment %s", path.name)
+                continue
+            if self._commit_index(index):
+                progressed = True
+        return progressed
 
-    def _commit_path(self, path: Path) -> None:
-        """Hand a closed segment to the buffer's commit_segment, with logging."""
-        try:
-            index = index_from_name(path.name)
-        except ValueError:
-            log.warning("tailer: ignoring unparseable segment name %s", path.name)
-            return
+    def _commit_index(self, index: int) -> bool:
+        """Hand one closed segment to the buffer (it re-stats the size)."""
         try:
             self.buffer.commit_segment(index)
         except ValueError as exc:
             # The buffer refused a state change (duplicate or out-of-order
-            # commit after a restart race). Log and keep tailing: killing a
-            # whole live stream over one bad file is the worse failure.
-            log.warning("tailer: buffer refused commit of %s: %s", path.name, exc)
+            # commit). Log and keep tailing: killing a whole live stream over
+            # one bad file is the worse failure.
+            log.warning("tailer: buffer refused commit of segment %d: %s", index, exc)
+            return False
         except FileNotFoundError:
-            log.warning("tailer: %s vanished before commit", path.name)
+            log.warning("tailer: segment %d vanished before commit", index)
+            return False
+        self.committed += 1
+        return True
 
     # -- small helpers ------------------------------------------------------
 
@@ -405,7 +522,9 @@ class StreamCapture:
             # than leak a zombie holding the directory.
             with contextlib.suppress(OSError):
                 proc.kill()
-        if getattr(proc, "stderr", None) is not None:
+        if self._stderr_reader is None and getattr(proc, "stderr", None) is not None:
+            # No reader owns the pipe (never started): close it here. With a
+            # reader, it closes the pipe itself at EOF.
             with contextlib.suppress(OSError):
                 proc.stderr.close()
 
@@ -623,8 +742,11 @@ def kill_process_tree(pid: int) -> None:
 __all__ = [
     "CaptureError",
     "DRAIN_GRACE_S",
+    "FIRST_SEGMENT_TIMEOUT_S",
     "RESOLVE_TIMEOUT_S",
+    "RW_TIMEOUT_S",
     "SEGMENT_TIME_S",
+    "STALL_TIMEOUT_S",
     "TAILER_POLL_S",
     "StreamCapture",
     "index_from_name",

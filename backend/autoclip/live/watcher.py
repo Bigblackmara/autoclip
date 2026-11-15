@@ -66,19 +66,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import queue
 import random
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import events, store
-from .buffer import PENDING_CAP_BYTES, SEGMENT_S, RingBuffer  # noqa: F401  (PENDING_CAP_BYTES: manager)
-from .circuit import PerStreamCooldown, TokenBucket
-from .judge import LiveJudgement, judge_window
+from .buffer import (  # noqa: F401  (PENDING_CAP_BYTES: manager)
+    PENDING_CAP_BYTES,
+    SEGMENT_S,
+    RingBuffer,
+    discard_segment_files,
+)
+from .circuit import JudgeCircuitBreaker, PerStreamCooldown, TokenBucket  # noqa: F401
+from .judge import JudgeBudgetExhausted, LiveJudgement, judge_window
 from .models import LiveClipRow, new_id
 from .paths import clip_dir, stream_buffer_dir
 from .settings import LiveSettings
@@ -109,17 +117,39 @@ SIGNAL_WINDOW_S = 30.0
 #: the judge's taste in pacing is not worth rendering a 3-second nothing.
 TRIM_MIN_S = 10.0
 
+#: A capture that has been up this long without dying counts as healthy even
+#: when no segment commit is observable (minimal test captures/buffers).
+HEALTHY_AFTER_S = 60.0
+#: Extra stream seconds a candidate waits, beyond the post-roll, for the
+#: buffer to commit the end of its window before cutting it anyway.
+COVERAGE_GRACE_S = 4 * SEGMENT_S
+#: Poll interval of that wait (real time).
+COVERAGE_POLL_S = 0.5
+#: How long teardown waits for a capture's stop (tree kill + thread joins).
+CAPTURE_STOP_WAIT_S = 12.0
+#: How long teardown waits for each signal worker thread to notice its stop.
+SIGNAL_JOIN_S = 3.0
+
 #: Judge-phase artifacts inside ``live/clips/<clip_id>/``. Distinct from
 #: clip_factory's RAW_NAME/AUDIO_NAME/TRANSCRIPT_NAME on purpose: the factory
 #: wipes its own artifacts when a window is re-judged, and the judge's
-#: evidence must survive that.
+#: evidence must survive that. The window and audio are deleted as soon as
+#: the transcript exists (a ~250 s window is hundreds of MB); only the small
+#: transcript and verdict JSON files stay.
 JUDGE_WINDOW_NAME = "judge_window.ts"
 JUDGE_AUDIO_NAME = "judge_audio.wav"
 JUDGE_TRANSCRIPT_NAME = "judge_transcript.json"
+JUDGE_VERDICT_NAME = "judge_verdict.json"
+
+#: Marker of the pipeline's "no speech in this audio" transcription failure.
+_NO_SPEECH_MARKER = "no speech"
 
 #: SSE channel naming (events.py contract): per-stream feed and the shared
 #: all-clips feed every stream publishes clip events to.
 CLIPS_CHANNEL = "live:-:clips"
+#: Shared feed of every stream's state changes (``stream_state`` events),
+#: merged into the global /api/live/events feed.
+STREAMS_CHANNEL = "live:-:streams"
 
 
 def stream_channel(stream_id: str) -> str:
@@ -180,10 +210,64 @@ def _looks_offline(exc: BaseException) -> bool:
 
 
 def _default_transcribe(path: Path, *_args: Any) -> Any:
-    """Default transcriber: A8 reuses the pipeline stage unchanged."""
-    from ..pipeline.transcribe import transcribe
+    """Default transcriber: the pipeline stage with the user's settings.
 
-    return transcribe(path)
+    The user's WhisperSettings (model, compute type, language) apply here
+    exactly as in the batch pipeline, and the model is the one shared,
+    resident instance renders use too — under the shared GPU slot.
+    """
+    from . import gpu
+
+    return gpu.transcribe(path)
+
+
+def _is_no_speech(exc: BaseException) -> bool:
+    """The pipeline's "nothing to transcribe" failure (silence, music)."""
+    from ..pipeline.transcribe import TranscriptionError
+
+    return isinstance(exc, TranscriptionError) and _NO_SPEECH_MARKER in str(exc).lower()
+
+
+class _Discarded(Exception):
+    """The clip row was tombstoned (discarded) while the candidate ran."""
+
+
+def _iso_ago(seconds: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+class StoreJudgeBudget:
+    """Per-stream judge budgets derived from ``live_clips`` (restart-proof).
+
+    Counts the LLM calls this stream's candidates spent in the last minute,
+    hour and day (``judge_calls`` per row — a repair retry counts twice) and
+    compares against the CURRENT rate-limit settings, so a settings save
+    re-sizes the budget immediately. An unreadable store fails closed.
+    """
+
+    WINDOWS: tuple[tuple[str, float, str], ...] = (
+        ("minute", 60.0, "judge_per_minute"),
+        ("hour", 3600.0, "judge_per_hour"),
+        ("day", 86400.0, "judge_per_day"),
+    )
+
+    def __init__(self, stream_id: str, rate_limit: Callable[[], Any]) -> None:
+        self.stream_id = stream_id
+        self._rate_limit = rate_limit
+
+    def room(self, extra: int = 1) -> tuple[bool, str]:
+        """Whether ``extra`` more calls fit every window; else the reason."""
+        rate = self._rate_limit()
+        for name, seconds, attr in self.WINDOWS:
+            limit = int(getattr(rate, attr, 0) or 0)
+            try:
+                used = int(store.judge_calls_since(self.stream_id, _iso_ago(seconds)) or 0)
+            except Exception:
+                log.warning("Judge budget unreadable for %s; refusing.", self.stream_id)
+                return False, f"judge {name} budget unavailable"
+            if used + extra > limit:
+                return False, f"judge {name} budget exhausted ({used}/{limit})"
+        return True, ""
 
 
 def _default_audio_extract(source: Path, destination: Path) -> Any:
@@ -289,13 +373,26 @@ class WatcherDeps:
     chat_runner: Callable[..., bool] | None = None
     #: (ClipWorkItem) -> bool — bounded enqueue; False drops the candidate
     enqueue_clip: Callable[[ClipWorkItem], bool] | None = None
-    #: () -> bool — capture capacity gate
+    #: () -> bool — capture capacity gate (reserves a slot when True)
     may_capture: Callable[[], bool] | None = None
+    #: () -> None — gives the capture slot back (parked, backoff, failure)
+    release_capture: Callable[[], None] | None = None
     #: (channel, event_type, data) — SSE publisher
     publish: Callable[[str, str, dict | None], None] | None = None
     #: async (seconds) -> None — sleep seam (tests fast-forward waits)
     sleep: Callable[[float], Awaitable[None]] | None = None
     max_connect_attempts: int | None = None
+    #: Restart-proof per-stream judge budget (``room(extra) -> (ok, why)``).
+    #: Default: derived from live_clips. Ignored while legacy token buckets
+    #: (judge_minute/hour/day) are injected.
+    judge_budget: Any = None
+    #: Provider-error circuit breaker shared across streams (manager-owned).
+    judge_breaker: Any = None
+    #: () -> (ok, reason) — disk admission for a new candidate (manager).
+    admit_candidate: Callable[[], tuple[bool, str]] | None = None
+    #: Max wait (s) for the buffer to cover a window's post-roll; None =
+    #: post_roll_s + COVERAGE_GRACE_S.
+    coverage_timeout_s: float | None = None
 
 
 # -- the watcher -------------------------------------------------------------------
@@ -335,6 +432,8 @@ class StreamWatcher:
         self._aggregator: Any = None
         self._signal_q: queue.SimpleQueue[DetectorSignal] = queue.SimpleQueue()
         self._bg_tasks: set[asyncio.Task] = set()
+        #: In-flight capture stops (threads). Never cancelled — awaited.
+        self._stop_tasks: set[asyncio.Task] = set()
         self._audio_thread: threading.Thread | None = None
         self._chat_thread: threading.Thread | None = None
         self._signal_stop: threading.Event | None = None
@@ -349,6 +448,12 @@ class StreamWatcher:
         self._state_detail = ""
         self._stopping = False
         self._connect_attempts = 0
+        #: Health baseline of the current capture: the attempt counter only
+        #: resets once it actually delivers (a committed segment), never on
+        #: a bare spawn — an ffmpeg dying right after resolving (403, geo
+        #: block) must exhaust the budget instead of looping forever.
+        self._connected_at = 0.0
+        self._index_at_connect = -1
         # Set when the capture layer reports the STREAM ended cleanly: the
         # next supervisor pass sleeps out the offline poll in
         # waiting_for_live before looking for a new broadcast.
@@ -358,6 +463,9 @@ class StreamWatcher:
         self._next_prune = 0.0
         self._candidate_busy = False
         self._workers_started = False
+        #: Signals at or before this stream time were already judged (or
+        #: refused): the same spike must not mint a second paid verdict.
+        self._consumed_until_s = float("-inf")
 
     # -- dependency defaults ---------------------------------------------------
 
@@ -374,18 +482,21 @@ class StreamWatcher:
             deps.trigger = self._default_trigger()
         if deps.cooldown is None:
             deps.cooldown = PerStreamCooldown(rate.cooldown_s)
-        if deps.judge_minute is None:
-            # Global budgets shared across streams (circuit.py contract):
-            # N per period means capacity N, refilled N/period per second.
-            deps.judge_minute = TokenBucket(rate.judge_per_minute / 60.0, rate.judge_per_minute)
-        if deps.judge_hour is None:
-            deps.judge_hour = TokenBucket(rate.judge_per_hour / 3600.0, rate.judge_per_hour)
-        if deps.judge_day is None:
-            deps.judge_day = TokenBucket(rate.judge_per_day / 86400.0, rate.judge_per_day)
+        #: Legacy seam: injected token buckets replace the store budget.
+        self._legacy_buckets = any(
+            b is not None for b in (deps.judge_minute, deps.judge_hour, deps.judge_day)
+        )
+        if deps.judge_budget is None and not self._legacy_buckets:
+            deps.judge_budget = StoreJudgeBudget(self.id, lambda: self._live.rate_limit)
+        if deps.judge_breaker is None:
+            deps.judge_breaker = JudgeCircuitBreaker()
         if deps.transcribe is None:
             deps.transcribe = _default_transcribe
         if deps.audio_extract is None:
             deps.audio_extract = _default_audio_extract
+        #: The real judge counts each of its provider calls (repairs too)
+        #: through a callback; an injected judge counts as one call.
+        self._judge_is_default = deps.judge is None or deps.judge is judge_window
         if deps.judge is None:
             deps.judge = judge_window
         if deps.chat_runner is None:
@@ -395,6 +506,8 @@ class StreamWatcher:
             log.warning("Stream %s has no clip queue; candidates will be dropped.", self.id)
         if deps.may_capture is None:
             deps.may_capture = lambda: True
+        if deps.release_capture is None:
+            deps.release_capture = lambda: None
         if deps.publish is None:
             deps.publish = publish_event
         if deps.sleep is None:
@@ -406,6 +519,13 @@ class StreamWatcher:
         def factory() -> Any:
             directory = stream_buffer_dir(self.id)
             directory.mkdir(parents=True, exist_ok=True)
+            # A new lifecycle starts from an empty folder: a fresh
+            # RingBuffer knows none of the old files and a fresh ffmpeg
+            # numbers from 0, so leftovers would be committed as new and
+            # every real segment refused as out of order (a blind stream).
+            removed = discard_segment_files(directory)
+            if removed:
+                log.info("Stream %s: cleared %d stale buffer segment(s).", self.id, removed)
             return RingBuffer(
                 directory,
                 retain_minutes=self._live.rolling_buffer.retain_minutes,
@@ -413,6 +533,24 @@ class StreamWatcher:
             )
 
         return factory
+
+    def update_settings(self, settings: LiveSettings) -> None:
+        """Take a settings change live (the manager mutates the tree in place).
+
+        Thresholds, rolls and budgets are read from ``self._live`` at use
+        time already; this re-applies the values that were copied into
+        long-lived objects at construction.
+        """
+        self._live = settings
+        buffer = self._buffer
+        rolling = settings.rolling_buffer
+        if buffer is not None and hasattr(buffer, "retain_s"):
+            with contextlib.suppress(Exception):
+                buffer.retain_s = float(rolling.retain_minutes) * 60.0
+                buffer.max_disk_bytes = int(rolling.max_disk_mb) * 1024 * 1024
+        cooldown = self._deps.cooldown
+        if isinstance(cooldown, PerStreamCooldown):
+            cooldown.cooldown_s = settings.rate_limit.cooldown_s
 
     def _default_capture_factory(self) -> Callable[..., Any]:
         def factory(buffer: Any, on_event: Callable[[str, str], None]) -> Any:
@@ -501,17 +639,22 @@ class StreamWatcher:
                 await self._teardown()
 
     async def _teardown(self) -> None:
-        """``finally``-side teardown: stop children, await their exits."""
+        """``finally``-side teardown: stop children, await their exits.
+
+        Nothing here blocks the event loop: the capture stop (tree kill +
+        thread joins, seconds on Windows) and the signal-thread joins run
+        in worker threads and are AWAITED, bounded — never cancelled, so a
+        stop that takes a moment still completes before a resume reuses
+        the stream's folder.
+        """
         self._stopping = True
         if self._wake is not None:
             self._wake.set()
         if self._signal_stop is not None:
             self._signal_stop.set()  # audio + chat workers watch this event
-        for thread in (self._audio_thread, self._chat_thread):
-            if thread is not None and thread.is_alive():
-                with contextlib.suppress(RuntimeError):
-                    thread.join(timeout=2.0)
         self._stop_capture_async()
+        with contextlib.suppress(Exception):
+            self._deps.release_capture()
         pending = [task for task in self._bg_tasks if not task.done()]
         for task in pending:
             task.cancel()
@@ -521,6 +664,22 @@ class StreamWatcher:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait(pending, timeout=3.0)
         self._bg_tasks.clear()
+        stops = [task for task in self._stop_tasks if not task.done()]
+        if stops:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait(stops, timeout=CAPTURE_STOP_WAIT_S)
+        joins = [
+            asyncio.to_thread(thread.join, SIGNAL_JOIN_S)
+            for thread in (self._audio_thread, self._chat_thread)
+            if thread is not None and thread.is_alive()
+        ]
+        if joins:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.gather(*joins, return_exceptions=True)
+        # The watcher is gone: unless it died terminally, it now watches
+        # nothing — "off", never a stale "clipping"/"watching".
+        if self._state is None or not is_terminal(self._state):
+            self.set_state(StreamState.OFF, "stopped")
 
     def stop(self, *, close_buffer: bool = False) -> None:
         """Flag this watcher to wind down (idempotent; sync emergency path).
@@ -560,13 +719,25 @@ class StreamWatcher:
             loop = self._loop
             if loop is not None and not loop.is_closed():
                 try:
-                    self._spawn(asyncio.to_thread(obj.stop))
+                    task = loop.create_task(asyncio.to_thread(obj.stop))
                 except RuntimeError:
                     with contextlib.suppress(Exception):
                         obj.stop()
+                    continue
+                # Tracked apart from candidate tasks: teardown cancels those,
+                # but a capture stop is awaited to completion.
+                self._stop_tasks.add(task)
+                task.add_done_callback(self._stop_tasks.discard)
             else:
                 with contextlib.suppress(Exception):
                     obj.stop()
+
+    async def wait_stopped(self, timeout: float = CAPTURE_STOP_WAIT_S) -> None:
+        """Await in-flight capture stops (bounded); used before deleting files."""
+        stops = [task for task in self._stop_tasks if not task.done()]
+        if stops:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait(stops, timeout=timeout)
 
     # -- state machine ------------------------------------------------------------
 
@@ -587,6 +758,12 @@ class StreamWatcher:
         DB must never kill the watch loop.
         """
         old = self._state
+        if self._stopping and not initial and new not in (StreamState.OFF, StreamState.ENDED):
+            # A stopping watcher's late writers (a cancelled candidate's
+            # finally, a capture callback) must not paint "reconnecting"
+            # over the OFF/ENDED the pause/remove just recorded.
+            log.debug("Stream %s: stopping; state %s not recorded.", self.id, new)
+            return False
         if not initial and not can_transition(old, new):
             log.warning("Stream %s: ignoring illegal state jump %s → %s.", self.id, old, new)
             return False
@@ -626,8 +803,38 @@ class StreamWatcher:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self._tick_s)
             self._wake.clear()
+            self._check_capture_health()
             self._drain_signals()
             await self._maybe_prune()
+
+    def _release_capture_slot(self) -> None:
+        """Give the capture capacity slot back (no capture is running)."""
+        with contextlib.suppress(Exception):
+            self._deps.release_capture()
+
+    def _newest_index(self) -> int:
+        segments = getattr(self._buffer, "segments", None)
+        try:
+            return int(segments[-1].index) if segments else -1
+        except Exception:
+            return -1
+
+    def _check_capture_health(self) -> None:
+        """Reset the connect budget once the current capture DELIVERS.
+
+        Delivery = a segment committed since the connect (or, for captures
+        that expose no commit signal, staying up for HEALTHY_AFTER_S).
+        """
+        if not self._connect_attempts or self._capture is None or self._loop is None:
+            return
+        committed = getattr(self._capture, "committed", None)
+        healthy = (
+            (isinstance(committed, int) and not isinstance(committed, bool) and committed > 0)
+            or self._newest_index() > self._index_at_connect
+            or self._loop.time() - self._connected_at >= HEALTHY_AFTER_S
+        )
+        if healthy:
+            self._connect_attempts = 0
 
     async def _connect(self) -> None:
         # The stream ended cleanly (broadcaster stopped) or resolution said
@@ -646,13 +853,16 @@ class StreamWatcher:
             # attempted yet, and a capacity slot must not be held while
             # sleeping.
             delay, self._backoff_wait_s = self._backoff_wait_s, 0.0
+            self._release_capture_slot()
             self.set_state(StreamState.RECONNECTING, "backoff before retry")
             await self._deps.sleep(delay)
             if self._stopping:
                 return
         # Capacity check and the CONNECTING mark are one synchronous block:
         # no await between them, so concurrent watchers can't all pass the
-        # check and overshoot settings.workers.max_concurrent_streams.
+        # check and overshoot settings.workers.max_concurrent_streams. The
+        # slot is reserved here, right before spawning, and given back
+        # whenever no capture runs (parked, backoff, failure).
         if not self._deps.may_capture():
             await self._park_waiting("waiting for capture capacity")
             return
@@ -668,17 +878,23 @@ class StreamWatcher:
             raise
         except (ImportError, AttributeError) as exc:
             # A missing implementation — retrying can't fix an import error.
+            self._release_capture_slot()
             self.set_state(StreamState.ERROR, f"capture unavailable: {exc}", error=str(exc))
             return
         except Exception as exc:
+            self._release_capture_slot()
             await self._connect_failed(exc)
             return
         if self._stopping or self._pending_capture is None:
             self._stop_capture_async()
+            self._release_capture_slot()
             return
         capture, self._pending_capture = self._pending_capture, None
         self._capture = capture
-        self._connect_attempts = 0
+        # NOT a budget reset: only a capture that delivers resets it
+        # (_check_capture_health) — see _connected_at.
+        self._connected_at = self._loop.time() if self._loop is not None else 0.0
+        self._index_at_connect = self._newest_index()
         store_call(self._buffer.begin_epoch)  # reconnect = new epoch (A1)
         self.set_state(StreamState.WATCHING, "live")
 
@@ -700,6 +916,8 @@ class StreamWatcher:
             self._pending_capture = None
 
     async def _park_waiting(self, detail: str) -> None:
+        # A parked stream holds no capture: its slot is free for a live one.
+        self._release_capture_slot()
         self.set_state(StreamState.WAITING_FOR_LIVE, detail)
         await self._deps.sleep(self._offline_poll_s)
 
@@ -757,6 +975,9 @@ class StreamWatcher:
         # Detach synchronously (state decisions below depend on "no
         # capture"); the expensive tree-kill runs in a thread.
         self._stop_capture_async()
+        self._release_capture_slot()
+        if self._wake is not None:
+            self._wake.set()  # the supervisor reacts now, not at its next tick
         if kind == "ended":
             # Clean end (broadcaster stopped): the channel is expected to
             # come back, so park in waiting_for_live on the offline poll —
@@ -893,6 +1114,9 @@ class StreamWatcher:
         window = self._evaluate_window()
         if window is None:
             return
+        window = self._unconsumed(window)
+        if window is None:
+            return
         try:
             decision = trigger.decide(window)
         except NotImplementedError:
@@ -921,6 +1145,28 @@ class StreamWatcher:
             log.info("Signal aggregator unavailable (A4 pending) for %s.", self.id)
         except Exception:
             log.exception("Aggregator rejected a signal on %s.", self.id)
+
+    def _unconsumed(self, window: Any) -> Any:
+        """Drop signals an earlier candidate already spent; None if none left.
+
+        Without this, one spike stays in the aggregator's 30 s window after
+        its verdict (reject, judge error, no speech) and re-fires on every
+        later signal — a fresh paid judge call each time for the same moment.
+        """
+        floor = self._consumed_until_s
+        signals = list(getattr(window, "signals", None) or [])
+        if floor == float("-inf"):
+            return window
+        fresh = [s for s in signals if float(getattr(s, "t_s", 0.0)) > floor]
+        if not fresh:
+            return None
+        if len(fresh) == len(signals):
+            return window
+        return SignalWindow(
+            start_s=max(float(getattr(window, "start_s", 0.0)), floor),
+            end_s=float(getattr(window, "end_s", 0.0)),
+            signals=fresh,
+        )
 
     def _evaluate_window(self) -> SignalWindow | None:
         try:
@@ -985,28 +1231,89 @@ class StreamWatcher:
             log.exception("Cooldown mark failed for %s.", self.id)
 
     def _acquire_judge_budget(self) -> tuple[bool, str]:
-        """Take one token from each global judge bucket (A4 circuit)."""
-        for name, bucket in (
-            ("minute", self._deps.judge_minute),
-            ("hour", self._deps.judge_hour),
-            ("day", self._deps.judge_day),
-        ):
-            if bucket is None:
-                continue
-            try:
-                ok = bool(bucket.try_acquire())
-            except NotImplementedError:
-                return False, f"judge {name} budget unavailable (circuit not implemented yet)"
-            if not ok:
-                return False, f"judge {name} budget exhausted"
-        return True, ""
+        """Check (legacy: take) the judge budget before any heavy work.
+
+        Default: the restart-proof per-stream budget derived from
+        ``live_clips`` must have room for at least one call. Injected
+        legacy token buckets (tests, embedders) are spent instead.
+        """
+        if self._legacy_buckets:
+            for name, bucket in (
+                ("minute", self._deps.judge_minute),
+                ("hour", self._deps.judge_hour),
+                ("day", self._deps.judge_day),
+            ):
+                if bucket is None:
+                    continue
+                try:
+                    ok = bool(bucket.try_acquire())
+                except NotImplementedError:
+                    return False, f"judge {name} budget unavailable (circuit not implemented yet)"
+                if not ok:
+                    return False, f"judge {name} budget exhausted"
+            return True, ""
+        return self._budget_room()
+
+    def _budget_room(self) -> tuple[bool, str]:
+        budget = self._deps.judge_budget
+        if budget is None:
+            return True, ""
+        try:
+            return budget.room(1)
+        except Exception:
+            log.exception("Judge budget check failed for %s; refusing.", self.id)
+            return False, "judge budget unavailable"
+
+    def _breaker_refusal(self) -> str:
+        """Why the shared provider breaker refuses a judge call ('' = allowed)."""
+        breaker = self._deps.judge_breaker
+        if breaker is None:
+            return ""
+        with contextlib.suppress(Exception):
+            remaining = float(breaker.remaining())
+            if remaining > 0:
+                last = getattr(breaker, "last_error", "") or "provider error"
+                return f"judge backing off for {remaining:.0f}s after provider errors ({last})"
+        return ""
+
+    def _admission_refusal(self) -> str:
+        """Why the manager's disk guard refuses a new candidate ('' = admit)."""
+        admit = self._deps.admit_candidate
+        if admit is None:
+            return ""
+        try:
+            ok, reason = admit()
+        except Exception:
+            log.exception("Disk admission check failed for %s; refusing.", self.id)
+            return "disk check failed"
+        return "" if ok else (reason or "disk budget exceeded")
 
     def _update_clip(self, clip_id: str, **fields: Any) -> None:
-        store_call(store.update_clip, clip_id, **fields)
+        """Write the candidate's row, unless the user discarded it meanwhile.
+
+        Every status write of the candidate path goes through the atomic
+        tombstone guard; a discarded row raises :class:`_Discarded`, which
+        stops the candidate without another write.
+        """
+        guarded = getattr(store, "update_clip_guarded", None)
+        if guarded is None:  # a minimal store double: plain write
+            store_call(store.update_clip, clip_id, **fields)
+            return
+        written = store_call(guarded, clip_id, **fields)
+        if written is False:
+            raise _Discarded(clip_id)
 
     def _update_clip_safe(self, clip_id: str, **fields: Any) -> None:
         with contextlib.suppress(Exception):
             self._update_clip(clip_id, **fields)
+
+    def _reject(self, clip_id: str, event: str, reason: str, **fields: Any) -> None:
+        """Record a rejection (row + events). ``reason`` is user-facing."""
+        self._update_clip(clip_id, status="rejected", reason=reason, **fields)
+        payload: dict[str, Any] = {"clip_id": clip_id, "reason": reason}
+        if "score" in fields:
+            payload["score"] = fields["score"]
+        self._publish_clip(event, payload)
 
     def _publish_clip(self, event_type: str, data: dict) -> None:
         payload = {"stream_id": self.id, **data}
@@ -1030,6 +1337,33 @@ class StreamWatcher:
         except Exception:
             log.debug("Transcript save failed for %s.", self.id, exc_info=True)
             return ""
+
+    def _save_verdict(self, directory: Path, judgement: Any, **extra: Any) -> None:
+        """Small JSON record of the verdict (kept; the media is deleted)."""
+        record = {
+            "score": int(getattr(judgement, "score", 0) or 0),
+            "title": getattr(judgement, "title", "") or "",
+            "hook": getattr(judgement, "hook", "") or "",
+            "reason": getattr(judgement, "reason", "") or "",
+            "start_word_offset": getattr(judgement, "start_word_offset", None),
+            "end_word_offset": getattr(judgement, "end_word_offset", None),
+            **extra,
+        }
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / JUDGE_VERDICT_NAME).write_text(
+                json.dumps(record, default=str), encoding="utf-8"
+            )
+        except Exception:
+            log.debug("Verdict save failed for %s.", self.id, exc_info=True)
+
+    @staticmethod
+    def _delete_quietly(*paths: Path) -> None:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.debug("could not delete %s", path, exc_info=True)
 
     def _trim_window(
         self,
@@ -1069,23 +1403,125 @@ class StreamWatcher:
             return clip_start_s, clip_end_s
         return start, end
 
-    async def _call_judge(self, words: list, signals: dict) -> LiveJudgement:
-        """One judge call under the manager's shared concurrency semaphore."""
-        coro = self._deps.judge(self.label or self.url, words, signals)
+    def _record_judge_call(self, clip_id: str | None) -> bool:
+        """Budget gate + bookkeeping for ONE paid judge call (repairs too)."""
+        if not self._legacy_buckets:
+            ok, reason = self._budget_room()
+            if not ok:
+                log.info("Stream %s: judge call refused (%s).", self.id, reason)
+                return False
+        if clip_id is not None:
+            add = getattr(store, "add_judge_call", None)
+            if add is not None:
+                with contextlib.suppress(Exception):
+                    store_call(add, clip_id)
+        return True
+
+    async def _call_judge(
+        self, words: list, signals: dict, *, clip_id: str | None = None
+    ) -> LiveJudgement:
+        """One judge verdict under the manager's shared concurrency semaphore.
+
+        Every provider request is counted against the stream's budget (and
+        recorded on the clip row) BEFORE it is sent — the real judge reports
+        its repair retry through ``before_call``; an injected judge counts
+        as one call.
+        """
+        label = self.label or self.url
+        if self._judge_is_default:
+            coro = self._deps.judge(
+                label, words, signals, before_call=lambda: self._record_judge_call(clip_id)
+            )
+        else:
+            if not self._record_judge_call(clip_id):
+                raise JudgeBudgetExhausted("judge budget exhausted")
+            coro = self._deps.judge(label, words, signals)
         sem = self._deps.judge_semaphore
         if sem is None:
             return await coro
         async with sem:
             return await coro
 
+    def _buffer_covered_until(self) -> float | None:
+        """Stream time the buffer has committed up to; None when unknown."""
+        buffer = self._buffer
+        covered = getattr(buffer, "covered_until_s", None)
+        if callable(covered):
+            with contextlib.suppress(Exception):
+                return covered()
+            return None
+        segments = getattr(buffer, "segments", None)
+        with contextlib.suppress(Exception):
+            if segments:
+                return (float(segments[-1].index) + 1.0) * SEGMENT_S
+        return None
+
+    async def _await_coverage(self, end_s: float) -> None:
+        """Wait (bounded) until the buffer holds the window's post-roll.
+
+        The trigger fires on the NEWEST committed audio, so the post-roll
+        the window asks for has not been captured yet; cutting immediately
+        silently drops it from both the judge's transcript and the clip.
+        Gives up when the capture is gone (nothing more will arrive), on
+        stop, or after the timeout — then the cut takes what exists.
+        """
+        timeout = self._deps.coverage_timeout_s
+        if timeout is None:
+            timeout = float(self._live.rolling_buffer.post_roll_s) + COVERAGE_GRACE_S
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while not self._stopping:
+            covered = self._buffer_covered_until()
+            if covered is None or covered >= end_s - 1e-6:
+                return
+            if self._capture is None or time.monotonic() >= deadline:
+                log.info(
+                    "Stream %s: window end %.1fs not captured (have %.1fs); cutting anyway.",
+                    self.id,
+                    end_s,
+                    covered,
+                )
+                return
+            await asyncio.sleep(COVERAGE_POLL_S)
+
+    def _pin(self, start_s: float) -> int | None:
+        """Hold the render window's segments against pruning; the pin index."""
+        pin = getattr(self._buffer, "pin_oldest", None)
+        if pin is None:
+            return None
+        index = int(max(0.0, start_s) // SEGMENT_S)
+        try:
+            pin(index)
+        except Exception:
+            log.debug("pin_oldest failed for %s.", self.id, exc_info=True)
+            return None
+        return index
+
+    def _unpin(self, index: int | None) -> None:
+        if index is None:
+            return
+        unpin = getattr(self._buffer, "unpin", None)
+        if unpin is not None:
+            with contextlib.suppress(Exception):
+                unpin(index)
+
+    async def _extract(self, start_s: float, end_s: float, target: Path, anchor_s: float) -> None:
+        """Threaded buffer extract, epoch-clamped to the trigger when supported."""
+        from .clip_factory import _buffer_extract
+
+        await asyncio.to_thread(_buffer_extract, self._buffer, start_s, end_s, target, anchor_s)
+
     async def _process_candidate(self, window: SignalWindow, decision: Any) -> None:
         """Turn one triggered window into a judged, enqueued clip candidate.
 
-        Steps are cost-ordered: cooldown (free) → candidate row → global
-        judge budgets (cheap) → buffer extraction + transcription (heavy)
-        → the LLM judge → the bounded clip queue. Every drop writes the
-        live_clips row so the UI can show WHY a candidate vanished rather
-        than a silent miss.
+        Steps are cost-ordered: cooldown (free) → candidate row → disk,
+        provider-breaker and judge-budget gates (cheap, no LLM call) →
+        coverage wait + extraction + transcription (heavy) → the LLM judge
+        → staging the render window → the bounded clip queue. Every drop
+        writes the live_clips row so the UI can show WHY a candidate
+        vanished rather than a silent miss. Whatever the outcome, the
+        signals the window was built from are consumed, so the same spike
+        never buys a second verdict; the judge's heavy media is deleted as
+        soon as the transcript exists.
         """
         if self._candidate_busy:
             log.debug("Stream %s: candidate already in flight; ignoring trigger.", self.id)
@@ -1093,6 +1529,13 @@ class StreamWatcher:
         self._candidate_busy = True
         clip_id = new_id()
         entered_clipping = False
+        row_created = False
+        pin_index: int | None = None
+        consumed_until = float(getattr(window, "end_s", 0.0) or 0.0)
+        directory = clip_dir(clip_id)
+        source_path = directory / JUDGE_WINDOW_NAME
+        audio_path = directory / JUDGE_AUDIO_NAME
+        staged = False
         try:
             rate_limit = self._live.rate_limit
             rolling = self._live.rolling_buffer
@@ -1103,6 +1546,7 @@ class StreamWatcher:
             trigger_end_s = max(times)
             clip_start_s = max(0.0, trigger_end_s - rolling.pre_roll_s)
             clip_end_s = trigger_end_s + rolling.post_roll_s
+            consumed_until = max(consumed_until, clip_end_s)
             store_call(
                 store.create_clip,
                 LiveClipRow(
@@ -1115,9 +1559,18 @@ class StreamWatcher:
                     clip_end_s=clip_end_s,
                 ),
             )
+            row_created = True
             self._publish_clip(
                 "clip_detecting", {"clip_id": clip_id, "trigger_end_s": trigger_end_s}
             )
+            disk_refusal = self._admission_refusal()
+            if disk_refusal:
+                self._reject(clip_id, "clip_rejected", f"refused: {disk_refusal}")
+                return
+            breaker_refusal = self._breaker_refusal()
+            if breaker_refusal:
+                self._reject(clip_id, "clip_rejected", f"judge unavailable: {breaker_refusal}")
+                return
             budget_ok, budget_reason = self._acquire_judge_budget()
             if not budget_ok:
                 self._update_clip(
@@ -1129,25 +1582,23 @@ class StreamWatcher:
             # The capture loop keeps running underneath: the state machine
             # explicitly allows watching → clipping → watching|reconnecting.
             entered_clipping = self.set_state(StreamState.CLIPPING, "candidate detected")
-            directory = clip_dir(clip_id)
-            source_path = directory / JUDGE_WINDOW_NAME
-            audio_path = directory / JUDGE_AUDIO_NAME
+            # Hold the render window in the buffer until it is staged into
+            # the clip folder (the verdict can take a while).
+            pin_index = self._pin(clip_start_s)
             # The judge reads a WIDER window than the eventual clip: it needs
-            # the setup that led to the moment, not just the moment. The
-            # final render window (clip_start_s..clip_end_s) is re-extracted
-            # from the buffer at render time, so this judgment window never
-            # bounds the clip. Anchor back from the trigger so the context
-            # covers the lead-up; the buffer clamps to whatever it holds.
+            # the setup that led to the moment, not just the moment. Anchor
+            # back from the trigger so the context covers the lead-up; the
+            # buffer clamps to whatever it holds.
             context_s = getattr(rolling, "judge_context_s", 0.0) or 0.0
             judge_end_s = min(clip_end_s, trigger_end_s + max(rolling.post_roll_s, 5.0))
             judge_start_s = max(0.0, trigger_end_s - context_s) if context_s > 0 else clip_start_s
+            # The post-roll is still in the future when the trigger fires.
+            await self._await_coverage(clip_end_s)
             try:
                 # extract() validates + pins + concatenates + unpins in one
-                # call (A1); a pruned or epoch-crossing range raises a clear
-                # error the candidate path records verbatim.
-                await asyncio.to_thread(
-                    self._buffer.extract, judge_start_s, judge_end_s, source_path
-                )
+                # call (A1); a pruned range raises a clear error the
+                # candidate path records verbatim.
+                await self._extract(judge_start_s, judge_end_s, source_path, trigger_end_s)
                 await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
             except Exception as exc:
                 if context_s > 0:
@@ -1162,16 +1613,26 @@ class StreamWatcher:
                     )
                     judge_start_s = clip_start_s
                     try:
-                        await asyncio.to_thread(
-                            self._buffer.extract, clip_start_s, clip_end_s, source_path
-                        )
+                        await self._extract(clip_start_s, clip_end_s, source_path, trigger_end_s)
                         await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
                     except Exception as exc2:
                         raise RuntimeError(f"window extraction failed: {exc2}") from exc2
                 else:
                     raise RuntimeError(f"window extraction failed: {exc}") from exc
+            # The window video only fed the audio pull: hundreds of MB, gone.
+            self._delete_quietly(source_path)
 
-            transcript = await asyncio.to_thread(self._deps.transcribe, audio_path)
+            try:
+                transcript = await asyncio.to_thread(self._deps.transcribe, audio_path)
+            except Exception as exc:
+                if not _is_no_speech(exc):
+                    raise
+                # Silence, music, dead air: rejected locally, no LLM call.
+                self._save_verdict(directory, LiveJudgement(score=0), reason="no speech")
+                self._reject(clip_id, "clip_rejected", "no speech in the window", score=0)
+                return
+            finally:
+                self._delete_quietly(audio_path)
             words = list(getattr(transcript, "words", None) or [])
             transcript_path = self._save_transcript(transcript, directory)
             signals = {
@@ -1183,29 +1644,53 @@ class StreamWatcher:
                 )
                 if window.strength_of(kind) > 0
             }
+            # Discarded while it was being cut/transcribed: stop before paying.
+            if not self._clip_alive(clip_id):
+                raise _Discarded(clip_id)
             try:
-                judgement = await self._call_judge(words, signals)
+                judgement = await self._call_judge(words, signals, clip_id=clip_id)
+            except JudgeBudgetExhausted as exc:
+                self._update_clip(clip_id, status="rejected", reason=f"rate limited: {exc}")
+                self._publish_clip("clip_rejected", {"clip_id": clip_id, "reason": str(exc)})
+                return
             except Exception as exc:
-                # A6/provider failure — the stream keeps watching.
+                # A6/provider failure — the stream keeps watching, and the
+                # shared breaker backs every stream off this provider.
+                breaker = self._deps.judge_breaker
+                if breaker is not None:
+                    with contextlib.suppress(Exception):
+                        breaker.failure(f"{type(exc).__name__}: {exc}")
                 self._update_clip(clip_id, status="rejected", reason=f"judge unavailable: {exc}")
                 self._publish_clip(
                     "clip_rejected", {"clip_id": clip_id, "reason": f"judge error: {exc}"}
                 )
                 return
+            breaker = self._deps.judge_breaker
+            if breaker is not None:
+                with contextlib.suppress(Exception):
+                    breaker.success()
+            self._save_verdict(
+                directory,
+                judgement,
+                judge_start_s=judge_start_s,
+                judge_end_s=judge_end_s,
+                signals=signals,
+            )
 
             if judgement.score < rate_limit.judge_min_score:
+                reason = judgement.reason or f"below judge_min_score ({rate_limit.judge_min_score})"
                 self._update_clip(
                     clip_id,
                     status="rejected",
                     title=judgement.title,
                     score=int(judgement.score),
-                    reason=judgement.reason
-                    or f"below judge_min_score ({rate_limit.judge_min_score})",
+                    reason=reason,
                     hook=judgement.hook,
                     transcript_path=transcript_path,
                 )
                 self._publish_clip(
-                    "clip_rejected", {"clip_id": clip_id, "score": int(judgement.score)}
+                    "clip_rejected",
+                    {"clip_id": clip_id, "score": int(judgement.score), "reason": reason},
                 )
                 return
 
@@ -1215,6 +1700,22 @@ class StreamWatcher:
             # Verdict passed: mark the cooldown so this stream cools down even
             # if the enqueue below drops the item under queue/disk pressure.
             self._cooldown_mark()
+            # Stage the render window NOW, while the (pinned) buffer holds
+            # it: the queued clip then renders without the buffer — after a
+            # long queue, a pause, a restart, or as a retry.
+            from . import clip_factory
+
+            raw_path = await asyncio.to_thread(
+                clip_factory.stage_window,
+                self._buffer,
+                clip_id,
+                final_start,
+                final_end,
+                anchor_s=trigger_end_s,
+            )
+            staged = True
+            self._unpin(pin_index)
+            pin_index = None
             self._update_clip(
                 clip_id,
                 status="queued",
@@ -1227,14 +1728,14 @@ class StreamWatcher:
                 clip_end_s=final_end,
             )
             try:
-                window_bytes = int(source_path.stat().st_size)
+                window_bytes = int(raw_path.stat().st_size)
             except OSError:
                 window_bytes = 0
             item = ClipWorkItem(
                 clip_id=clip_id,
                 stream_id=self.id,
                 label=self.label or self.url,
-                source_path=source_path,
+                source_path=raw_path,
                 clip_start_s=final_start,
                 clip_end_s=final_end,
                 trigger_start_s=trigger_start_s,
@@ -1251,28 +1752,48 @@ class StreamWatcher:
                 self._publish_clip(
                     "clip_dropped", {"clip_id": clip_id, "reason": "queue full or disk pressure"}
                 )
+                self._delete_quietly(raw_path)
                 return
+            staged = False  # the queue owns it now
             self._publish_clip(
                 "clip_queued",
                 {"clip_id": clip_id, "score": int(judgement.score), "title": judgement.title},
             )
         except asyncio.CancelledError:
-            self._update_clip_safe(clip_id, status="failed", error="cancelled before verdict")
+            if row_created:
+                self._update_clip_safe(clip_id, status="failed", error="cancelled before verdict")
             raise
+        except _Discarded:
+            log.info("Stream %s: candidate %s was discarded; stopping it.", self.id, clip_id)
         except Exception as exc:
             # Crash isolation: the candidate dies, the watch does not.
             log.exception("Candidate pipeline failed for stream %s.", self.id)
-            self._update_clip_safe(clip_id, status="failed", error=str(exc))
-            self._publish_clip("clip_failed", {"clip_id": clip_id, "error": str(exc)})
+            if row_created:
+                self._update_clip_safe(clip_id, status="failed", error=str(exc))
+                self._publish_clip("clip_failed", {"clip_id": clip_id, "error": str(exc)})
         finally:
             # Candidate work over. If the capture is still alive → back to
             # plain watching. If it died mid-clip, a capture callback has
             # already parked or reconnected us; the reconnecting hop is the
             # legal exit when clipping → waiting was refused, and the park
             # flag drives the rest from the connect path.
+            self._unpin(pin_index)
+            self._delete_quietly(source_path, audio_path)
+            if staged and not self._clip_alive(clip_id):
+                self._delete_quietly(directory / "raw.ts")
+            if row_created:
+                self._consumed_until_s = max(self._consumed_until_s, consumed_until)
             self._candidate_busy = False
             if entered_clipping and self._state is StreamState.CLIPPING:
                 if self._capture is not None:
                     self.set_state(StreamState.WATCHING, "live")
                 else:
                     self.set_state(StreamState.RECONNECTING, "capture lost during clip")
+
+    @staticmethod
+    def _clip_alive(clip_id: str) -> bool:
+        """Whether the clip row still wants its staged window (not tombstoned)."""
+        with contextlib.suppress(Exception):
+            row = store.get_clip(clip_id)
+            return row is not None and row.status not in ("rejected",)
+        return True

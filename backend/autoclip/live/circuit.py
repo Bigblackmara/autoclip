@@ -37,6 +37,51 @@ class TokenBucket:
         self._last = now
 
 
+class JudgeCircuitBreaker:
+    """Backs the LLM judge off after provider errors (shared by all streams).
+
+    A provider at capacity ("Service temporarily at capacity", 429/529) or
+    down answers every stream the same way, so retrying on every trigger
+    only burns rate limits. After ``n`` consecutive failures the breaker is
+    open for ``base_s * 2**(n-1)`` seconds (capped at ``cap_s``); while it
+    is open candidates are refused locally. One success closes it.
+    """
+
+    def __init__(
+        self,
+        base_s: float = 30.0,
+        cap_s: float = 600.0,
+        *,
+        clock=time.monotonic,
+    ) -> None:
+        self.base_s = base_s
+        self.cap_s = cap_s
+        self._clock = clock
+        self.failures = 0
+        self.last_error = ""
+        self._open_until = 0.0
+
+    def remaining(self) -> float:
+        """Seconds the breaker stays open (0 when calls are allowed)."""
+        return max(0.0, self._open_until - self._clock())
+
+    def allow(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def failure(self, error: str = "") -> float:
+        """Record a provider failure; returns the new open duration."""
+        self.failures += 1
+        self.last_error = error[:300]
+        delay = min(self.cap_s, self.base_s * (2 ** (self.failures - 1)))
+        self._open_until = self._clock() + delay
+        return delay
+
+    def success(self) -> None:
+        self.failures = 0
+        self.last_error = ""
+        self._open_until = 0.0
+
+
 class PerStreamCooldown:
     """Tracks last-clip-per-stream timestamps; cooldown enforced per stream."""
 

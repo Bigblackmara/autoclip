@@ -580,3 +580,61 @@ class TestConcurrency:
         refused = [r for r in results if isinstance(r, ValueError)]
         assert len(refused) == 1
         assert "already" in str(refused[0])
+
+
+class TestEpochStraddlingWindows:
+    """A reconnect inside a clip window: clamp to the trigger's epoch."""
+
+    def _two_epochs(self, tmp_path: Path) -> RingBuffer:
+        buf = RingBuffer(tmp_path / "buf")
+        for i in range(0, 4):  # epoch 0: 0..24 s
+            path = buf.next_segment_path(i)
+            path.write_bytes(bytes([65 + i]) * 10)
+            buf.commit_segment(i)
+        buf.begin_epoch()
+        for i in range(4, 8):  # epoch 1 after the reconnect: 24..48 s
+            path = buf.next_segment_path(i)
+            path.write_bytes(bytes([65 + i]) * 10)
+            buf.commit_segment(i)
+        return buf
+
+    def test_anchor_in_the_new_epoch_keeps_the_new_side(self, tmp_path: Path) -> None:
+        buf = self._two_epochs(tmp_path)
+        out = buf.extract(12.0, 42.0, tmp_path / "o.ts", anchor_s=30.0)
+        assert out.read_bytes() == b"E" * 10 + b"F" * 10 + b"G" * 10  # segments 4..6
+
+    def test_anchor_in_the_old_epoch_keeps_the_old_side(self, tmp_path: Path) -> None:
+        buf = self._two_epochs(tmp_path)
+        out = buf.extract(6.0, 36.0, tmp_path / "o.ts", anchor_s=20.0)
+        assert out.read_bytes() == b"B" * 10 + b"C" * 10 + b"D" * 10  # segments 1..3
+
+    def test_without_an_anchor_mixing_still_raises(self, tmp_path: Path) -> None:
+        buf = self._two_epochs(tmp_path)
+        with pytest.raises(ValueError, match="epoch"):
+            buf.extract(12.0, 42.0, tmp_path / "o.ts")
+
+    def test_single_epoch_ranges_are_unchanged_by_the_anchor(self, tmp_path: Path) -> None:
+        buf = self._two_epochs(tmp_path)
+        out = buf.extract(24.0, 36.0, tmp_path / "o.ts", anchor_s=30.0)
+        assert out.read_bytes() == b"E" * 10 + b"F" * 10
+
+
+class TestCoverageAndLifecycleHelpers:
+    def test_covered_until_is_the_end_of_the_newest_segment(self, tmp_path: Path) -> None:
+        buf = RingBuffer(tmp_path / "buf")
+        assert buf.covered_until_s() is None
+        commit_n(buf, 3)
+        assert buf.covered_until_s() == pytest.approx(3 * SEGMENT_S)
+
+    def test_discard_segment_files_clears_only_segments(self, tmp_path: Path) -> None:
+        from autoclip.live.buffer import discard_segment_files
+
+        directory = tmp_path / "buf"
+        directory.mkdir()
+        for i in (0, 950, 1000):
+            (directory / segment_name(i)).write_bytes(b"x")
+        (directory / "notes.txt").write_text("keep me", encoding="utf-8")
+
+        assert discard_segment_files(directory) == 3
+        assert sorted(p.name for p in directory.iterdir()) == ["notes.txt"]
+        assert discard_segment_files(tmp_path / "missing") == 0
