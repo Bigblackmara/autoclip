@@ -21,6 +21,7 @@ from . import captions as captions_module
 from . import ffmpeg
 from .captions import CaptionStyle
 from .reframe.croppath import CropPath, segment_crop_filter
+from .reframe.facecam import Facecam
 from .transcript import Word
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,16 @@ RATIOS: dict[str, tuple[int, int]] = {
 #: platform normalises toward, so hitting it ourselves avoids their processing.
 LOUDNESS_TRUE_PEAK = -1.5
 LOUDNESS_RANGE = 11.0
+
+#: Height of the facecam panel in the split layout, as a fraction of the
+#: output height. The panel takes the cam's own aspect within these bounds;
+#: outside them the cam is cropped (never stretched) to fit.
+SPLIT_TOP_MIN = 0.30
+SPLIT_TOP_MAX = 0.42
+
+#: Ratios the split layout supports. Square and landscape outputs have no room
+#: for a stacked panel and keep the ordinary crop.
+SPLIT_RATIOS = ("9:16",)
 
 AUDIO_BITRATE = "192k"
 AUDIO_SAMPLE_RATE = 48_000
@@ -60,10 +71,146 @@ class ExportRequest:
     #: False for audio-only sources (podcasts, voice memos). The clip is then
     #: rendered as captions over a generated solid background.
     has_video: bool = True
+    #: Resolved layout: "split" stacks ``facecam`` above the gameplay, "crop"
+    #: (or anything else) renders ``crop_path``. Settings resolve "auto" before
+    #: building the request — see :func:`resolve_layout`.
+    layout: str = "crop"
+    facecam: Facecam | None = None
+
+    @property
+    def is_split(self) -> bool:
+        return (
+            self.layout == "split"
+            and self.facecam is not None
+            and self.has_video
+            and self.ratio in SPLIT_RATIOS
+        )
 
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
+
+
+def resolve_layout(setting: str, facecam: Facecam | None, ratio: str) -> str:
+    """Turn the ``layout`` setting into what actually renders: "split" or "crop".
+
+    "auto" only splits for what looks like a real overlay (see
+    :attr:`Facecam.is_overlay`), so talking-head videos, podcasts and anything
+    ambiguous keep the crop.
+    """
+    if ratio not in SPLIT_RATIOS or facecam is None or setting == "crop":
+        return "crop"
+    if setting == "split":
+        return "split"
+    return "split" if facecam.is_overlay else "crop"
+
+
+@dataclass(frozen=True)
+class SplitGeometry:
+    """Where each panel of the split layout comes from, in source pixels."""
+
+    top_h: int
+    cam: tuple[int, int, int, int]
+    game: tuple[int, int, int, int]
+
+
+def split_geometry(
+    facecam: Facecam, crop_path: CropPath | None, out_w: int, out_h: int
+) -> SplitGeometry:
+    """Lay out the facecam panel (top) and the gameplay panel (bottom).
+
+    The panel height follows the cam's own aspect, clamped to
+    :data:`SPLIT_TOP_MIN`..:data:`SPLIT_TOP_MAX` of the output; the cam rect
+    is then cropped to the panel's aspect around the face, so nothing is ever
+    stretched. Gameplay fills the rest at full source height, centred where the
+    crop path framed the clip (or the frame centre), and moved clear of the cam.
+    """
+    sw, sh = facecam.source_width, facecam.source_height
+    cam_x, cam_y, cam_w, cam_h = facecam.x, facecam.y, facecam.width, facecam.height
+
+    ideal = out_w * cam_h / cam_w if cam_w else out_h * SPLIT_TOP_MIN
+    top_h = _even(min(max(ideal, out_h * SPLIT_TOP_MIN), out_h * SPLIT_TOP_MAX))
+    panel_aspect = out_w / top_h
+
+    face_cx = facecam.face_left + facecam.face_width / 2
+    face_cy = facecam.face_top + facecam.face_height / 2
+    if cam_w / cam_h > panel_aspect:
+        # Cam is wider than the panel: trim the sides, keeping the face centred.
+        crop_w = min(cam_w - cam_w % 2, _even(cam_h * panel_aspect))
+        crop_h = cam_h - cam_h % 2
+        crop_x = _clamp_int(face_cx - crop_w / 2, cam_x, cam_x + cam_w - crop_w)
+        crop_y = cam_y
+    else:
+        # Cam is taller: trim top and bottom, face a little above centre.
+        crop_w = cam_w - cam_w % 2
+        crop_h = min(cam_h - cam_h % 2, _even(cam_w / panel_aspect))
+        crop_x = cam_x
+        crop_y = _clamp_int(face_cy - crop_h * 0.42, cam_y, cam_y + cam_h - crop_h)
+
+    bottom_h = out_h - top_h
+    game_h = sh - sh % 2
+    game_w = min(sw - sw % 2, _even(game_h * out_w / bottom_h))
+    centre = _gameplay_centre(crop_path, facecam) or sw / 2
+    game_x = _clamp_int(centre - game_w / 2, 0, sw - game_w)
+
+    # Keep the cam out of the gameplay panel when there's room to.
+    cam_right = cam_x + cam_w
+    if game_x < cam_right and game_x + game_w > cam_x:
+        if cam_x + cam_w / 2 < sw / 2 and cam_right + game_w <= sw:
+            game_x = cam_right
+        elif cam_x - game_w >= 0:
+            game_x = cam_x - game_w
+    game_x = _clamp_int(game_x, 0, sw - game_w)
+
+    return SplitGeometry(
+        top_h=top_h,
+        cam=(crop_x & ~1, crop_y & ~1, crop_w, crop_h),
+        game=(game_x & ~1, 0, game_w, game_h),
+    )
+
+
+def _gameplay_centre(crop_path: CropPath | None, facecam: Facecam) -> float | None:
+    """Time-weighted horizontal centre of the crop path, ignoring the cam.
+
+    Segments that framed the facecam itself (the speaker tracker happily
+    follows the webcam face) or fitted the whole frame say nothing about
+    where the action is.
+    """
+    if crop_path is None:
+        return None
+    total = 0.0
+    weighted = 0.0
+    for segment in crop_path.segments:
+        if segment.fit or not segment.keyframes:
+            continue
+        xs = [k.x + segment.width / 2 for k in segment.keyframes]
+        centre = sum(xs) / len(xs)
+        if facecam.x <= centre <= facecam.x + facecam.width:
+            continue
+        weight = max(segment.duration_s, 0.0)
+        total += weight
+        weighted += centre * weight
+    return weighted / total if total > 0 else None
+
+
+def split_caption_margin(style: CaptionStyle, out_h: int, top_h: int) -> float:
+    """Caption bottom margin (fraction of height) that keeps text off the cam.
+
+    Captions sit in the gameplay panel. The style's own margin is kept unless
+    its text block (up to three lines) would reach up into the facecam panel.
+    """
+    block = 3 * style.size_ratio * 1.25
+    ceiling = 1.0 - top_h / out_h - block - 0.02
+    return max(0.04, min(style.margin_v_ratio, ceiling))
+
+
+def _even(value: float) -> int:
+    rounded = int(round(value))
+    return max(2, rounded - rounded % 2)
+
+
+def _clamp_int(value: float, low: float, high: float) -> int:
+    return int(round(max(low, min(value, high)))) if high > low else int(low)
 
 
 def ratio_dimensions(ratio: str) -> tuple[int, int]:
@@ -116,6 +263,15 @@ def build_video_filtergraph(
             fonts_name=fonts_name,
         )
 
+    if request.is_split:
+        return _captions_chain(
+            request,
+            _split_chain(request, out_w, out_h),
+            "[vstack]",
+            subtitle_name=subtitle_name,
+            fonts_name=fonts_name,
+        )
+
     segments = request.crop_path.segments
     if not segments:
         raise ExportError("The crop path has no segments.")
@@ -159,6 +315,29 @@ def build_video_filtergraph(
 
     return _captions_chain(
         request, ";".join(parts), current, subtitle_name=subtitle_name, fonts_name=fonts_name
+    )
+
+
+def _split_chain(request: ExportRequest, out_w: int, out_h: int) -> str:
+    """Facecam panel stacked over a gameplay panel, producing ``[vstack]``."""
+    assert request.facecam is not None
+    geometry = split_geometry(request.facecam, request.crop_path, out_w, out_h)
+    cx, cy, cw, ch = geometry.cam
+    gx, gy, gw, gh = geometry.game
+    bottom_h = out_h - geometry.top_h
+    return ";".join(
+        [
+            "[0:v]split=2[camsrc][gamesrc]",
+            (
+                f"[camsrc]crop={cw}:{ch}:{cx}:{cy},"
+                f"scale={out_w}:{geometry.top_h}:flags=lanczos,setsar=1[cam]"
+            ),
+            (
+                f"[gamesrc]crop={gw}:{gh}:{gx}:{gy},"
+                f"scale={out_w}:{bottom_h}:flags=lanczos,setsar=1[game]"
+            ),
+            "[cam][game]vstack=inputs=2,format=yuv420p[vstack]",
+        ]
     )
 
 
@@ -282,6 +461,10 @@ def export_clip(
     render_cwd: Path | None = None
 
     if request.burn_captions and request.words:
+        margin_v_ratio = None
+        if request.is_split and request.facecam is not None:
+            top_h = split_geometry(request.facecam, request.crop_path, out_w, out_h).top_h
+            margin_v_ratio = split_caption_margin(request.style, out_h, top_h)
         ass_path = captions_module.write_ass(
             workspace / "captions.ass",
             request.words,
@@ -289,6 +472,7 @@ def export_clip(
             width=out_w,
             height=out_h,
             time_offset_s=request.start_s,
+            margin_v_ratio=margin_v_ratio,
         )
         render_cwd, subtitle_name, fonts_name = ffmpeg.relative_filter_workspace(
             ass_path, captions_module.FONT_DIR
@@ -420,9 +604,10 @@ def export_clip(
         )
 
     log.info(
-        "Exported %s (%.1fs, %s)",
+        "Exported %s (%.1fs, %s, %s)",
         request.destination.name,
         request.duration_s,
         request.ratio,
+        "split" if request.is_split else "crop",
     )
     return request.destination

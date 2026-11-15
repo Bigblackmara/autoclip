@@ -417,6 +417,11 @@ def clip(
     max_clips: int = typer.Option(0, "--max-clips", "-n", help="Override the clip count."),
     style: str = typer.Option("", "--style", "-s", help="Caption style preset."),
     ratio: str = typer.Option("", "--ratio", "-r", help="Output ratio: 9:16, 1:1, or 16:9."),
+    layout: str = typer.Option(
+        "",
+        "--layout",
+        help="9:16 layout: auto (facecam over gameplay when found), split, or crop.",
+    ),
     diarize: bool = typer.Option(
         False, "--diarize/--no-diarize", help="Label speakers (needs the diarization extra)."
     ),
@@ -445,6 +450,10 @@ def clip(
         settings.export.caption_style = style
     if ratio:
         settings.export.ratio = ratio  # type: ignore[assignment]
+    if layout:
+        if layout not in ("auto", "split", "crop"):
+            raise typer.BadParameter("Layout must be auto, split, or crop.", param_hint="--layout")
+        settings.export.layout = layout  # type: ignore[assignment]
     if diarize:
         settings.whisper.diarization = True
     if centre_crop:

@@ -68,6 +68,7 @@ class JobSettingsIn(BaseModel):
     max_clips: int | None = Field(default=None, ge=1, le=50)
     caption_style: str | None = None
     ratio: Literal["9:16", "1:1", "16:9"] | None = None
+    layout: Literal["auto", "split", "crop"] | None = None
 
 
 class JobCreateIn(BaseModel):
@@ -153,6 +154,8 @@ class ClipOut(BaseModel):
     user_trimmed: bool
     caption_style: str = "bold_pop"
     ratio: str = "9:16"
+    #: The job's layout setting — what a re-export uses unless told otherwise.
+    layout: str = "auto"
     exports: list[ExportOut] = Field(default_factory=list)
 
     @classmethod
@@ -164,6 +167,7 @@ class ClipOut(BaseModel):
         exports: list[models.Export] | None = None,
         default_style: str = "bold_pop",
         default_ratio: str = "9:16",
+        default_layout: str = "auto",
     ) -> ClipOut:
         return cls(
             id=clip.id,
@@ -182,6 +186,7 @@ class ClipOut(BaseModel):
             user_trimmed=clip.user_trimmed,
             caption_style=edit.caption_style if edit else default_style,
             ratio=edit.ratio if edit else default_ratio,
+            layout=default_layout,
             exports=[ExportOut.of(e) for e in (exports or [])],
         )
 
@@ -205,6 +210,8 @@ class ExportRequestIn(BaseModel):
     ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
     style: str = "bold_pop"
     write_srt: bool = False
+    #: None keeps the layout the clip's job was created with.
+    layout: Literal["auto", "split", "crop"] | None = None
 
 
 class CaptionStyleOut(BaseModel):

@@ -29,6 +29,8 @@ from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
 from .prepare import Loudness, Silence
 from .reframe import ReframeConfig, build_crop_path
 from .reframe.croppath import CropPath
+from .reframe.facecam import Facecam, detect_facecam, load_detection, save_detection
+from .reframe.faces import FaceDetectionUnavailable
 from .transcript import Transcript
 
 log = logging.getLogger(__name__)
@@ -100,6 +102,10 @@ class JobWorkspace:
     def crop_path(self, clip_id: str) -> Path:
         return self.root / "crops" / f"{clip_id}.json"
 
+    def facecam(self, clip_id: str) -> Path:
+        """Cached facecam detection for one clip (``null`` when there is none)."""
+        return self.root / "facecam" / f"{clip_id}.json"
+
     @property
     def captions_dir(self) -> Path:
         return self.root / "captions"
@@ -118,7 +124,56 @@ JOB_SCOPED_SETTINGS: tuple[tuple[str, str], ...] = (
     ("clips", "max_clips"),
     ("export", "caption_style"),
     ("export", "ratio"),
+    ("export", "layout"),
 )
+
+
+def wants_facecam(layout: str, ratio: str, has_video: bool) -> bool:
+    """Whether the split layout could apply, i.e. facecam detection is worth running."""
+    return has_video and layout != "crop" and ratio in export.SPLIT_RATIOS
+
+
+def facecam_for_clip(
+    workspace: JobWorkspace,
+    clip: Clip,
+    source: Source,
+) -> Facecam | None:
+    """Detect (or load the cached) facecam overlay for one clip.
+
+    Detection runs per clip rather than once per source: a long stream
+    changes layout — lobby, match, a full-screen "just chatting" stretch — and
+    the cam moves with it. The result, including "no facecam", is cached in
+    the job workspace like the crop paths.
+    """
+    cache = workspace.facecam(clip.id)
+    cached, facecam = load_detection(cache)
+    if cached:
+        return facecam
+    if not source.width or not source.height:
+        return None
+
+    try:
+        facecam = detect_facecam(
+            Path(source.path),
+            start_s=clip.start_s,
+            end_s=clip.end_s,
+            source_width=source.width,
+            source_height=source.height,
+        )
+    except FaceDetectionUnavailable as exc:
+        # Not cached: the next run may have the model.
+        log.warning("Facecam detection unavailable (%s); keeping the crop layout.", exc)
+        return None
+    except Exception:
+        # The layout is an enhancement: a detection failure (a model that
+        # can't be fetched offline, an undecodable frame) must not fail a job
+        # whose ordinary crop would render fine. Not cached, so a retry tries again.
+        log.warning(
+            "Facecam detection failed for clip %s; keeping the crop layout.", clip.id, exc_info=True
+        )
+        return None
+    save_detection(cache, facecam)
+    return facecam
 
 
 def settings_for_job(job: Job) -> Settings:
@@ -384,8 +439,14 @@ class PipelineRunner:
         if self.settings.export.ratio == "16:9":
             config = ReframeConfig(aspect_w=16, aspect_h=9)
 
+        detect_cams = wants_facecam(
+            self.settings.export.layout, self.settings.export.ratio, self.source.has_video
+        )
+
         for index, clip in enumerate(clips):
             self._check_cancelled()
+            if detect_cams:
+                facecam_for_clip(self.workspace, clip, self.source)
             cached = self.workspace.crop_path(clip.id)
             if cached.exists():
                 crop_paths[clip.id] = CropPath.load(cached)
@@ -439,6 +500,11 @@ class PipelineRunner:
 
             crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
             words = transcript.slice(clip.start_word, clip.end_word)
+            facecam = (
+                facecam_for_clip(self.workspace, clip, self.source)
+                if wants_facecam(self.settings.export.layout, ratio, self.source.has_video)
+                else None
+            )
             destination = destination_dir / export.output_filename(
                 clip.title or f"clip-{clip.rank}", ratio, rank=clip.rank
             )
@@ -453,6 +519,8 @@ class PipelineRunner:
                 style=style,
                 ratio=ratio,
                 has_video=self.source.has_video,
+                layout=export.resolve_layout(self.settings.export.layout, facecam, ratio),
+                facecam=facecam,
             )
 
             def clip_progress(fraction: float, i: int = index) -> None:

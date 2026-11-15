@@ -16,7 +16,12 @@ from ..db.models import Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import export as export_module
 from ..pipeline.reframe.croppath import CropPath, centre_crop
-from ..pipeline.runner import JobWorkspace, settings_for_job
+from ..pipeline.runner import (
+    JobWorkspace,
+    facecam_for_clip,
+    settings_for_job,
+    wants_facecam,
+)
 from ..pipeline.transcript import Transcript, Word
 from .schemas import (
     CaptionPatchIn,
@@ -46,12 +51,23 @@ def _job_export_defaults(job_id: str) -> tuple[str, str]:
     return export.caption_style, export.ratio
 
 
-def _clip_out(clip, defaults: tuple[str, str] | None = None) -> ClipOut:
+def _job_layout(job_id: str) -> str:
+    """The layout setting ("auto" / "split" / "crop") a job was created with."""
+    job = store.get_job(job_id)
+    return (settings_for_job(job).export if job else load_settings().export).layout
+
+
+def _clip_out(clip, defaults: tuple[str, str] | None = None, layout: str | None = None) -> ClipOut:
     edit = store.get_clip_edit(clip.id)
     exports = store.list_exports(clip.id)
     style, ratio = defaults or _job_export_defaults(clip.job_id)
     return ClipOut.of(
-        clip, edit=edit, exports=exports, default_style=style, default_ratio=ratio
+        clip,
+        edit=edit,
+        exports=exports,
+        default_style=style,
+        default_ratio=ratio,
+        default_layout=layout or _job_layout(clip.job_id),
     )
 
 
@@ -61,7 +77,8 @@ async def list_clips_for_job(job_id: str) -> list[ClipOut]:
         raise HTTPException(status_code=404, detail="Job not found.")
     clips = await asyncio.to_thread(store.list_clips, job_id)
     defaults = await asyncio.to_thread(_job_export_defaults, job_id)
-    return [await asyncio.to_thread(_clip_out, clip, defaults) for clip in clips]
+    layout = await asyncio.to_thread(_job_layout, job_id)
+    return [await asyncio.to_thread(_clip_out, clip, defaults, layout) for clip in clips]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)
@@ -218,6 +235,13 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     workspace = JobWorkspace(clip.job_id)
     crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, payload.ratio)
 
+    layout_setting = payload.layout or await asyncio.to_thread(_job_layout, clip.job_id)
+    facecam = None
+    if wants_facecam(layout_setting, payload.ratio, source.has_video):
+        # Cached from the job's reframe stage when it ran with a split-capable
+        # layout; detected now (and cached) otherwise.
+        facecam = await asyncio.to_thread(facecam_for_clip, workspace, clip, source)
+
     destination = (
         paths.exports_dir()
         / clip.job_id
@@ -236,6 +260,8 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         style=style,
         ratio=payload.ratio,
         has_video=source.has_video,
+        layout=export_module.resolve_layout(layout_setting, facecam, payload.ratio),
+        facecam=facecam,
     )
 
     try:

@@ -92,6 +92,11 @@ class ExportSettings(BaseModel):
     crf: int = 18
     #: Also write a .srt sidecar next to each exported clip.
     write_srt: bool = False
+    #: Frame layout for 9:16 clips. "auto" stacks a detected facecam overlay
+    #: above the gameplay (streamer clips) and otherwise crops as usual;
+    #: "split" asks for the stacked layout whenever a facecam is found; "crop"
+    #: always uses the speaker-following crop. Other ratios always crop.
+    layout: Literal["auto", "split", "crop"] = "auto"
 
 
 class Settings(BaseModel):

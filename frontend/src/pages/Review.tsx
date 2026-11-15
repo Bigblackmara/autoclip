@@ -5,10 +5,12 @@ import {
   api,
   formatBytes,
   formatDuration,
+  LAYOUTS,
   type CaptionStyle,
   type Clip,
   type CropPath,
   type Job,
+  type Layout,
   type Word,
 } from '../api'
 import { CaptionEditor } from '../components/CaptionEditor'
@@ -29,6 +31,8 @@ export function Review() {
   const [wordsDirty, setWordsDirty] = useState(false)
   const [savingWords, setSavingWords] = useState(false)
   const [exporting, setExporting] = useState<Set<string>>(new Set())
+  // Per-clip layout picked here for the next export; unset means the job's.
+  const [layouts, setLayouts] = useState<Record<string, Layout>>({})
   const [exportingKept, setExportingKept] = useState(false)
   const [error, setError] = useState<Error | null>(null)
 
@@ -146,7 +150,13 @@ export function Review() {
     setExporting((current) => new Set(current).add(clip.id))
     setError(null)
     try {
-      await api.exportClip(clip.id, clip.ratio, clip.caption_style)
+      await api.exportClip(
+        clip.id,
+        clip.ratio,
+        clip.caption_style,
+        false,
+        layouts[clip.id] ?? clip.layout,
+      )
       patchClip(await api.getClip(clip.id))
     } catch (err) {
       setError(err as Error)
@@ -337,6 +347,35 @@ export function Review() {
                       </button>
                     ))}
                   </div>
+                </div>
+
+                <div>
+                  <p className="eyebrow border-b border-ink-800 pb-2">Layout</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {LAYOUTS.map(({ value, label }) => {
+                      const current = layouts[selected.id] ?? selected.layout
+                      return (
+                        <button
+                          key={value}
+                          onClick={() =>
+                            setLayouts((all) => ({ ...all, [selected.id]: value }))
+                          }
+                          aria-pressed={value === current}
+                          disabled={selected.ratio !== '9:16'}
+                          className={['btn', value === current ? 'btn-primary' : 'btn-ghost'].join(
+                            ' ',
+                          )}
+                        >
+                          {label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <p className="mt-2 text-xs leading-snug text-ink-500">
+                    {selected.ratio === '9:16'
+                      ? 'Facecam + gameplay stacks a streamer’s webcam above the game. Auto uses it only when a facecam overlay is found.'
+                      : 'Stacked layouts need 9:16; this ratio always crops.'}
+                  </p>
                 </div>
 
                 <div className="border-t border-ink-800 pt-6">
