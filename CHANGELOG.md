@@ -90,6 +90,12 @@ being validated against a fixed golden video set — see
   highlight prompt now asks for the same: start on the hook, end after the
   reaction, no overlapping clips. See
   [How clip boundaries are chosen](README.md#how-clip-boundaries-are-chosen).
+- **Clip boundaries without punctuation**: where Whisper left no sentence-ending
+  punctuation within reach (52 of 599 40-word windows on that stream), a long
+  pause now counts as a sentence break for start/end snapping, the duration
+  clamp, and overlap trimming. The threshold comes from the transcript's own
+  gaps (`max(0.6 s, p90)`, capped at 1.5 s); punctuation still wins when both
+  are in reach.
 - **Live Watch timing**: stream copy cuts segments at keyframes (~8 s, variable,
   not the nominal 6 s), but clips, judge trims and audio stamps assumed
   index × 6 s, so clips started and ended at the wrong moment. Capture now

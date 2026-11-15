@@ -17,6 +17,11 @@ takes these passes:
    louder than the clip's own speech (a laugh, a scream, "bro!"), run the end
    on until that reaction settles, bounded by the maximum length.
 
+"Sentence" in steps 1-3 means punctuation first and pauses second: Whisper
+often leaves long stretches of fast speech unpunctuated, and there a long gap
+between words is the best evidence of where a thought ends (see
+:class:`SentenceBreaks`).
+
 Step 4 is what a fixed ±0.25s pad can't do. Padding by a constant clips breaths
 and plosives, because the gap before a word varies with how the speaker breathes.
 Cutting inside actual silence is where a human editor would put the blade.
@@ -27,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import statistics
+from bisect import bisect_left
 from dataclasses import dataclass
 
 from .prepare import Loudness, Silence
@@ -88,6 +94,16 @@ HOOK_MATCH_CHARS = 24
 #: Hooks shorter than this (after normalising) are too ambiguous to anchor on.
 HOOK_MIN_CHARS = 8
 
+#: A pause counts as a soft sentence break when it is at least this long...
+PAUSE_FLOOR_S = 0.6
+#: ...raised to this percentile of the transcript's own inter-word gaps...
+PAUSE_PERCENTILE = 0.9
+#: ...but a speaker who pauses a lot still breaks on a pause this long.
+PAUSE_CEILING_S = 1.5
+#: A pause only stands in for punctuation when no punctuated sentence end lies
+#: within this many words of it: punctuation wins wherever the ASR emitted it.
+PAUSE_PUNCTUATION_RADIUS = 6
+
 #: The reaction must start this soon after the last word to belong to the clip.
 REACTION_ONSET_S = 1.5
 #: ...and be this much louder than the clip's own speech.
@@ -120,6 +136,70 @@ class Boundary:
         return self.end_s - self.start_s
 
 
+class SentenceBreaks:
+    """Where sentences end in a transcript: punctuation, then long pauses.
+
+    With Whisper "small" on a 2h44m IShowSpeed stream, 52 of 599 40-word
+    windows carried no sentence-ending punctuation at all, so snapping had
+    nothing to snap to and clip edges stayed wherever the model guessed. In
+    those stretches the speaker still stops between thoughts.
+
+    A word *soft-ends* a sentence when the gap after it is at least
+    :attr:`threshold_s` (see :func:`pause_threshold`), no punctuated sentence
+    end lies within :data:`PAUSE_PUNCTUATION_RADIUS` words, and the word is not
+    one a thought cannot end on ("the", "to", "let": a pause there is a
+    hesitation). Punctuated ends always count. A pure function of the words,
+    so the same transcript always yields the same breaks.
+    """
+
+    def __init__(self, transcript: Transcript, *, threshold_s: float | None = None) -> None:
+        words = transcript.words
+        self.threshold_s = pause_threshold(transcript) if threshold_s is None else threshold_s
+        punctuated = [i for i, word in enumerate(words) if word.ends_sentence]
+        soft: set[int] = set()
+        for index in range(len(words) - 1):
+            word = words[index]
+            if word.ends_sentence or words[index + 1].start - word.end < self.threshold_s:
+                continue
+            if not word.ends_clause and _bare(word.text) in DANGLING_ENDS:
+                continue
+            radius = PAUSE_PUNCTUATION_RADIUS
+            nearest = bisect_left(punctuated, index - radius)
+            if nearest < len(punctuated) and punctuated[nearest] <= index + radius:
+                continue
+            soft.add(index)
+        self.punctuated = frozenset(punctuated)
+        self.soft = frozenset(soft)
+        self._ends = self.punctuated | self.soft
+
+    def ends_at(self, index: int, *, soft: bool = True) -> bool:
+        """True when word ``index`` closes a sentence.
+
+        ``soft=False`` counts punctuation only.
+        """
+        return index in (self._ends if soft else self.punctuated)
+
+    def starts_at(self, index: int, *, soft: bool = True) -> bool:
+        """True when word ``index`` opens a sentence. Index 0 always does."""
+        return index <= 0 or self.ends_at(index - 1, soft=soft)
+
+
+def pause_threshold(transcript: Transcript) -> float:
+    """The inter-word gap that counts as a sentence break for this transcript.
+
+    ``max(PAUSE_FLOOR_S, p90 of gaps)``, capped at :data:`PAUSE_CEILING_S`.
+    Measuring the speaker's own rhythm keeps a slow, pausing talker from
+    breaking every few words, while a fast streamer (on the Speed job 72% of
+    gaps are 0 s and p90 is 0.3 s) still gets the floor.
+    """
+    words = transcript.words
+    gaps = sorted(max(0.0, words[i].start - words[i - 1].end) for i in range(1, len(words)))
+    if not gaps:
+        return PAUSE_FLOOR_S
+    p90 = gaps[min(len(gaps) - 1, int(PAUSE_PERCENTILE * len(gaps)))]
+    return min(PAUSE_CEILING_S, max(PAUSE_FLOOR_S, p90))
+
+
 def refine(
     transcript: Transcript,
     start_word: int,
@@ -130,6 +210,7 @@ def refine(
     max_duration_s: float = 90.0,
     hook: str = "",
     loudness: Loudness | None = None,
+    breaks: SentenceBreaks | None = None,
 ) -> Boundary | None:
     """Refine a proposed word range into a cuttable boundary.
 
@@ -138,6 +219,8 @@ def refine(
 
     ``hook`` is the model's verbatim quote of the opening words; found near
     ``start_word`` it decides the start. ``loudness`` enables the reaction tail.
+    ``breaks`` is the transcript's :class:`SentenceBreaks`; pass it when
+    refining many ranges of one transcript so it is only built once.
 
     Preconditions:
         transcript has word-level timings; start_word and end_word are valid
@@ -145,6 +228,8 @@ def refine(
     """
     if not transcript.words:
         return None
+    if breaks is None:
+        breaks = SentenceBreaks(transcript)
 
     last_index = len(transcript.words) - 1
     start_word = max(0, min(start_word, last_index))
@@ -154,15 +239,17 @@ def refine(
     if anchored is not None and anchored < end_word:
         start_word = anchored
     else:
-        start_word = snap_start_to_sentence(transcript, start_word)
-    end_word = snap_end_to_sentence(transcript, end_word)
+        start_word = snap_start_to_sentence(transcript, start_word, breaks)
+    end_word = snap_end_to_sentence(transcript, end_word, breaks)
     start_word = strip_leading_fillers(transcript, start_word, end_word)
     end_word = shed_dangling_end(transcript, start_word, end_word)
 
     if end_word <= start_word:
         return None
 
-    end_word = _clamp_duration(transcript, start_word, end_word, min_duration_s, max_duration_s)
+    end_word = _clamp_duration(
+        transcript, start_word, end_word, min_duration_s, max_duration_s, breaks
+    )
     if end_word is None:
         return None
 
@@ -284,48 +371,83 @@ def shed_dangling_end(transcript: Transcript, start_word: int, end_word: int) ->
 # --------------------------------------------------------------------------
 
 
-def snap_start_to_sentence(transcript: Transcript, index: int) -> int:
+def snap_start_to_sentence(
+    transcript: Transcript, index: int, breaks: SentenceBreaks | None = None
+) -> int:
     """Move ``index`` to the first word of the nearest sentence.
 
     A word starts a sentence if the word before it ended one. Index 0 always
     qualifies. Ties prefer moving earlier, since starting slightly wide is
     recoverable while clipping the hook is not.
+
+    Punctuation wins: pause breaks are only consulted when no punctuated
+    sentence start lies within :data:`SENTENCE_SEARCH_WORDS`, and then the
+    longest pause in that window is taken (see :func:`_longest_pause`).
     """
     if index <= 0:
         return 0
+    if breaks is None:
+        breaks = SentenceBreaks(transcript)
 
+    order: list[int] = []
     for offset in range(SENTENCE_SEARCH_WORDS + 1):
         for candidate in (index - offset, index + offset):
             if candidate <= 0:
                 return 0
             if candidate >= len(transcript.words):
                 continue
-            if transcript.words[candidate - 1].ends_sentence:
+            if breaks.starts_at(candidate, soft=False):
                 return candidate
+            order.append(candidate)
 
-    return index
+    soft = [c for c in order if breaks.starts_at(c)]
+    return _longest_pause(transcript, soft, before=True) if soft else index
 
 
-def snap_end_to_sentence(transcript: Transcript, index: int) -> int:
+def snap_end_to_sentence(
+    transcript: Transcript, index: int, breaks: SentenceBreaks | None = None
+) -> int:
     """Move ``index`` to the last word of the nearest sentence.
 
     Ties prefer moving later — ending on the complete thought rather than
-    truncating it.
+    truncating it. As for starts, pause breaks are only consulted when no
+    punctuated sentence end lies within :data:`SENTENCE_SEARCH_WORDS`.
     """
     last_index = len(transcript.words) - 1
     if index >= last_index:
         return last_index
+    if breaks is None:
+        breaks = SentenceBreaks(transcript)
 
+    order: list[int] = []
     for offset in range(SENTENCE_SEARCH_WORDS + 1):
         for candidate in (index + offset, index - offset):
             if candidate >= last_index:
                 return last_index
             if candidate < 0:
                 continue
-            if transcript.words[candidate].ends_sentence:
+            if breaks.ends_at(candidate, soft=False):
                 return candidate
+            order.append(candidate)
 
-    return index
+    soft = [c for c in order if breaks.ends_at(c)]
+    return _longest_pause(transcript, soft, before=False) if soft else index
+
+
+def _longest_pause(transcript: Transcript, candidates: list[int], *, before: bool) -> int:
+    """The candidate with the longest pause before (or after) it.
+
+    ``candidates`` come in search order (nearest first, preferred direction
+    first on a tie), so equal pauses resolve the same way punctuation does.
+    The longest pause rather than the nearest: on the Speed stream a 0.67 s
+    hesitation inside "real | talk" sat three words before a 2.98 s stop
+    after "I'm up right now".
+    """
+
+    def pause(index: int) -> float:
+        return transcript.pause_before(index if before else index + 1)
+
+    return max(candidates, key=pause)
 
 
 def _clamp_duration(
@@ -334,6 +456,7 @@ def _clamp_duration(
     end_word: int,
     min_duration_s: float,
     max_duration_s: float,
+    breaks: SentenceBreaks,
 ) -> int | None:
     """Adjust ``end_word`` so the clip fits the duration range.
 
@@ -348,10 +471,7 @@ def _clamp_duration(
     if duration_at(end_word) > max_duration_s:
         # Walk back to the last sentence end that fits.
         for candidate in range(end_word, start_word, -1):
-            if (
-                duration_at(candidate) <= max_duration_s
-                and transcript.words[candidate].ends_sentence
-            ):
+            if duration_at(candidate) <= max_duration_s and breaks.ends_at(candidate):
                 end_word = candidate
                 break
         else:
@@ -369,7 +489,7 @@ def _clamp_duration(
         for candidate in range(end_word + 1, last_index + 1):
             if duration_at(candidate) > max_duration_s:
                 break
-            if transcript.words[candidate].ends_sentence:
+            if breaks.ends_at(candidate):
                 end_word = candidate
                 if duration_at(end_word) >= min_duration_s:
                     break

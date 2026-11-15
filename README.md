@@ -252,6 +252,7 @@ The model proposes a word range and quotes its hook; the cut points are then fix
 
 - **Start on the hook.** When the quoted hook is found near the proposed start, the clip starts there, not on a preamble before it. Up to three leading connectives or hesitations ("and", "but", "so", "um") are dropped.
 - **End on a whole thought.** An end with no punctuation backs off a dangling function word ("the", "to", "let"), and padding never runs into the neighbouring word.
+- **Pauses stand in for missing punctuation.** Whisper often leaves fast speech unpunctuated. Where no sentence-ending punctuation is within reach, a long pause (at least `max(0.6 s, p90 of the transcript's own gaps)`, capped at 1.5 s) counts as a sentence break: the longest one in reach wins, pauses after a function word don't count, and punctuation always wins when both are in reach.
 - **Keep the reaction.** A loud reaction that starts right after the last line (laughter, a shout) is kept, up to 4 s and within the max clip length. Loudness is measured once per job with ffmpeg's ebur128 filter and cached as `loudness.json` in the job folder.
 - **No overlaps.** Partially overlapping clips are merged when the result still fits the max length; otherwise the weaker one is trimmed at a sentence edge, or dropped if what's left is too short.
 

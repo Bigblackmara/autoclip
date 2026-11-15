@@ -245,6 +245,7 @@ def build_clips(
     """Deduplicate, refine, rank, and truncate raw candidates into clips."""
     deduped = dedupe(candidates)
     log.info("%d candidates remain after dedupe.", len(deduped))
+    breaks = boundaries.SentenceBreaks(transcript)
 
     clips: list[Clip] = []
     for candidate in deduped:
@@ -257,6 +258,7 @@ def build_clips(
             max_duration_s=config.max_duration_s,
             hook=candidate.hook,
             loudness=loudness,
+            breaks=breaks,
         )
         if boundary is None:
             log.debug(
@@ -286,7 +288,7 @@ def build_clips(
 
     # Refinement can move edges enough that two survivors now overlap.
     clips = _dedupe_clips(clips)
-    clips = resolve_overlaps(clips, transcript, config)
+    clips = resolve_overlaps(clips, transcript, config, breaks=breaks)
     clips.sort(key=lambda c: c.score, reverse=True)
     clips = clips[: config.max_clips]
 
@@ -348,7 +350,11 @@ def _iou(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
 
 
 def resolve_overlaps(
-    clips: list[Clip], transcript: Transcript, config: DetectionConfig
+    clips: list[Clip],
+    transcript: Transcript,
+    config: DetectionConfig,
+    *,
+    breaks: boundaries.SentenceBreaks | None = None,
 ) -> list[Clip]:
     """Remove the partial overlaps that the IoU dedupe lets through.
 
@@ -357,8 +363,11 @@ def resolve_overlaps(
     overlapping clips are one moment: they merge when the union still fits
     ``max_duration_s`` (the better-scoring clip keeps its title). Otherwise the
     weaker clip gives up the shared stretch at a sentence boundary, and is
-    dropped if what remains is shorter than ``min_duration_s``.
+    dropped if what remains is shorter than ``min_duration_s``. Sentence
+    boundaries include soft pause breaks (:class:`boundaries.SentenceBreaks`).
     """
+    if breaks is None:
+        breaks = boundaries.SentenceBreaks(transcript)
     remaining = sorted(clips, key=lambda c: c.score, reverse=True)
     kept: list[Clip] = []
     while remaining:
@@ -378,7 +387,7 @@ def resolve_overlaps(
             other.end_word = max(clip.end_word, other.end_word)
             remaining.insert(0, other)
             continue
-        trimmed = _trim_off(clip, other, transcript, config.min_duration_s)
+        trimmed = _trim_off(clip, other, transcript, config.min_duration_s, breaks)
         if trimmed is None:
             log.debug("Dropped clip %s: it overlaps %s and cannot be trimmed.", clip.id, other.id)
         else:
@@ -391,7 +400,11 @@ def _overlap_s(a: Clip, b: Clip) -> float:
 
 
 def _trim_off(
-    clip: Clip, keeper: Clip, transcript: Transcript, min_duration_s: float
+    clip: Clip,
+    keeper: Clip,
+    transcript: Transcript,
+    min_duration_s: float,
+    breaks: boundaries.SentenceBreaks,
 ) -> Clip | None:
     """Shorten ``clip`` on a sentence edge so it no longer overlaps ``keeper``."""
     words = transcript.words
@@ -401,7 +414,7 @@ def _trim_off(
             (
                 i
                 for i in range(keeper.end_word + 1, clip.end_word)
-                if words[i - 1].ends_sentence and words[i].start >= keeper.end_s
+                if breaks.starts_at(i) and words[i].start >= keeper.end_s
             ),
             None,
         )
@@ -415,7 +428,7 @@ def _trim_off(
             (
                 i
                 for i in range(keeper.start_word - 1, clip.start_word, -1)
-                if words[i].ends_sentence and words[i].end <= keeper.start_s
+                if breaks.ends_at(i) and words[i].end <= keeper.start_s
             ),
             None,
         )
