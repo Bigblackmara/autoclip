@@ -8,6 +8,7 @@ troughs rather than mid-breath.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -46,25 +47,40 @@ def extract_audio(
     *,
     duration_s: float | None = None,
     on_progress: Callable[[float], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Path:
-    """Extract mono 16 kHz PCM WAV from any input."""
+    """Extract mono 16 kHz PCM WAV from any input.
+
+    ffmpeg writes to a sibling ``.partial.wav`` that is renamed into place
+    only on success. The runner reuses any non-empty ``audio.wav`` on a
+    retry or after a restart, and a WAV cut short by a crash, a cancel, or a
+    full disk is still a valid, non-empty file — so the job silently went on
+    to transcribe and clip only the first part of the video.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg.run(
-        [
-            "-i",
-            str(source),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(AUDIO_SAMPLE_RATE),
-            "-c:a",
-            "pcm_s16le",
-            str(destination),
-        ],
-        total_duration_s=duration_s,
-        on_progress=on_progress,
-    )
+    partial = destination.with_name(destination.stem + ".partial.wav")
+    try:
+        ffmpeg.run(
+            [
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(AUDIO_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(partial),
+            ],
+            total_duration_s=duration_s,
+            on_progress=on_progress,
+            cancelled=cancelled,
+        )
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    os.replace(partial, destination)
     return destination
 
 

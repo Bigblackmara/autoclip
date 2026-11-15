@@ -139,6 +139,7 @@ async def detect(
     semaphore = asyncio.Semaphore(concurrency)
     completed = 0
     lock = asyncio.Lock()
+    errors: list[Exception] = []
 
     async def run_window(window: TranscriptWindow) -> list[ClipCandidate]:
         nonlocal completed
@@ -154,6 +155,7 @@ async def detect(
                     window.last_word,
                     exc,
                 )
+                errors.append(exc)
                 candidates = []
             async with lock:
                 completed += 1
@@ -163,6 +165,13 @@ async def detect(
 
     results = await asyncio.gather(*(run_window(w) for w in windows))
     candidates = [c for group in results for c in group]
+
+    if not candidates and len(errors) == len(windows):
+        # Every window failed: that is a provider problem (bad key, unknown
+        # model, unreachable server), not a video without highlights. Saying
+        # "no clips were found" here sent users tuning prompts and models when
+        # the fix was in settings.
+        raise errors[0]
 
     if not candidates:
         raise HighlightError(

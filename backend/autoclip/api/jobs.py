@@ -147,6 +147,7 @@ async def retry_job(job_id: str) -> JobOut:
             detail=f"Only failed or cancelled jobs can be retried (this one is {job.status}).",
         )
 
+    queue.requeued(job_id)
     await asyncio.to_thread(store.update_job, job_id, status="queued", error=None, progress=0.0)
     queue.notify()
 

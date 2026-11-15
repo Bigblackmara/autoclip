@@ -16,10 +16,12 @@ changes between ffmpeg versions.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -296,9 +298,12 @@ def run(
 
     log.debug("ffmpeg %s", " ".join(command[1:]))
 
+    pump = bool(on_progress and total_duration_s)
     proc = subprocess.Popen(
         command,
-        stdout=subprocess.PIPE,
+        # stdout only carries -progress lines; without them there is nothing
+        # to read, and an unread pipe is one more thing that can fill up.
+        stdout=subprocess.PIPE if pump else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
@@ -306,17 +311,33 @@ def run(
         cwd=str(cwd) if cwd else None,
     )
 
+    # stderr is drained on its own thread for the whole run. Reading it only
+    # at the end (communicate() after the progress pump, or after the
+    # cancellable wait) deadlocked on damaged input: each decode error is a
+    # stderr line even at -loglevel error, and once the OS pipe buffer (a few
+    # KB on Windows) filled, ffmpeg blocked writing it and the job hung at a
+    # fixed percentage forever.
+    stderr_lines: list[str] = []
+    drain = threading.Thread(
+        target=_drain, args=(proc.stderr, stderr_lines), name="ffmpeg-stderr", daemon=True
+    )
+    drain.start()
+
     try:
-        if on_progress and total_duration_s and proc.stdout is not None:
+        if pump and proc.stdout is not None:
             _pump_progress(proc, total_duration_s, on_progress, cancelled)
         elif cancelled is not None:
             _wait_cancellable(proc, cancelled)
-
-        stdout, stderr = proc.communicate()
+        proc.wait()
     except BaseException:
         proc.kill()
         proc.wait()
         raise
+    finally:
+        drain.join(timeout=5.0)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    stderr = "".join(stderr_lines)
 
     if proc.returncode != 0:
         raise FFmpegError(
@@ -327,6 +348,24 @@ def run(
 
     if on_progress:
         on_progress(1.0)
+
+
+def _drain(stream, sink: list[str]) -> None:
+    """Read ``stream`` to EOF into ``sink``, keeping only the recent tail."""
+    if stream is None:
+        return
+    with contextlib.suppress(ValueError, OSError):  # closed underneath us on kill
+        for line in stream:
+            sink.append(line)
+            if len(sink) > _STDERR_KEEP_LINES * 2:
+                del sink[:-_STDERR_KEEP_LINES]
+    with contextlib.suppress(OSError):
+        stream.close()
+
+
+#: stderr lines kept for error messages. A damaged hour-long source can emit
+#: millions of decode errors; only the tail is ever shown.
+_STDERR_KEEP_LINES = 200
 
 
 class Cancelled(RuntimeError):

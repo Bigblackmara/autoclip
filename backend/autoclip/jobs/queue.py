@@ -98,6 +98,16 @@ class JobQueue:
     def is_cancelled(self, job_id: str) -> bool:
         return job_id in self._cancel_requested
 
+    def requeued(self, job_id: str) -> None:
+        """Forget a stale cancel request — call when a job is queued again.
+
+        A job cancelled while still queued is never picked up by the worker,
+        so the worker's ``finally`` never clears its flag. Retrying it then
+        ran into the leftover flag and was cancelled again the instant it
+        started, so a cancelled-while-queued job could never be retried.
+        """
+        self._cancel_requested.discard(job_id)
+
     def status(self) -> QueueStatus:
         return QueueStatus(
             running_job_id=self._running_job_id,

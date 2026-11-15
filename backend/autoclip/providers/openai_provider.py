@@ -75,22 +75,25 @@ class OpenAIProvider(LLMProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            # Only OpenAI's own endpoint reliably honours this; other vendors
+            # 400 on it, so a rejected request is retried without it.
+            "response_format": {"type": "json_object"},
         }
-        # Only OpenAI's own endpoint reliably honours this; other vendors 400 on
-        # it, so a failed request is retried once without it.
-        try:
-            response = await client.chat.completions.create(
-                **request, response_format={"type": "json_object"}
-            )
-        except Exception as exc:
-            if _is_unsupported_parameter(exc):
-                log.debug("Endpoint rejected response_format; retrying without it.")
-                try:
-                    response = await client.chat.completions.create(**request)
-                except Exception as retry_exc:
-                    raise _translate(retry_exc, self.name, self.model) from retry_exc
-            else:
-                raise _translate(exc, self.name, self.model) from exc
+        # Each rejected optional parameter is dropped and the request retried.
+        # Reasoning models (o-series, gpt-5) refuse any non-default
+        # temperature with an "Unsupported value" 400; dropping only
+        # response_format would fail the same way again, so a suggested model
+        # like o4-mini could never produce a clip.
+        while True:
+            try:
+                response = await client.chat.completions.create(**request)
+                break
+            except Exception as exc:
+                rejected = _rejected_parameter(exc, request)
+                if rejected is None:
+                    raise _translate(exc, self.name, self.model) from exc
+                log.debug("Endpoint rejected %s; retrying without it.", rejected)
+                del request[rejected]
 
         choices = response.choices or []
         if not choices:
@@ -119,6 +122,22 @@ class OpenAIProvider(LLMProvider):
 def _is_unsupported_parameter(exc: Exception) -> bool:
     lowered = str(exc).lower()
     return "response_format" in lowered or "unsupported" in lowered or "unrecognized" in lowered
+
+
+def _rejected_parameter(exc: Exception, request: dict) -> str | None:
+    """The optional request parameter an error is complaining about, if any.
+
+    Only parameters still present in ``request`` qualify, so the retry loop in
+    ``_complete`` ends after at most one retry per optional parameter.
+    """
+    if not _is_unsupported_parameter(exc) and "temperature" not in str(exc).lower():
+        return None
+    lowered = str(exc).lower()
+    if "temperature" in lowered and "temperature" in request:
+        return "temperature"
+    if "response_format" in request:
+        return "response_format"
+    return None
 
 
 def _translate(exc: Exception, provider: str, model: str) -> ProviderError:

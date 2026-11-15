@@ -48,24 +48,25 @@ class AnthropicProvider(LLMProvider):
     async def _complete(self, system: str, user: str, config: DetectionConfig) -> str:
         client = self._client()
         try:
+            # No assistant prefill and no ``temperature``: current Claude models
+            # (Sonnet 5, Opus 4.6+) reject a prefilled assistant turn with a
+            # 400, and the API version the installed SDK sends (2026-10-21)
+            # rejects sampling parameters on every model — either one made
+            # every window fail, so the job reported "no clips found". Prose or
+            # fences around the JSON are handled by extract_json_object.
+            # max_tokens leaves room for the adaptive thinking these models run
+            # by default, which counts against the same ceiling.
             message = await client.messages.create(
                 model=self.model,
-                max_tokens=4096,
-                temperature=config.temperature,
+                max_tokens=16000,
                 system=system,
-                messages=[
-                    {"role": "user", "content": user},
-                    # Prefilling the assistant turn with an opening brace is the
-                    # cheapest way to stop Claude prepending a sentence of prose.
-                    {"role": "assistant", "content": "{"},
-                ],
+                messages=[{"role": "user", "content": user}],
             )
         except Exception as exc:
             raise _translate(exc, self.name, self.model) from exc
 
-        text = "".join(block.text for block in message.content if hasattr(block, "text"))
-        # Put back the brace we prefilled.
-        return "{" + text
+        # Thinking blocks carry no ``text``; only the answer is wanted.
+        return "".join(block.text for block in message.content if hasattr(block, "text"))
 
     async def health_check(self) -> ProviderStatus:
         if not self.api_key:

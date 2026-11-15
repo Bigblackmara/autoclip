@@ -281,31 +281,53 @@ def extract_json_object(raw: str) -> dict[str, Any]:
 
 
 def _json_by_brace_matching(text: str) -> Any:
-    """Extract the first balanced ``{...}`` or ``[...]`` region and parse it."""
+    """Extract the first balanced ``{...}`` or ``[...]`` region that parses.
+
+    Top-level regions are tried in turn, not just the first. Models write
+    prose such as "each clip is {start, end}:" before the real object, and
+    giving up on that first unparseable region cost a retry round-trip — and
+    the whole window when the retry was phrased the same way.
+
+    The search never descends into a region: after an unparseable one it
+    resumes past its end, and an unclosed (truncated) one ends the search.
+    Otherwise a truncated reply would yield its first complete inner clip
+    object, which validates as "no clips" instead of triggering the retry.
+    """
     for opener, closer in (("{", "}"), ("[", "]")):
         start = text.find(opener)
-        if start == -1:
-            continue
-        depth = 0
-        in_string = False
-        escaped = False
-        for i in range(start, len(text)):
-            char = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-            elif char == opener:
-                depth += 1
-            elif char == closer:
-                depth -= 1
-                if depth == 0:
-                    return json.loads(text[start : i + 1])
+        while start != -1:
+            region = _balanced_region(text, start, opener, closer)
+            if region is None:
+                break
+            try:
+                return json.loads(region)
+            except json.JSONDecodeError:
+                start = text.find(opener, start + len(region))
 
     raise ValueError("No JSON object found in the response.")
+
+
+def _balanced_region(text: str, start: int, opener: str, closer: str) -> str | None:
+    """The balanced region opening at ``start``, or None if it never closes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None

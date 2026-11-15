@@ -101,6 +101,39 @@ class JobWorkspace:
         return self.root / "captions"
 
 
+#: Settings a job can override at creation time (see ``api.jobs``), as
+#: ``(section, field)`` pairs. Everything else — provider models, base URLs,
+#: encoder choice — comes from the current settings, so a retry after fixing
+#: a bad endpoint in settings picks the fix up.
+JOB_SCOPED_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("whisper", "model"),
+    ("whisper", "language"),
+    ("whisper", "diarization"),
+    ("clips", "min_duration_s"),
+    ("clips", "max_duration_s"),
+    ("clips", "max_clips"),
+    ("export", "caption_style"),
+    ("export", "ratio"),
+)
+
+
+def settings_for_job(job: Job) -> Settings:
+    """Current settings with the job's own choices layered on top.
+
+    The web API snapshots per-job overrides (clip lengths, clip count, ratio,
+    caption style, Whisper model) into ``job.settings``, but the queue built
+    its runner from the global settings alone — so every override chosen in
+    the UI was silently ignored.
+    """
+    settings = load_settings()
+    snapshot = job.settings or {}
+    for section, name in JOB_SCOPED_SETTINGS:
+        value = (snapshot.get(section) or {}).get(name)
+        if value is not None:
+            setattr(getattr(settings, section), name, value)
+    return settings
+
+
 class PipelineRunner:
     """Executes one job."""
 
@@ -115,7 +148,7 @@ class PipelineRunner:
     ) -> None:
         self.job = job
         self.source = source
-        self.settings = settings or load_settings()
+        self.settings = settings or settings_for_job(job)
         self.on_progress = on_progress
         self._is_cancelled = is_cancelled or (lambda: False)
         self.workspace = JobWorkspace(job.id)
@@ -184,6 +217,16 @@ class PipelineRunner:
             store.update_job(self.job.id, status="cancelled", finished_at=utcnow(), progress=0.0)
             raise
         except Exception as exc:
+            if self._is_cancelled():
+                # Stages abort their own long-running work when cancelled —
+                # ffmpeg raises ``ffmpeg.Cancelled``, Whisper a
+                # TranscriptionError — and those are not JobCancelled. Without
+                # this, cancelling mid-transcription or mid-render left the job
+                # marked "failed" with a "cancelled" error message.
+                store.update_job(
+                    self.job.id, status="cancelled", finished_at=utcnow(), progress=0.0
+                )
+                raise JobCancelled("Job cancelled.") from exc
             log.exception("Job %s failed.", self.job.id)
             store.update_job(self.job.id, status="failed", error=str(exc), finished_at=utcnow())
             raise
@@ -207,6 +250,7 @@ class PipelineRunner:
                 self.workspace.audio,
                 duration_s=self.source.duration_s,
                 on_progress=self._stage_progress(stage),
+                cancelled=self._is_cancelled,
             )
 
         if self.source.has_video and not self.workspace.thumbnails.exists():
@@ -365,10 +409,16 @@ class PipelineRunner:
         for index, clip in enumerate(clips):
             self._check_cancelled()
 
+            if self._already_exported(clip, ratio):
+                # A retry after a failure at clip 7 must not re-render clips
+                # 1-6 (minutes each) or stack duplicate export records on them.
+                self._emit(stage, (index + 1) / len(clips), f"Exporting clip {index + 1}")
+                continue
+
             crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
             words = transcript.slice(clip.start_word, clip.end_word)
             destination = destination_dir / export.output_filename(
-                clip.title or f"clip-{clip.rank}", ratio
+                clip.title or f"clip-{clip.rank}", ratio, rank=clip.rank
             )
 
             request = export.ExportRequest(
@@ -380,6 +430,7 @@ class PipelineRunner:
                 words=words,
                 style=style,
                 ratio=ratio,
+                has_video=self.source.has_video,
             )
 
             def clip_progress(fraction: float, i: int = index) -> None:
@@ -406,6 +457,16 @@ class PipelineRunner:
             store.update_clip(clip.id, status="exported")
 
         self._finish_stage(stage)
+
+    @staticmethod
+    def _already_exported(clip: Clip, ratio: str) -> bool:
+        """True when an earlier run of this job already rendered ``clip``."""
+        if clip.status != "exported":
+            return False
+        return any(
+            record.ratio == ratio and Path(record.path).exists()
+            for record in store.list_exports(clip.id)
+        )
 
     def _fallback_crop_path(self, clip: Clip, ratio: str) -> CropPath:
         """Centre crop for sources with no reframe data (audio-only, or a failure)."""

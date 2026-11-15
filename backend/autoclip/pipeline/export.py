@@ -56,6 +56,9 @@ class ExportRequest:
     style: CaptionStyle
     ratio: str = "9:16"
     burn_captions: bool = True
+    #: False for audio-only sources (podcasts, voice memos). The clip is then
+    #: rendered as captions over a generated solid background.
+    has_video: bool = True
 
     @property
     def duration_s(self) -> float:
@@ -75,8 +78,19 @@ def slugify_title(title: str, *, max_length: int = 50) -> str:
     return slug[:max_length] or "clip"
 
 
-def output_filename(title: str, ratio: str) -> str:
-    return f"{slugify_title(title)}_{ratio.replace(':', 'x')}.mp4"
+def output_filename(title: str, ratio: str, *, rank: int | None = None) -> str:
+    """Output name for a clip; ``rank`` keeps one job's clips apart.
+
+    All of a job's clips render into one directory, and titles collide more
+    than you'd think: the model reuses a title, two titles slug the same
+    ("Wait... what?!" / "wait what"), and emoji-only titles all become
+    ``clip``. Without the rank the later clip silently overwrote the earlier
+    one's file, leaving two export records pointing at one video.
+    """
+    stem = slugify_title(title)
+    if rank is not None:
+        stem = f"{rank:02d}-{stem}"
+    return f"{stem}_{ratio.replace(':', 'x')}.mp4"
 
 
 # --------------------------------------------------------------------------
@@ -92,6 +106,15 @@ def build_video_filtergraph(
 ) -> str:
     """Build the ``-filter_complex`` video chain for one clip."""
     out_w, out_h = ratio_dimensions(request.ratio)
+    if not request.has_video:
+        return _captions_chain(
+            request,
+            "[1:v]setsar=1,format=yuv420p[vbg]",
+            "[vbg]",
+            subtitle_name=subtitle_name,
+            fonts_name=fonts_name,
+        )
+
     segments = request.crop_path.segments
     if not segments:
         raise ExportError("The crop path has no segments.")
@@ -133,14 +156,27 @@ def build_video_filtergraph(
         parts.append(f"{''.join(labels)}concat=n={len(segments)}:v=1:a=0[vcat]")
         current = "[vcat]"
 
+    return _captions_chain(
+        request, ";".join(parts), current, subtitle_name=subtitle_name, fonts_name=fonts_name
+    )
+
+
+def _captions_chain(
+    request: ExportRequest,
+    graph: str,
+    current: str,
+    *,
+    subtitle_name: str | None,
+    fonts_name: str,
+) -> str:
+    """Append the caption burn (or a pass-through) producing ``[vout]``."""
     if request.burn_captions and subtitle_name is not None:
         # Bare relative names — ffmpeg runs with its cwd set to the render
         # workspace, so there is nothing here that needs escaping.
-        parts.append(f"{current}ass=filename={subtitle_name}:fontsdir={fonts_name}[vout]")
+        tail = f"{current}ass=filename={subtitle_name}:fontsdir={fonts_name}[vout]"
     else:
-        parts.append(f"{current}null[vout]")
-
-    return ";".join(parts)
+        tail = f"{current}null[vout]"
+    return f"{graph};{tail}"
 
 
 def _fit_chain(source_label: str, index: int, out_w: int, out_h: int) -> list[str]:
@@ -263,6 +299,21 @@ def export_clip(
 
     request.destination.parent.mkdir(parents=True, exist_ok=True)
 
+    # Audio-only sources have no [0:v] for the filtergraph to read, and the
+    # render failed with "Stream specifier ':v' matches no streams" for every
+    # uploaded podcast or voice memo. A generated solid frame stands in as
+    # input 1, cut to the clip length so the output ends with the audio.
+    background_input: list[str] = []
+    if not request.has_video:
+        background_input = [
+            "-f",
+            "lavfi",
+            "-t",
+            f"{request.duration_s:.4f}",
+            "-i",
+            f"color=c=black:s={out_w}x{out_h}:r=30",
+        ]
+
     # Input and output paths are ordinary argv arguments, so they stay absolute
     # and need no escaping regardless of the working directory.
     def render_args(video_args: list[str]) -> list[str]:
@@ -276,6 +327,7 @@ def export_clip(
             f"{request.duration_s:.4f}",
             "-i",
             str(request.source),
+            *background_input,
             "-filter_complex",
             filtergraph,
             "-map",

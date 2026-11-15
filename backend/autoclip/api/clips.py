@@ -199,7 +199,9 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     destination = (
         paths.exports_dir()
         / clip.job_id
-        / export_module.output_filename(clip.title or f"clip-{clip.rank}", payload.ratio)
+        / export_module.output_filename(
+            clip.title or f"clip-{clip.rank}", payload.ratio, rank=clip.rank
+        )
     )
 
     request = export_module.ExportRequest(
@@ -211,6 +213,7 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         words=words,
         style=style,
         ratio=payload.ratio,
+        has_video=source.has_video,
     )
 
     try:
@@ -306,17 +309,49 @@ def _load_transcript(job_id: str) -> Transcript:
     return Transcript.load(workspace.transcript)
 
 
+#: Slack for the cached crop path's span versus the clip duration, covering
+#: float round-tripping through JSON — far below any real trim.
+_CROP_DURATION_TOLERANCE_S = 0.05
+
+#: Slack for a crop window's aspect ratio: windows are forced to even pixel
+#: sizes, which moves 9:16 on a 1080p source by well under 1 %.
+_CROP_ASPECT_TOLERANCE = 0.02
+
+
+def _crop_path_fits(path: CropPath, duration_s: float, aspect: tuple[int, int]) -> bool:
+    """Whether a cached crop path was built for this clip span and ratio."""
+    if not path.segments or abs(path.duration_s - duration_s) > _CROP_DURATION_TOLERANCE_S:
+        return False
+    target = aspect[0] / aspect[1]
+    for segment in path.segments:
+        # Fit segments letterbox the whole frame and suit any output ratio.
+        if segment.fit or not segment.height:
+            continue
+        if abs(segment.width / segment.height - target) > target * _CROP_ASPECT_TOLERANCE:
+            return False
+    return True
+
+
 def _crop_path_for(workspace: JobWorkspace, clip, source, ratio: str) -> CropPath:
     """Reuse the job's cached crop path, falling back to a centre crop.
 
     A re-export at a different ratio can't reuse a path computed for the
     original one, so the geometry is recomputed rather than stretched.
-    """
-    cached = workspace.crop_path(clip.id)
-    if cached.exists() and ratio == "9:16":
-        return CropPath.load(cached)
 
+    The cache is checked against what it was built for, not assumed: it is
+    computed at the *job's* ratio (not always 9:16) and for the clip's
+    boundaries at reframe time. Reusing a 1:1 path for a 9:16 export
+    stretched every frame, and reusing a path after the user trimmed the
+    clip shifted the framing in time and cut the video short of the audio
+    (or trimmed into an empty segment) once the duration changed.
+    """
     aspect = {"9:16": (9, 16), "1:1": (1, 1), "16:9": (16, 9)}[ratio]
+    cached = workspace.crop_path(clip.id)
+    if cached.exists():
+        path = CropPath.load(cached)
+        if _crop_path_fits(path, clip.end_s - clip.start_s, aspect):
+            return path
+
     return centre_crop(
         source.width or 1920,
         source.height or 1080,

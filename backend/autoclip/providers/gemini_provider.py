@@ -17,6 +17,12 @@ SUGGESTED_MODELS = [
     "gemini-1.5-flash",
 ]
 
+#: Per-request ceiling in milliseconds (google-genai's unit), matching the
+#: Anthropic and OpenAI SDK defaults of ten minutes.
+_REQUEST_TIMEOUT_MS = 600_000
+#: Total attempts including the first; retries cover 429 and 5xx responses.
+_REQUEST_ATTEMPTS = 3
+
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
@@ -39,7 +45,19 @@ class GeminiProvider(LLMProvider):
                 provider=self.name,
                 hint="Add one with `autoclip config set-secret gemini`.",
             )
-        return genai.Client(api_key=self.api_key)
+        from google.genai import types
+
+        # google-genai builds its httpx client with ``timeout=None`` and no
+        # retries unless told otherwise. The call runs in a worker thread that
+        # cannot be cancelled, so one stalled connection hung the highlight
+        # stage — and the whole job queue behind it — forever.
+        return genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(
+                timeout=_REQUEST_TIMEOUT_MS,
+                retry_options=types.HttpRetryOptions(attempts=_REQUEST_ATTEMPTS),
+            ),
+        )
 
     async def _complete(self, system: str, user: str, config: DetectionConfig) -> str:
         from google.genai import types
