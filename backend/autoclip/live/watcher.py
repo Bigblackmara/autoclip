@@ -81,8 +81,10 @@ from typing import Any
 from . import events, store
 from .buffer import (  # noqa: F401  (PENDING_CAP_BYTES: manager)
     PENDING_CAP_BYTES,
+    RECENT_SEGMENTS,
     SEGMENT_S,
     RingBuffer,
+    adaptive_timeout_s,
     discard_segment_files,
     segment_index_at,
 )
@@ -95,6 +97,21 @@ from .signals import DetectorSignal, SignalKind, SignalWindow
 from .states import StreamState, can_transition, is_terminal
 
 log = logging.getLogger(__name__)
+
+
+def _recent_segment_max(buffer: Any) -> float | None:
+    """Longest recent real segment of a buffer (or a double); None if unknown."""
+    if buffer is None:
+        return None
+    method = getattr(buffer, "recent_segment_max_s", None)
+    with contextlib.suppress(Exception):
+        if callable(method):
+            value = method()
+            return None if value is None else float(value)
+        segments = list(getattr(buffer, "segments", None) or [])[-RECENT_SEGMENTS:]
+        if segments:
+            return max(float(getattr(seg, "duration_s", SEGMENT_S)) for seg in segments)
+    return None
 
 
 def _segment_start(segment: Any) -> float:
@@ -131,8 +148,14 @@ TRIM_MIN_S = 10.0
 #: when no segment commit is observable (minimal test captures/buffers).
 HEALTHY_AFTER_S = 60.0
 #: Extra stream seconds a candidate waits, beyond the post-roll, for the
-#: buffer to commit the end of its window before cutting it anyway.
+#: buffer to commit the end of its window before cutting it anyway. This is
+#: the BASE (4 nominal segments): the segment holding the window end only
+#: commits once it closes, i.e. up to one REAL segment later, so the live
+#: grace is COVERAGE_GRACE_SEGMENTS × the longest recent real segment when
+#: that is longer (long-GOP streams), capped at COVERAGE_GRACE_CEILING_S.
 COVERAGE_GRACE_S = 4 * SEGMENT_S
+COVERAGE_GRACE_SEGMENTS = 3.0
+COVERAGE_GRACE_CEILING_S = 90.0
 #: Poll interval of that wait (real time).
 COVERAGE_POLL_S = 0.5
 #: How long teardown waits for a capture's stop (tree kill + thread joins).
@@ -401,7 +424,7 @@ class WatcherDeps:
     #: () -> (ok, reason) — disk admission for a new candidate (manager).
     admit_candidate: Callable[[], tuple[bool, str]] | None = None
     #: Max wait (s) for the buffer to cover a window's post-roll; None =
-    #: post_roll_s + COVERAGE_GRACE_S.
+    #: post_roll_s + the adaptive coverage grace (see COVERAGE_GRACE_S).
     coverage_timeout_s: float | None = None
 
 
@@ -1484,6 +1507,19 @@ class StreamWatcher:
                 return _segment_start(newest) + duration
         return None
 
+    def _coverage_timeout_s(self) -> float:
+        """Max wait for a window's post-roll: injected, else post-roll + grace."""
+        timeout = self._deps.coverage_timeout_s
+        if timeout is not None:
+            return float(timeout)
+        grace = adaptive_timeout_s(
+            COVERAGE_GRACE_S,
+            _recent_segment_max(self._buffer),
+            segments=COVERAGE_GRACE_SEGMENTS,
+            ceiling_s=COVERAGE_GRACE_CEILING_S,
+        )
+        return float(self._live.rolling_buffer.post_roll_s) + grace
+
     async def _await_coverage(self, end_s: float) -> None:
         """Wait (bounded) until the buffer holds the window's post-roll.
 
@@ -1493,14 +1529,14 @@ class StreamWatcher:
         Gives up when the capture is gone (nothing more will arrive), on
         stop, or after the timeout — then the cut takes what exists.
         """
-        timeout = self._deps.coverage_timeout_s
-        if timeout is None:
-            timeout = float(self._live.rolling_buffer.post_roll_s) + COVERAGE_GRACE_S
-        deadline = time.monotonic() + max(0.0, float(timeout))
+        started = time.monotonic()
         while not self._stopping:
             covered = self._buffer_covered_until()
             if covered is None or covered >= end_s - 1e-6:
                 return
+            # Re-read each poll: the grace follows the real segment lengths
+            # (a long-GOP stream commits a segment only every ~GOP seconds).
+            deadline = started + max(0.0, self._coverage_timeout_s())
             if self._capture is None or time.monotonic() >= deadline:
                 log.info(
                     "Stream %s: window end %.1fs not captured (have %.1fs); cutting anyway.",

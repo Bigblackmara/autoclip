@@ -11,16 +11,33 @@ import json
 import logging
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .buffer import SEGMENT_S
 
 log = logging.getLogger(__name__)
 
 
 class LiveRollingBufferSettings(BaseModel):
-    #: Target seconds per .ts segment (capture currently always asks ffmpeg
-    #: for buffer.SEGMENT_S). Real segments are keyframe-cut and vary; the
-    #: buffer times clips from their real lengths, never from this.
-    segment_s: float = 6.0
+    #: READ-ONLY report of the ``-segment_time`` capture asks ffmpeg for
+    #: (buffer.SEGMENT_S); the UI shows it as "segments of about N s". It is
+    #: not a knob: the buffer's nominal fallbacks (a segment with no real
+    #: length) are tied to SEGMENT_S, so any stored value is pinned back to
+    #: it on load. Real segments are keyframe-cut and vary; clips are timed
+    #: from their real lengths, and the stall/coverage timers adapt to them.
+    segment_s: float = SEGMENT_S
+
+    @field_validator("segment_s", mode="after")
+    @classmethod
+    def _pin_segment_s(cls, value: float) -> float:
+        if value != SEGMENT_S:
+            log.warning(
+                "live.rolling_buffer.segment_s=%s ignored: capture always records %s s segments",
+                value,
+                SEGMENT_S,
+            )
+        return SEGMENT_S
+
     #: How much of the stream to keep on disk, in minutes.
     retain_minutes: float = 5.0
     #: Hard disk cap for ONE stream's buffer, megabytes.
