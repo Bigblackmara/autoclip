@@ -196,10 +196,35 @@ class LLMProvider(ABC):
     def _parse(self, raw: str, window: TranscriptWindow) -> ClipCandidates:
         """Validate a raw response and clamp indices into the window."""
         payload = extract_json_object(raw)
-        candidates = ClipCandidates.model_validate(payload)
+        items = payload.get("clips", [])
+        if not isinstance(items, list):
+            raise ValueError(f'"clips" must be a list, got {type(items).__name__}.')
+
+        # Items are validated one at a time. Validating the list as a whole
+        # meant one slip (a missing index, a negative one, a string where a
+        # number goes) threw away every good clip in the same reply, and a
+        # retry that repeated the slip lost the whole window.
+        valid: list[ClipCandidate] = []
+        problems: list[str] = []
+        for position, item in enumerate(items):
+            try:
+                valid.append(ClipCandidate.model_validate(item))
+            except ValidationError as exc:
+                problems.append(f"clips[{position}]: {exc}")
+        if problems:
+            if not valid:
+                # Nothing usable: raise so the caller retries with the errors.
+                raise ValueError("\n".join(problems))
+            log.warning(
+                "%s: dropped %d malformed clip item(s) of %d.\n%s",
+                self.name,
+                len(problems),
+                len(items),
+                "\n".join(problems),
+            )
 
         cleaned: list[ClipCandidate] = []
-        for candidate in candidates.clips:
+        for candidate in valid:
             start = max(window.first_word, min(candidate.start_word_index, window.last_word))
             end = max(window.first_word, min(candidate.end_word_index, window.last_word))
             if end <= start:

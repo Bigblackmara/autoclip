@@ -33,6 +33,30 @@ RECOMMENDED_MODELS = [
 #: Highlight detection over an 8-minute window is slow on consumer hardware.
 _REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
 
+#: Context window bounds, in tokens. Ollama's default context (2048 or 4096
+#: depending on version) is smaller than one transcript window, and Ollama
+#: drops the FRONT of an over-long prompt without an error — the system prompt
+#: with the JSON schema first — so the model answered without its instructions.
+MIN_NUM_CTX = 8192
+MAX_NUM_CTX = 32768
+#: Conservative characters-per-token for the ``[index]word`` transcript format
+#: (digits and brackets tokenize worse than prose).
+_CHARS_PER_TOKEN = 3.5
+#: Room for the reply: a full clip list is a few hundred tokens per clip.
+_REPLY_TOKENS = 2048
+
+
+def context_tokens(system: str, user: str) -> int:
+    """A ``num_ctx`` that holds the whole prompt plus the reply.
+
+    Rounded up to a power of two (the sizes runners allocate KV cache in
+    comfortably) and clamped: the floor avoids reloading the model for every
+    small prompt, the ceiling keeps the KV cache inside consumer VRAM.
+    """
+    needed = int((len(system) + len(user)) / _CHARS_PER_TOKEN) + _REPLY_TOKENS
+    size = 1 << max(0, needed - 1).bit_length()
+    return max(MIN_NUM_CTX, min(MAX_NUM_CTX, size))
+
 
 class OllamaProvider(LLMProvider):
     name = "ollama"
@@ -61,7 +85,10 @@ class OllamaProvider(LLMProvider):
             # Ollama's JSON mode constrains decoding to valid JSON, which is the
             # single biggest reliability win for small local models.
             "format": "json",
-            "options": {"temperature": config.temperature},
+            "options": {
+                "temperature": config.temperature,
+                "num_ctx": context_tokens(system, user),
+            },
         }
 
         try:

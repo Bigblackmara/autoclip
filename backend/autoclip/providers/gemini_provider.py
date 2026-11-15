@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import logging
 
 from .base import DetectionConfig, LLMProvider, ProviderError, ProviderStatus
@@ -22,6 +24,18 @@ SUGGESTED_MODELS = [
 _REQUEST_TIMEOUT_MS = 600_000
 #: Total attempts including the first; retries cover 429 and 5xx responses.
 _REQUEST_ATTEMPTS = 3
+
+#: The blocking SDK calls run here rather than on the event loop's default
+#: executor. A cancelled job abandons its in-flight request, but the thread
+#: can't be interrupted, and the batch runner's ``asyncio.run`` joins the
+#: default executor on exit — so a cancel still waited out the request (up to
+#: three ten-minute attempts). Threads here are not joined by the loop.
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
+
+
+async def _in_thread(func, /, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXECUTOR, functools.partial(func, *args, **kwargs))
 
 
 class GeminiProvider(LLMProvider):
@@ -75,7 +89,7 @@ class GeminiProvider(LLMProvider):
             # The SDK's async surface has moved between releases; running the
             # sync call in a thread works across all of them and keeps the event
             # loop free.
-            response = await asyncio.to_thread(
+            response = await _in_thread(
                 client.models.generate_content,
                 model=self.model,
                 contents=user,
@@ -93,7 +107,7 @@ class GeminiProvider(LLMProvider):
             )
         try:
             client = self._client()
-            models = await asyncio.to_thread(lambda: list(client.models.list()))
+            models = await _in_thread(lambda: list(client.models.list()))
             names = sorted(
                 m.name.removeprefix("models/") for m in models if getattr(m, "name", None)
             )[:50]

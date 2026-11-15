@@ -298,9 +298,37 @@ def _build_ass_style(style: CaptionStyle, *, height: int, scale: float) -> pysub
     return ass_style
 
 
+#: U+2060 WORD JOINER: default-ignorable, so libass (shaping through HarfBuzz)
+#: draws nothing for it, whatever the font. See :func:`escape_ass_text`.
+_INERT = "⁠"
+
+
+def escape_ass_text(text: str) -> str:
+    r"""Make transcript text render literally inside an ASS Dialogue line.
+
+    Event text is ASS markup, not plain text: ``{`` opens an override block,
+    and ``\N`` / ``\n`` / ``\h`` are a line break, a soft break and a hard
+    space. A word such as ``{laughs}`` vanished from the burned caption, a
+    backslash before n/N/h broke the line, and a word ending in a backslash
+    paired with the ``{`` of the highlight tag after it (``\{`` is an escape),
+    so the tag itself was drawn on screen as text.
+
+    ASS has no general escape, so two mechanisms are combined, both checked
+    against real libass renders: an invisible word joiner after every
+    backslash, which stops it pairing with whatever follows; then libass's own
+    ``\{`` and ``\}`` escapes, which draw identically to bare braces. Real
+    newlines and tabs become spaces — pysubs2 writes event text raw, and a
+    newline would end the Dialogue line mid-caption.
+    """
+    text = " ".join(text.split())
+    text = text.replace("\\", "\\" + _INERT)
+    return text.replace("{", "\\{").replace("}", "\\}")
+
+
 def _text_of(word: Word, style: CaptionStyle) -> str:
     text = word.text.strip()
-    return text.upper() if style.all_caps else text
+    # Escape after upper-casing: upper() would turn an escaped "\n" into "\N".
+    return escape_ass_text(text.upper() if style.all_caps else text)
 
 
 def _event(start_s: float, end_s: float, text: str, offset: float) -> pysubs2.SSAEvent:
@@ -391,9 +419,13 @@ def write_srt(path: Path, words: list[Word], *, time_offset_s: float = 0.0) -> P
             pysubs2.SSAEvent(
                 start=pysubs2.make_time(s=max(0.0, group.start - time_offset_s)),
                 end=pysubs2.make_time(s=max(0.0, group.end - time_offset_s)),
-                text=group.text,
+                # pysubs2 treats event text as ASS markup when writing SRT: it
+                # strips {...} as override tags and turns \N, \n and \h into
+                # breaks and spaces. The joiner after each backslash keeps
+                # those literal; keep_ssa_tags below keeps the braces.
+                text=" ".join(group.text.split()).replace("\\", "\\" + _INERT),
             )
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    subs.save(str(path), encoding="utf-8", format_="srt")
+    subs.save(str(path), encoding="utf-8", format_="srt", keep_ssa_tags=True)
     return path

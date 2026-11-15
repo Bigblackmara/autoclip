@@ -9,6 +9,7 @@ tight single to sit in one clip without a mid-stream frame-size change.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -314,6 +315,14 @@ def export_clip(
             f"color=c=black:s={out_w}x{out_h}:r=30",
         ]
 
+    # ffmpeg writes a sibling ``.partial.mp4`` (same directory, so the final
+    # rename is atomic; still .mp4 so the muxer is inferred) that replaces the
+    # destination only once the render is complete. Rendering in place left a
+    # truncated, unplayable MP4 in the exports folder after every failed or
+    # cancelled render — and a failed re-export had already destroyed the good
+    # file it was replacing, because -y truncates the output at start-up.
+    partial = request.destination.with_name(request.destination.stem + ".partial.mp4")
+
     # Input and output paths are ordinary argv arguments, so they stay absolute
     # and need no escaping regardless of the working directory.
     def render_args(video_args: list[str]) -> list[str]:
@@ -347,7 +356,7 @@ def export_clip(
             str(AUDIO_SAMPLE_RATE),
             "-movflags",
             "+faststart",
-            str(request.destination),
+            str(partial),
         ]
 
     def run(video_args: list[str]) -> None:
@@ -359,31 +368,49 @@ def export_clip(
             cwd=render_cwd,
         )
 
-    video_args = encoder_args(settings)
     try:
-        run(video_args)
-    except ffmpeg.FFmpegError as exc:
-        uses_gpu = "h264_nvenc" in video_args
-        if not uses_gpu or (cancelled is not None and cancelled()):
-            raise ExportError(f"Could not render {request.destination.name}.\n{exc}") from exc
-        # NVENC passed the start-up probe but can still fail at run time
-        # (encoder sessions or GPU memory exhausted by other work). The CPU
-        # encoder gives the same quality, only slower.
-        log.warning(
-            "The GPU encoder failed for %s (%s); rendering on the CPU instead.",
-            request.destination.name,
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
-        )
-        cpu_settings = settings.model_copy(update={"prefer_hardware_encoder": False})
+        video_args = encoder_args(settings)
         try:
-            run(encoder_args(cpu_settings))
-        except ffmpeg.FFmpegError as cpu_exc:
-            raise ExportError(
-                f"Could not render {request.destination.name}.\n{cpu_exc}"
-            ) from cpu_exc
+            run(video_args)
+        except ffmpeg.FFmpegError as exc:
+            uses_gpu = "h264_nvenc" in video_args
+            if not uses_gpu or (cancelled is not None and cancelled()):
+                raise ExportError(f"Could not render {request.destination.name}.\n{exc}") from exc
+            # NVENC passed the start-up probe but can still fail at run time
+            # (encoder sessions or GPU memory exhausted by other work). The CPU
+            # encoder gives the same quality, only slower.
+            log.warning(
+                "The GPU encoder failed for %s (%s); rendering on the CPU instead.",
+                request.destination.name,
+                str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            )
+            cpu_settings = settings.model_copy(update={"prefer_hardware_encoder": False})
+            try:
+                run(encoder_args(cpu_settings))
+            except ffmpeg.FFmpegError as cpu_exc:
+                raise ExportError(
+                    f"Could not render {request.destination.name}.\n{cpu_exc}"
+                ) from cpu_exc
 
-    if not request.destination.exists() or request.destination.stat().st_size == 0:
-        raise ExportError(f"ffmpeg reported success but {request.destination.name} is empty.")
+        if not partial.exists() or partial.stat().st_size == 0:
+            raise ExportError(f"ffmpeg reported success but {request.destination.name} is empty.")
+        try:
+            os.replace(partial, request.destination)
+        except OSError as exc:
+            # Windows refuses to replace a file another program has open, e.g.
+            # the previous render playing in a media player.
+            raise ExportError(
+                f"Could not save {request.destination.name} ({exc}). "
+                "Close any program that has it open and try again."
+            ) from exc
+    except BaseException:
+        # Cancellation (ffmpeg.Cancelled, KeyboardInterrupt) included. Cleanup
+        # must not mask the real error, so an undeletable leftover is logged.
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove the partial render %s.", partial, exc_info=True)
+        raise
 
     if settings.write_srt and request.words:
         captions_module.write_srt(

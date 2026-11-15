@@ -12,6 +12,7 @@ buys back the clips that live on the seams.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 
@@ -36,8 +37,16 @@ HOSTED_CONCURRENCY = 3
 LOCAL_CONCURRENCY = 1
 
 
+#: How often an in-flight detection checks the job's cancel flag, in seconds.
+CANCEL_POLL_S = 0.25
+
+
 class HighlightError(RuntimeError):
     """Highlight detection produced nothing usable."""
+
+
+class DetectionCancelled(RuntimeError):
+    """The job was cancelled while windows were still being scored."""
 
 
 def build_windows(
@@ -127,8 +136,14 @@ async def detect(
     job_id: str,
     silences: list[Silence] | None = None,
     on_progress: Callable[[float], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[Clip]:
-    """Run detection across the whole transcript and return ranked clips."""
+    """Run detection across the whole transcript and return ranked clips.
+
+    ``cancelled`` is polled while windows are in flight; once it returns True
+    the outstanding provider calls are cancelled and DetectionCancelled is
+    raised.
+    """
     windows = build_windows(transcript)
     if not windows:
         raise HighlightError("The transcript is empty, so there is nothing to clip.")
@@ -163,7 +178,11 @@ async def detect(
                     on_progress(completed / len(windows))
             return candidates
 
-    results = await asyncio.gather(*(run_window(w) for w in windows))
+    gathered = asyncio.gather(*(run_window(w) for w in windows))
+    if cancelled is None:
+        results = await gathered
+    else:
+        results = await _unless_cancelled(gathered, cancelled)
     candidates = [c for group in results for c in group]
 
     if not candidates and len(errors) == len(windows):
@@ -182,6 +201,29 @@ async def detect(
 
     log.info("Providers proposed %d raw candidates.", len(candidates))
     return build_clips(transcript, candidates, config, job_id=job_id, silences=silences or [])
+
+
+async def _unless_cancelled(
+    gathered: asyncio.Future[list[list[ClipCandidate]]], cancelled: Callable[[], bool]
+) -> list[list[ClipCandidate]]:
+    """Await ``gathered``, cancelling it as soon as ``cancelled()`` is True.
+
+    The runner only checked its cancel flag between stages, so a cancel
+    during detection waited out every window — minutes per window on a local
+    model, up to the ten-minute request timeouts on a stalled hosted one —
+    before the job stopped.
+    """
+    while True:
+        done, _ = await asyncio.wait({gathered}, timeout=CANCEL_POLL_S)
+        if done:
+            return gathered.result()
+        if cancelled():
+            gathered.cancel()
+            # Let every window task unwind (closing its HTTP connection)
+            # before reporting, so nothing is left running on this loop.
+            with contextlib.suppress(asyncio.CancelledError):
+                await gathered
+            raise DetectionCancelled("Highlight detection was cancelled.")
 
 
 def build_clips(

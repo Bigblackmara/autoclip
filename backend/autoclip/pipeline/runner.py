@@ -336,6 +336,8 @@ class PipelineRunner:
             job_id=self.job.id,
             silences=silences,
             on_progress=self._stage_progress(stage),
+            # DetectionCancelled is turned into JobCancelled by run().
+            cancelled=self._is_cancelled,
         )
 
         store.replace_clips(self.job.id, clips)
