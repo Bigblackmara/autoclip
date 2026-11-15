@@ -1,19 +1,23 @@
 """Prepare stage — normalise media into what later stages expect.
 
 Produces a 16 kHz mono WAV (what Whisper wants), a thumbnail strip for UI
-scrubbing, and a silence map used later to place clip boundaries in audio
-troughs rather than mid-breath.
+scrubbing, a silence map used later to place clip boundaries in audio
+troughs rather than mid-breath, and a loudness profile that lets a clip's end
+run on through the reaction (the laugh, the scream) instead of cutting just
+before it.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import ffmpeg
 
@@ -39,6 +43,51 @@ class Silence:
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+
+#: Loudness values at or below this are treated as digital silence.
+LOUDNESS_FLOOR_LUFS = -120.0
+
+
+@dataclass
+class Loudness:
+    """Momentary loudness (EBU R128, 400 ms window) sampled every ``step_s``.
+
+    ebur128 emits one value per ``step_s`` frame; ``values[i]`` covers the
+    400 ms window that ends with frame ``i``, so its centre sits at
+    ``(i + 1) * step_s - WINDOW_S / 2``. :meth:`frames` reports those centres,
+    so callers can reason about "how loud is the audio around time t".
+    """
+
+    values: list[float]
+    step_s: float = 0.1
+
+    WINDOW_S = 0.4
+
+    def __bool__(self) -> bool:
+        return bool(self.values)
+
+    def _centre(self, index: int) -> float:
+        return (index + 1) * self.step_s - self.WINDOW_S / 2
+
+    def frames(self, start: float, end: float) -> list[tuple[float, float]]:
+        """``(centre_time, loudness)`` for every window centred in ``[start, end]``."""
+        if not self.values or end < start:
+            return []
+        offset = self.WINDOW_S / 2 - self.step_s
+        first = max(0, math.ceil((start + offset) / self.step_s - 1e-9))
+        last = min(len(self.values) - 1, math.floor((end + offset) / self.step_s + 1e-9))
+        return [(self._centre(i), self.values[i]) for i in range(first, last + 1)]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"step_s": self.step_s, "values": [round(v, 1) for v in self.values]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Loudness:
+        return cls(
+            values=[float(v) for v in data.get("values") or []],
+            step_s=float(data.get("step_s") or 0.1),
+        )
 
 
 def extract_audio(
@@ -169,3 +218,53 @@ def detect_silences(
             pending_start = None
 
     return silences
+
+
+_LOUDNESS_M = re.compile(r"lavfi\.r128\.M=(\S+)")
+
+
+def measure_loudness(audio: Path) -> Loudness:
+    """Measure momentary loudness every 100 ms with ffmpeg's ``ebur128``.
+
+    Streamers' reactions are loud: a cut placed right before a loudness spike
+    is the cut that loses the laugh. The boundary pass uses this profile to
+    carry a clip's end through the reaction. An empty profile (ffmpeg missing
+    or failing) simply disables that step.
+    """
+    try:
+        command = [
+            ffmpeg.ffmpeg_path(),
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            str(audio),
+            "-af",
+            "ebur128=metadata=1,ametadata=mode=print:key=lavfi.r128.M",
+            "-f",
+            "null",
+            "-",
+        ]
+        proc = subprocess.run(
+            command, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace"
+        )
+    except (OSError, ffmpeg.FFmpegError) as exc:
+        log.warning("Loudness measurement unavailable (%s); clip ends won't follow reactions.", exc)
+        return Loudness(values=[])
+    if proc.returncode != 0:
+        log.warning("ebur128 failed; clip ends won't follow reactions.")
+        return Loudness(values=[])
+    return parse_loudness(proc.stderr or "")
+
+
+def parse_loudness(log_text: str) -> Loudness:
+    """Parse ``ametadata`` print output into a 100 ms loudness profile."""
+    values: list[float] = []
+    for match in _LOUDNESS_M.finditer(log_text):
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            value = LOUDNESS_FLOOR_LUFS
+        if value != value or value < LOUDNESS_FLOOR_LUFS:  # nan or -inf
+            value = LOUDNESS_FLOOR_LUFS
+        values.append(value)
+    return Loudness(values=values, step_s=0.1)

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from ..db.models import Clip, new_id
 from ..providers import ClipCandidate, DetectionConfig, LLMProvider, TranscriptWindow
 from . import boundaries
-from .prepare import Silence
+from .prepare import Loudness, Silence
 from .transcript import Transcript
 
 log = logging.getLogger(__name__)
@@ -30,6 +30,10 @@ OVERLAP_S = 60
 
 #: Two candidates covering this much of the same words are the same clip.
 DEDUPE_IOU = 0.4
+
+#: Clips sharing no more than this much time merely touch: silence padding on
+#: both sides of a boundary can legitimately cross.
+OVERLAP_TOLERANCE_S = 0.5
 
 #: Hosted providers tolerate parallel windows; a local model is already
 #: saturating the GPU, so extra concurrency only adds contention.
@@ -135,6 +139,7 @@ async def detect(
     *,
     job_id: str,
     silences: list[Silence] | None = None,
+    loudness: Loudness | None = None,
     on_progress: Callable[[float], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> list[Clip]:
@@ -200,7 +205,9 @@ async def detect(
         )
 
     log.info("Providers proposed %d raw candidates.", len(candidates))
-    return build_clips(transcript, candidates, config, job_id=job_id, silences=silences or [])
+    return build_clips(
+        transcript, candidates, config, job_id=job_id, silences=silences or [], loudness=loudness
+    )
 
 
 async def _unless_cancelled(
@@ -233,6 +240,7 @@ def build_clips(
     *,
     job_id: str,
     silences: list[Silence] | None = None,
+    loudness: Loudness | None = None,
 ) -> list[Clip]:
     """Deduplicate, refine, rank, and truncate raw candidates into clips."""
     deduped = dedupe(candidates)
@@ -247,6 +255,8 @@ def build_clips(
             silences=silences or [],
             min_duration_s=config.min_duration_s,
             max_duration_s=config.max_duration_s,
+            hook=candidate.hook,
+            loudness=loudness,
         )
         if boundary is None:
             log.debug(
@@ -276,6 +286,7 @@ def build_clips(
 
     # Refinement can move edges enough that two survivors now overlap.
     clips = _dedupe_clips(clips)
+    clips = resolve_overlaps(clips, transcript, config)
     clips.sort(key=lambda c: c.score, reverse=True)
     clips = clips[: config.max_clips]
 
@@ -334,3 +345,84 @@ def _iou(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
         return 0.0
     union = (a_end - a_start + 1) + (b_end - b_start + 1) - intersection
     return intersection / union if union else 0.0
+
+
+def resolve_overlaps(
+    clips: list[Clip], transcript: Transcript, config: DetectionConfig
+) -> list[Clip]:
+    """Remove the partial overlaps that the IoU dedupe lets through.
+
+    On a real IShowSpeed stream two pairs survived dedupe while sharing 3.4 s
+    and 13.9 s of audio, so a viewer of both watched the same bit twice. Two
+    overlapping clips are one moment: they merge when the union still fits
+    ``max_duration_s`` (the better-scoring clip keeps its title). Otherwise the
+    weaker clip gives up the shared stretch at a sentence boundary, and is
+    dropped if what remains is shorter than ``min_duration_s``.
+    """
+    remaining = sorted(clips, key=lambda c: c.score, reverse=True)
+    kept: list[Clip] = []
+    while remaining:
+        clip = remaining.pop(0)
+        other = next((k for k in kept if _overlap_s(clip, k) > OVERLAP_TOLERANCE_S), None)
+        if other is None:
+            kept.append(clip)
+            continue
+        union_start = min(clip.start_s, other.start_s)
+        union_end = max(clip.end_s, other.end_s)
+        if union_end - union_start <= config.max_duration_s:
+            # ``other`` scored at least as high, so it absorbs ``clip``. It is
+            # re-queued so the grown clip is checked against the rest of kept.
+            kept.remove(other)
+            other.start_s, other.end_s = union_start, union_end
+            other.start_word = min(clip.start_word, other.start_word)
+            other.end_word = max(clip.end_word, other.end_word)
+            remaining.insert(0, other)
+            continue
+        trimmed = _trim_off(clip, other, transcript, config.min_duration_s)
+        if trimmed is None:
+            log.debug("Dropped clip %s: it overlaps %s and cannot be trimmed.", clip.id, other.id)
+        else:
+            remaining.insert(0, trimmed)
+    return kept
+
+
+def _overlap_s(a: Clip, b: Clip) -> float:
+    return min(a.end_s, b.end_s) - max(a.start_s, b.start_s)
+
+
+def _trim_off(
+    clip: Clip, keeper: Clip, transcript: Transcript, min_duration_s: float
+) -> Clip | None:
+    """Shorten ``clip`` on a sentence edge so it no longer overlaps ``keeper``."""
+    words = transcript.words
+    if clip.start_s >= keeper.start_s:
+        # The clip runs on past the keeper's end: start it after the keeper.
+        first = next(
+            (
+                i
+                for i in range(keeper.end_word + 1, clip.end_word)
+                if words[i - 1].ends_sentence and words[i].start >= keeper.end_s
+            ),
+            None,
+        )
+        if first is None:
+            return None
+        clip.start_word = first
+        clip.start_s = max(keeper.end_s, words[first].start - boundaries.FALLBACK_LEAD_S)
+    else:
+        # The clip leads into the keeper: end it before the keeper starts.
+        last = next(
+            (
+                i
+                for i in range(keeper.start_word - 1, clip.start_word, -1)
+                if words[i].ends_sentence and words[i].end <= keeper.start_s
+            ),
+            None,
+        )
+        if last is None:
+            return None
+        clip.end_word = last
+        clip.end_s = min(keeper.start_s, words[last].end + boundaries.FALLBACK_TAIL_S)
+    if clip.end_s - clip.start_s < min_duration_s:
+        return None
+    return clip

@@ -68,6 +68,13 @@ being validated against a fixed golden video set — see
 
 ### Fixed
 
+- **Clip boundaries** (measured on a real 2h44m stream, 38 clips): starts now
+  follow the model's verbatim hook instead of snapping back onto "But you know
+  what," / "And"; leading connectives are stripped; unpunctuated ends no longer
+  stop on a function word; padding never runs into the neighbouring word; a loud
+  reaction right after the last line (measured with ebur128, cached as
+  `loudness.json`) is kept, up to 4 s and within the max length; partially
+  overlapping clips are merged or trimmed instead of both shipping.
 - **YouTube downloads**: yt-dlp is given every installed JavaScript runtime
   (Deno, Node, Bun) for YouTube's player challenge, and `yt-dlp[default]` is a
   dependency. HTTP 403/429 and "only images available" now explain that YouTube

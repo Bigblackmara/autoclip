@@ -18,6 +18,12 @@ Judge every candidate against four things, in this order of importance:
 
 Start on the first word of a complete thought. End on the last word of a complete thought — ideally the strongest line, not the trailing qualification after it. Never start or end mid-sentence.
 
+`start_word_index` is the first word of your `hook`. Do not begin on a connective ("and", "but", "so") or on a reply to a question the clip does not contain — start on the question.
+
+When the payoff is followed by a reaction — laughter, shouting, "bro!", a scream, the other person's comeback — end after the reaction lands, not on the line before it. A reaction is the payoff; cutting it is the most common way to ruin a clip. Stop before the next topic starts.
+
+Clips must not overlap. If two moments share lines, return them as one clip.
+
 Do not extend a clip to reach a length target. A tight 25-second clip beats a padded 60-second one. Do not merge two unrelated good moments into one clip to make it longer.
 
 ## Scoring

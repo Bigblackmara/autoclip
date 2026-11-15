@@ -26,7 +26,7 @@ from ..db.models import Clip, Export, Job, Source, new_id, utcnow
 from ..db.models import Transcript as TranscriptRow
 from ..providers import build_provider, detection_config
 from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
-from .prepare import Silence
+from .prepare import Loudness, Silence
 from .reframe import ReframeConfig, build_crop_path
 from .reframe.croppath import CropPath
 from .transcript import Transcript
@@ -88,6 +88,10 @@ class JobWorkspace:
     @property
     def silences(self) -> Path:
         return self.root / "silences.json"
+
+    @property
+    def loudness(self) -> Path:
+        return self.root / "loudness.json"
 
     @property
     def thumbnails(self) -> Path:
@@ -209,7 +213,7 @@ class PipelineRunner:
             audio = self._stage_prepare()
             transcript = self._stage_transcribe(audio)
             silences = self._load_or_detect_silences(audio)
-            clips = await self._stage_highlights(transcript, silences)
+            clips = await self._stage_highlights(transcript, silences, audio)
             crop_paths = self._stage_reframe(clips, transcript)
             self._stage_captions(clips, transcript)
             self._stage_export(clips, transcript, crop_paths)
@@ -312,8 +316,22 @@ class PipelineRunner:
         )
         return silences
 
+    def _load_or_measure_loudness(self, audio: Path) -> Loudness:
+        if self.workspace.loudness.exists():
+            try:
+                raw = json.loads(self.workspace.loudness.read_text(encoding="utf-8"))
+                return Loudness.from_dict(raw)
+            except (ValueError, TypeError, AttributeError):
+                log.warning("Ignoring an unreadable loudness profile; measuring again.")
+
+        loudness = prepare.measure_loudness(audio)
+        # An empty profile means ffmpeg failed; don't cache that, retry next run.
+        if loudness:
+            self.workspace.loudness.write_text(json.dumps(loudness.to_dict()), encoding="utf-8")
+        return loudness
+
     async def _stage_highlights(
-        self, transcript: Transcript, silences: list[Silence]
+        self, transcript: Transcript, silences: list[Silence], audio: Path | None = None
     ) -> list[Clip]:
         stage = Stage.HIGHLIGHTS
         self._check_cancelled()
@@ -329,12 +347,14 @@ class PipelineRunner:
         config = detection_config(self.settings)
 
         self._emit(stage, 0.0, f"Finding highlights with {provider.name}")
+        loudness = self._load_or_measure_loudness(audio) if audio is not None else None
         clips = await highlights.detect(
             transcript,
             provider,
             config,
             job_id=self.job.id,
             silences=silences,
+            loudness=loudness,
             on_progress=self._stage_progress(stage),
             # DetectionCancelled is turned into JobCancelled by run().
             cancelled=self._is_cancelled,
