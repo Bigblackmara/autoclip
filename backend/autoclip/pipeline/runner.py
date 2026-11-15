@@ -29,7 +29,16 @@ from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
 from .prepare import Loudness, Silence
 from .reframe import ReframeConfig, build_crop_path
 from .reframe.croppath import CropPath
-from .reframe.facecam import Facecam, detect_facecam, load_detection, save_detection
+from .reframe.facecam import (
+    CamPrior,
+    Facecam,
+    build_cam_prior,
+    detect_facecam,
+    load_detection,
+    load_prior,
+    save_detection,
+    save_prior,
+)
 from .reframe.faces import FaceDetectionUnavailable
 from .transcript import Transcript
 
@@ -107,6 +116,11 @@ class JobWorkspace:
         return self.root / "facecam" / f"{clip_id}.json"
 
     @property
+    def facecam_prior(self) -> Path:
+        """Cached home-cam prior for the job's source (``null`` when there is none)."""
+        return self.root / "facecam" / "source-prior.json"
+
+    @property
     def captions_dir(self) -> Path:
         return self.root / "captions"
 
@@ -142,8 +156,9 @@ def facecam_for_clip(
 
     Detection runs per clip rather than once per source: a long stream
     changes layout — lobby, match, a full-screen "just chatting" stretch — and
-    the cam moves with it. The result, including "no facecam", is cached in
-    the job workspace like the crop paths.
+    the cam moves with it. Which of several cams is the streamer's comes from
+    the source-wide home-cam prior (:func:`cam_prior_for_source`). The result,
+    including "no facecam", is cached in the job workspace like the crop paths.
     """
     cache = workspace.facecam(clip.id)
     cached, facecam = load_detection(cache)
@@ -159,6 +174,9 @@ def facecam_for_clip(
             end_s=clip.end_s,
             source_width=source.width,
             source_height=source.height,
+            # Only built when the clip has a cam at all: talking heads and
+            # cam-less videos never pay for the source-level pass.
+            prior=lambda: cam_prior_for_source(workspace, source),
         )
     except FaceDetectionUnavailable as exc:
         # Not cached: the next run may have the model.
@@ -174,6 +192,37 @@ def facecam_for_clip(
         return None
     save_detection(cache, facecam)
     return facecam
+
+
+def cam_prior_for_source(workspace: JobWorkspace, source: Source) -> CamPrior | None:
+    """Build (or load the cached) home-cam prior for the job's source.
+
+    One cheap pass over frames spread across the whole source finds the cam
+    that recurs throughout it — the streamer's, not a teammate's who joined
+    for a few lobbies. Cached in the job workspace, including "none found";
+    a failure is not cached, and detection then goes on without a prior.
+    """
+    cache = workspace.facecam_prior
+    cached, prior = load_prior(cache)
+    if cached:
+        return prior
+    if not source.width or not source.height or not source.duration_s:
+        return None
+    try:
+        prior = build_cam_prior(
+            Path(source.path),
+            duration_s=source.duration_s,
+            source_width=source.width,
+            source_height=source.height,
+        )
+    except FaceDetectionUnavailable as exc:
+        log.warning("Home-cam prior unavailable (%s).", exc)
+        return None
+    except Exception:
+        log.warning("Building the home-cam prior failed; going without it.", exc_info=True)
+        return None
+    save_prior(cache, prior)
+    return prior
 
 
 def settings_for_job(job: Job) -> Settings:

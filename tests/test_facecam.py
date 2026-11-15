@@ -7,6 +7,8 @@ video. One slow test renders a real split clip with ffmpeg.
 
 from __future__ import annotations
 
+import copy
+import functools
 import subprocess
 from pathlib import Path
 
@@ -472,7 +474,7 @@ class TestRunnerFacecam:
         source, job, clip = setup
         calls: list[tuple[float, float]] = []
 
-        def fake_detect(video, *, start_s, end_s, source_width, source_height):
+        def fake_detect(video, *, start_s, end_s, source_width, source_height, prior=None):
             calls.append((start_s, end_s))
             return _facecam()
 
@@ -761,3 +763,351 @@ class TestSplitRender:
         image = np.frombuffer(frame, dtype=np.uint8).reshape(1920, 1080, 3)
         panel = image[20 : top_h - 20, 20:-20].reshape(-1, 3).mean(axis=0)
         assert panel[0] > 180 and panel[1] < 80 and panel[2] < 80
+
+
+# --------------------------------------------------------------------------
+# Home-cam prior
+# --------------------------------------------------------------------------
+
+#: Synthetic stream layout, in source pixels (multiples of the 4x analysis scale).
+#: The streamer's cam docks mid-left early on and bottom-left later; a teammate
+#: (a bigger cam, top-right) joins for the squad half only.
+HOME_EARLY = (0, 400, 472, 264)
+HOME_LATE = (0, 816, 472, 264)
+TEAMMATE = (1340, 0, 580, 328)
+STREAMER_ROOM = (200, 110, 50)  # an orange room
+TEAMMATE_ROOM = (40, 170, 70)  # a green screen
+
+
+def _room(base: tuple[int, int, int], size: tuple[int, int], seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    h, w = size
+    noise = rng.integers(-25, 26, size=(h, w, 3))
+    return np.clip(np.asarray(base)[None, None, :] + noise, 0, 255).astype(np.uint8)
+
+
+def _stream(
+    count: int, cams_per_frame: list[list[tuple[tuple[int, int, int, int], tuple[int, int, int]]]]
+) -> np.ndarray:
+    """Analysis-size RGB frames: changing colourful 'gameplay' under static cams."""
+    scale = SW // fcm.ANALYSIS_WIDTH
+    h, w = SH // scale, SW // scale
+    rng = np.random.default_rng(11)
+    rooms: dict[tuple, np.ndarray] = {}
+    frames = []
+    for index in range(count):
+        coarse = rng.integers(0, 256, size=(9, 16, 3)).astype(np.uint8)
+        frame = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_CUBIC)
+        for rect, colour in cams_per_frame[index]:
+            x, y, cw, ch = (v // scale for v in rect)
+            key = (colour, cw, ch)
+            if key not in rooms:
+                rooms[key] = _room(colour, (ch, cw), seed=sum(colour))
+            frame[y : y + ch, x : x + cw] = rooms[key]
+            # The overlay's frame on its inner sides.
+            if y > 0:
+                frame[y, x : x + cw] = 250
+            if y + ch < h:
+                frame[y + ch - 1, x : x + cw] = 250
+            if x > 0:
+                frame[y : y + ch, x] = 250
+            if x + cw < w:
+                frame[y : y + ch, x + cw - 1] = 250
+        frames.append(frame)
+    return np.stack(frames)
+
+
+def _face_in(rect: tuple[int, int, int, int], jitter: float = 0.0) -> FaceBox:
+    x, y, w, h = rect
+    return FaceBox(left=x + w / 2 - 32 + jitter, top=y + h / 3 + jitter / 2, width=64, height=72)
+
+
+def _squad_stream(count: int = 40):
+    """First half: streamer at HOME_EARLY. Second half: HOME_LATE + teammate."""
+    cams, detections = [], []
+    for index in range(count):
+        if index < count // 2:
+            cams.append([(HOME_EARLY, STREAMER_ROOM)])
+            detections.append([_face_in(HOME_EARLY, index % 3)])
+        else:
+            cams.append([(HOME_LATE, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)])
+            detections.append([_face_in(HOME_LATE, index % 3), _face_in(TEAMMATE, index % 3)])
+    return detections, _stream(count, cams)
+
+
+@functools.cache
+def _built_prior() -> fcm.CamPrior | None:
+    detections, frames = _squad_stream()
+    return fcm.locate_cam_prior(detections, frames, SW, SH)
+
+
+def _prior() -> fcm.CamPrior:
+    prior = _built_prior()
+    assert prior is not None
+    return copy.deepcopy(prior)
+
+
+def _near(rect, expected, tolerance: float = 12.0) -> bool:
+    return all(abs(a - b) <= tolerance for a, b in zip(rect, expected, strict=True))
+
+
+class TestCamSignature:
+    def test_the_same_room_matches_wherever_it_is_docked(self) -> None:
+        frames = _stream(4, [[(HOME_EARLY, STREAMER_ROOM), (TEAMMATE, STREAMER_ROOM)]] * 4)
+
+        early = fcm.cam_signature(frames, HOME_EARLY, SW, SH)
+        elsewhere = fcm.cam_signature(frames, TEAMMATE, SW, SH)
+
+        assert fcm.signature_distance(early, elsewhere) < fcm.PRIOR_MATCH_DISTANCE
+
+    def test_another_room_does_not(self) -> None:
+        frames = _stream(4, [[(HOME_EARLY, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)]] * 4)
+
+        streamer = fcm.cam_signature(frames, HOME_EARLY, SW, SH)
+        teammate = fcm.cam_signature(frames, TEAMMATE, SW, SH)
+
+        assert fcm.signature_distance(streamer, teammate) > fcm.PRIOR_MATCH_DISTANCE
+
+    def test_distance_bounds(self) -> None:
+        a = np.array([1.0, 0.0, 0.0])
+        assert fcm.signature_distance(a, a) == pytest.approx(0.0, abs=1e-6)
+        assert fcm.signature_distance(a, np.array([0.0, 1.0, 0.0])) == pytest.approx(1.0)
+        assert fcm.signature_distance(a, np.array([1.0, 0.0])) == 1.0
+
+
+class TestLocateCamPrior:
+    def test_the_cam_that_recurs_across_the_stream_is_home(self) -> None:
+        prior = _prior()
+
+        # Both docking places of the streamer's cam, and not the teammate's,
+        # although the teammate's cam is bigger.
+        assert len(prior.homes) == 2
+        rects = sorted(h.rect for h in prior.homes)
+        assert _near(rects[0], HOME_EARLY) and _near(rects[1], HOME_LATE)
+        assert prior.presence == pytest.approx(1.0)
+        assert prior.samples == 40
+
+    def test_teammates_on_screen_as_long_as_the_streamer_give_no_prior(self) -> None:
+        count = 30
+        cams = [[(HOME_LATE, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)]] * count
+        detections = [[_face_in(HOME_LATE), _face_in(TEAMMATE)] for _ in range(count)]
+
+        assert fcm.locate_cam_prior(detections, _stream(count, cams), SW, SH) is None
+
+    def test_a_cam_seen_in_few_samples_is_no_prior(self) -> None:
+        count = 30
+        cams = [[(HOME_LATE, STREAMER_ROOM)] if i < 4 else [] for i in range(count)]
+        detections = [[_face_in(HOME_LATE)] if i < 4 else [] for i in range(count)]
+
+        assert fcm.locate_cam_prior(detections, _stream(count, cams), SW, SH) is None
+
+    def test_no_cams_means_no_prior(self) -> None:
+        count = 20
+        talking_head = [[FaceBox(left=760, top=260, width=300, height=360)]] * count
+
+        assert fcm.locate_cam_prior(talking_head, _stream(count, [[]] * count), SW, SH) is None
+        assert fcm.locate_cam_prior([], None, SW, SH) is None
+
+
+class TestChooseWithPrior:
+    def _clip(self, cams, faces, count: int = 12):
+        frames = _stream(count, [cams] * count)
+        detections = [[_face_in(rect, i % 3) for rect in faces] for i in range(count)]
+        return detections, frames
+
+    def _locate(self, detections, frames, prior):
+        return fcm.locate_facecam(
+            detections, fcm._grey_stack(frames), SW, SH, colour_frames=frames, prior=prior
+        )
+
+    def test_the_streamer_beats_a_bigger_teammate(self) -> None:
+        cams = [(HOME_LATE, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)]
+        detections, frames = self._clip(cams, [HOME_LATE, TEAMMATE])
+
+        without = self._locate(detections, frames, None)
+        with_prior = self._locate(detections, frames, _prior())
+
+        assert without is not None and without.x > SW / 2  # the old pick: the teammate
+        assert with_prior is not None
+        assert _near((with_prior.x, with_prior.y, with_prior.width, with_prior.height), HOME_LATE)
+
+    def test_a_missed_face_falls_back_to_the_home_rect(self) -> None:
+        # The streamer's cam is on screen but their face isn't detected.
+        cams = [(HOME_LATE, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)]
+        detections, frames = self._clip(cams, [TEAMMATE])
+        prior = _prior()
+
+        cam = self._locate(detections, frames, prior)
+
+        assert cam is not None
+        assert cam.method == "prior"
+        late = next(h for h in prior.homes if h.y > SH / 2)
+        assert (cam.x, cam.y, cam.width, cam.height) == late.rect
+        assert cam.is_overlay
+
+    def test_only_strangers_means_crop(self) -> None:
+        cams = [(TEAMMATE, TEAMMATE_ROOM)]
+        detections, frames = self._clip(cams, [TEAMMATE])
+
+        assert self._locate(detections, frames, None) is not None
+        assert self._locate(detections, frames, _prior()) is None
+
+    def test_no_cam_never_builds_the_prior(self) -> None:
+        def explode():
+            raise AssertionError("the prior must not be built without a cam")
+
+        detections = [[FaceBox(left=760, top=260, width=300, height=360)]] * 10
+        frames = _stream(10, [[]] * 10)
+
+        assert self._locate(detections, frames, explode) is None
+
+    def test_a_failing_prior_falls_back_to_placement(self) -> None:
+        def broken():
+            raise RuntimeError("decode failed")
+
+        cams = [(HOME_LATE, STREAMER_ROOM)]
+        detections, frames = self._clip(cams, [HOME_LATE])
+
+        cam = self._locate(detections, frames, broken)
+
+        assert cam is not None and cam.x == 0
+
+    def test_a_lazy_prior_is_used(self) -> None:
+        prior = _prior()
+        cams = [(HOME_LATE, STREAMER_ROOM), (TEAMMATE, TEAMMATE_ROOM)]
+        detections, frames = self._clip(cams, [HOME_LATE, TEAMMATE])
+
+        cam = self._locate(detections, frames, lambda: prior)
+
+        assert cam is not None and cam.x == 0
+
+    def test_a_prior_for_another_frame_size_is_ignored(self) -> None:
+        prior = _prior()
+        prior.source_width = 1280
+        cams = [(TEAMMATE, TEAMMATE_ROOM)]
+        detections, frames = self._clip(cams, [TEAMMATE])
+
+        assert self._locate(detections, frames, prior) is not None
+
+    def test_a_cam_at_home_is_snapped_to_the_home_rect(self) -> None:
+        prior = _prior()
+        late = next(h for h in prior.homes if h.y > SH / 2)
+        nudged = _facecam(x=late.x, y=late.y + 8, width=late.width, height=late.height - 8)
+
+        snapped = fcm._snap_to_home(nudged, prior)
+
+        assert (snapped.x, snapped.y, snapped.width, snapped.height) == late.rect
+        assert snapped.face_left == nudged.face_left
+        # Somewhere else entirely: left alone.
+        far = _facecam(x=1400, y=0)
+        assert fcm._snap_to_home(far, prior) == far
+
+
+class TestBuildCamPrior:
+    def test_samples_the_whole_source_one_frame_at_a_time(self) -> None:
+        detections, frames = _squad_stream(fcm.PRIOR_SAMPLES)
+        calls: list[list[float]] = []
+
+        def reader(video, times):
+            calls.append(list(times))
+            index = len(calls) - 1
+            return [cv2.resize(frames[index], (SW, SH), interpolation=cv2.INTER_NEAREST)]
+
+        faces = iter(detections)
+        prior = fcm.build_cam_prior(
+            Path("stream.mp4"),
+            duration_s=3600.0,
+            source_width=SW,
+            source_height=SH,
+            reader=reader,
+            detector=lambda frame: next(faces),
+        )
+
+        assert all(len(times) == 1 for times in calls)
+        times = [t for times in calls for t in times]
+        assert len(times) == fcm.PRIOR_SAMPLES
+        assert times[0] < 60 and times[-1] > 3540
+        assert prior is not None and len(prior.homes) == 2
+
+    def test_short_sources_take_fewer_samples(self) -> None:
+        assert len(fcm.prior_sample_times(60.0)) == fcm.MIN_SAMPLES
+        assert len(fcm.prior_sample_times(36000.0)) == fcm.PRIOR_SAMPLES
+
+    def test_unreadable_source_gives_none(self) -> None:
+        def no_detector(frame):
+            raise AssertionError("nothing to detect in")
+
+        prior = fcm.build_cam_prior(
+            Path("missing.mp4"),
+            duration_s=600.0,
+            source_width=SW,
+            source_height=SH,
+            reader=lambda video, times: [],
+            detector=no_detector,
+        )
+
+        assert prior is None
+
+    def test_prior_cache_round_trips(self, tmp_path: Path) -> None:
+        prior = _prior()
+        path = fcm.save_prior(tmp_path / "prior.json", prior)
+
+        assert fcm.load_prior(path) == (True, prior)
+        fcm.save_prior(path, None)
+        assert fcm.load_prior(path) == (True, None)
+        path.write_text('{"version": 0, "prior": null}', encoding="utf-8")
+        assert fcm.load_prior(path) == (False, None)
+        assert fcm.load_prior(tmp_path / "missing.json") == (False, None)
+
+
+class TestRunnerPrior:
+    @pytest.fixture
+    def setup(self, initialised_db):
+        source = store.create_source(
+            Source(
+                id=new_id(),
+                type="upload",
+                path="C:/m/stream.mp4",
+                duration_s=3600.0,
+                width=SW,
+                height=SH,
+            )
+        )
+        job = store.create_job(Job(id=new_id(), source_id=source.id))
+        clip = Clip(id=new_id(), job_id=job.id, rank=1, start_s=10.0, end_s=40.0)
+        store.replace_clips(job.id, [clip])
+        return source, job, clip
+
+    def test_the_prior_is_built_once_on_demand_and_cached(self, setup, monkeypatch) -> None:
+        source, job, clip = setup
+        prior = _prior()
+        builds: list[float] = []
+
+        def fake_build(video, *, duration_s, source_width, source_height):
+            builds.append(duration_s)
+            return prior
+
+        def fake_detect(video, *, prior=None, **kwargs):
+            assert callable(prior)
+            return _facecam() if prior() is not None else None
+
+        monkeypatch.setattr(runner, "build_cam_prior", fake_build)
+        monkeypatch.setattr(runner, "detect_facecam", fake_detect)
+        workspace = runner.JobWorkspace(job.id)
+
+        assert runner.facecam_for_clip(workspace, clip, source) == _facecam()
+        assert runner.cam_prior_for_source(workspace, source) == prior
+        assert builds == [3600.0]
+        assert workspace.facecam_prior.exists()
+
+    def test_a_failed_prior_is_not_cached(self, setup, monkeypatch) -> None:
+        source, job, _ = setup
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("decode failed")
+
+        monkeypatch.setattr(runner, "build_cam_prior", broken)
+        workspace = runner.JobWorkspace(job.id)
+
+        assert runner.cam_prior_for_source(workspace, source) is None
+        assert not workspace.facecam_prior.exists()

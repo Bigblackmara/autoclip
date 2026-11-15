@@ -25,6 +25,21 @@ off-centre one that is biggest and most consistently present. Detection is
 per clip: a long stream changes layout (lobby, match, a full-screen "just
 chatting" stretch) and the cam moves with it.
 
+A clip alone can't always tell the streamer from a teammate: a squad lobby
+shows three or four player cams, and the streamer's face is the one hidden
+behind a donation alert. The whole stream can. A cheap source-level pass
+(:func:`build_cam_prior`) samples frames spread over the entire source and
+finds the cam *identity* that recurs across all of it: cams are located per
+position as above (their borders are crisp across samples from unrelated
+scenes), described by a colour histogram of the overlay (the streamer's room
+looks the same wherever the overlay is docked), and positions that look alike
+are merged. Teammates join for some lobbies; the streamer's own cam is there
+nearly throughout. That identity is the "home cam" prior. Per clip, a cam that
+matches the prior wins over bigger strangers; when the streamer's face is
+missed but one of the prior's home rects still shows the same room, that rect
+is used; and when cams were found but none of them is the streamer, the clip
+keeps the plain crop rather than putting a stranger on top.
+
 Everything returns ``None`` rather than guessing when the signal is weak: the
 caller then keeps the ordinary speaker-following crop, which is the right
 answer for every video that is not a gameplay stream.
@@ -40,7 +55,7 @@ import math
 import statistics
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -113,7 +128,40 @@ MAX_SAMPLES = 30
 #: A cam this close to a frame edge (fraction of the frame) counts as docked.
 EDGE_DOCK = 0.03
 
-CACHE_VERSION = 1
+#: Version 2: detections made with the home-cam prior.
+CACHE_VERSION = 2
+
+# Home-cam prior ------------------------------------------------------------
+
+#: Frames sampled across the whole source for the prior (fewer for a short one).
+PRIOR_SAMPLES = 60
+
+#: A cam position must be seen in at least this many prior samples to count.
+PRIOR_MIN_FRAMES = 3
+
+#: The streamer's cam is on screen for much of the stream: an identity seen in
+#: fewer of the samples than this is no prior at all.
+PRIOR_MIN_PRESENCE = 0.2
+
+#: And it must clearly beat the runner-up. A squad stream whose teammates are
+#: on screen as long as the streamer gives no prior; detection then behaves as
+#: it did without one.
+PRIOR_DOMINANCE = 1.25
+
+#: Hellinger distance between colour signatures under which two cam regions
+#: show the same room. Measured on a squad stream: the streamer's cam at two
+#: docking positions differs by ~0.13 (single frames up to ~0.3), teammates'
+#: cams by 0.48 or more.
+PRIOR_MATCH_DISTANCE = 0.35
+
+#: A cam matching the prior that overlaps one of its home rects this much is
+#: snapped to the home rect, which was measured over many unrelated scenes.
+PRIOR_SNAP_IOU = 0.75
+
+#: Hue x saturation x value bins of the colour signature.
+SIGNATURE_BINS = (16, 4, 4)
+
+PRIOR_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -208,6 +256,57 @@ class Facecam:
         return cls(**{name: data[name] for name in cls.__dataclass_fields__ if name in data})
 
 
+@dataclass
+class HomeCam:
+    """One place the streamer's cam was docked, in source pixels."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+    #: Median face box seen there.
+    face_left: float
+    face_top: float
+    face_width: float
+    face_height: float
+    #: Fraction of the source samples the cam was seen at this place.
+    presence: float
+
+    @property
+    def rect(self) -> tuple[int, int, int, int]:
+        return self.x, self.y, self.width, self.height
+
+
+@dataclass
+class CamPrior:
+    """The streamer's own cam, learned from frames spread over the whole source."""
+
+    source_width: int
+    source_height: int
+    #: Normalised colour histogram of the cam (see :func:`cam_signature`).
+    signature: list[float]
+    #: Where the cam was docked, most frequent first.
+    homes: list[HomeCam]
+    #: Fraction of the source samples the cam was seen in, at any home.
+    presence: float
+    samples: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CamPrior:
+        homes = [HomeCam(**home) for home in data["homes"]]
+        return cls(
+            source_width=int(data["source_width"]),
+            source_height=int(data["source_height"]),
+            signature=[float(v) for v in data["signature"]],
+            homes=homes,
+            presence=float(data["presence"]),
+            samples=int(data["samples"]),
+        )
+
+
 # --------------------------------------------------------------------------
 # Cache
 # --------------------------------------------------------------------------
@@ -241,6 +340,31 @@ def load_detection(path: Path) -> tuple[bool, Facecam | None]:
         return False, None
 
 
+def save_prior(path: Path, prior: CamPrior | None) -> Path:
+    """Cache the source's home-cam prior, including "none found"."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": PRIOR_VERSION, "prior": prior.to_dict() if prior else None}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def load_prior(path: Path) -> tuple[bool, CamPrior | None]:
+    """Return ``(cached, prior)``; ``cached`` is False for a missing or stale file."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, None
+    if not isinstance(raw, dict) or raw.get("version") != PRIOR_VERSION:
+        return False, None
+    data = raw.get("prior")
+    if data is None:
+        return True, None
+    try:
+        return True, CamPrior.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return False, None
+
+
 # --------------------------------------------------------------------------
 # Detection entry point
 # --------------------------------------------------------------------------
@@ -249,6 +373,9 @@ def load_detection(path: Path) -> tuple[bool, Facecam | None]:
 FaceDetector = Callable[[Any], list[FaceBox]]
 #: ``(video, times) -> rgb frames`` (H x W x 3 uint8 arrays), one per time.
 FrameReader = Callable[[Path, Sequence[float]], list[Any]]
+#: A source's home-cam prior, or a zero-argument callable that builds (or
+#: loads) it on demand.
+PriorArg = CamPrior | Callable[[], CamPrior | None] | None
 
 
 def sample_times(start_s: float, end_s: float, count: int | None = None) -> list[float]:
@@ -271,11 +398,15 @@ def detect_facecam(
     samples: int | None = None,
     detector: FaceDetector | None = None,
     reader: FrameReader | None = None,
+    prior: PriorArg = None,
 ) -> Facecam | None:
     """Find a facecam overlay in ``video`` between ``start_s`` and ``end_s``.
 
     Returns None when there is no stable small face — the normal result for
-    anything that is not a gameplay stream.
+    anything that is not a gameplay stream. ``prior`` (see
+    :func:`build_cam_prior`) picks the streamer's cam among several; when it
+    is a callable it is only called if the clip has any cam at all, so videos
+    without one never pay for the source-level pass.
     """
     times = sample_times(start_s, end_s, samples)
     reader = reader or read_frames
@@ -293,8 +424,11 @@ def detect_facecam(
         if owned_detector is not None:
             owned_detector.close()
 
-    grey = _analysis_frames(frames)
-    return locate_facecam(detections, grey, source_width, source_height)
+    colour = _analysis_colour(frames)
+    grey = _grey_stack(colour)
+    return locate_facecam(
+        detections, grey, source_width, source_height, colour_frames=colour, prior=prior
+    )
 
 
 def locate_facecam(
@@ -302,54 +436,40 @@ def locate_facecam(
     grey_frames: Any | None,
     source_width: int,
     source_height: int,
+    *,
+    colour_frames: Any | None = None,
+    prior: PriorArg = None,
 ) -> Facecam | None:
     """The pure half of detection: faces per frame (+ optional frames) to a rect.
 
     ``grey_frames`` is an ``(N, h, w)`` float array of the sampled frames at
-    analysis resolution, or None to skip the border search.
+    analysis resolution, or None to skip the border search. ``colour_frames``
+    is the same frames in RGB ``(N, h, w, 3)``, needed to match cams against
+    a ``prior``; without either, the cam is chosen on placement and size.
     """
-    clusters = stable_face_clusters(detections, source_width, source_height)
-    if not clusters:
-        return None
-
-    candidates: list[Facecam] = []
-    for cluster in clusters:
-        rect, method = _cam_rect(cluster.faces, grey_frames, source_width, source_height)
-        if rect is None:
-            continue
-        x, y, w, h = rect
-        median = cluster.median_face
-        candidates.append(
-            Facecam(
-                x=x,
-                y=y,
-                width=w,
-                height=h,
-                source_width=source_width,
-                source_height=source_height,
-                face_left=median.left,
-                face_top=median.top,
-                face_width=median.width,
-                face_height=median.height,
-                presence=round(cluster.presence, 3),
-                method=method,
-            )
-        )
-
+    candidates = cam_candidates(detections, grey_frames, source_width, source_height)
     if not candidates:
         return None
 
-    # Overlays dock against a frame edge, away from the centre where the game
-    # (and its characters' faces) lives. Among several cams — a squad stream —
-    # the streamer's own is by convention the biggest and always on screen;
-    # a found border counts for a little more than an estimate.
-    chosen = max(
-        candidates,
-        key=lambda c: (
-            c.well_placed,
-            c.width * c.height * c.presence * (1.0 if c.method == "border" else 0.9),
-        ),
-    )
+    if callable(prior):
+        try:
+            prior = prior()
+        except Exception:  # the prior is an enhancement; never fail detection
+            log.warning("The home-cam prior failed; choosing without it.", exc_info=True)
+            prior = None
+
+    if (
+        prior is not None
+        and colour_frames is not None
+        and len(colour_frames) > 0
+        and (prior.source_width, prior.source_height) == (source_width, source_height)
+    ):
+        chosen = choose_with_prior(candidates, colour_frames, prior)
+    else:
+        chosen = _choose_by_placement(candidates)
+
+    if chosen is None:
+        return None
     log.info(
         "Facecam at %dx%d+%d+%d (%s, face in %.0f%% of samples).",
         chosen.width,
@@ -362,6 +482,380 @@ def locate_facecam(
     return chosen
 
 
+def cam_candidates(
+    detections: Sequence[Sequence[FaceBox]],
+    grey_frames: Any | None,
+    source_width: int,
+    source_height: int,
+) -> list[Facecam]:
+    """Every stable small face's cam, before choosing among them."""
+    candidates: list[Facecam] = []
+    for cluster in stable_face_clusters(detections, source_width, source_height):
+        cam = _cluster_cam(cluster, grey_frames, source_width, source_height)
+        if cam is not None:
+            candidates.append(cam)
+    return candidates
+
+
+def _cluster_cam(
+    cluster: FaceCluster, grey_frames: Any | None, source_width: int, source_height: int
+) -> Facecam | None:
+    rect, method = _cam_rect(cluster.faces, grey_frames, source_width, source_height)
+    if rect is None:
+        return None
+    x, y, w, h = rect
+    median = cluster.median_face
+    return Facecam(
+        x=x,
+        y=y,
+        width=w,
+        height=h,
+        source_width=source_width,
+        source_height=source_height,
+        face_left=median.left,
+        face_top=median.top,
+        face_width=median.width,
+        face_height=median.height,
+        presence=round(cluster.presence, 3),
+        method=method,
+    )
+
+
+def _choose_by_placement(candidates: Sequence[Facecam]) -> Facecam:
+    # Overlays dock against a frame edge, away from the centre where the game
+    # (and its characters' faces) lives. Among several cams — a squad stream —
+    # the streamer's own is by convention the biggest and always on screen;
+    # a found border counts for a little more than an estimate.
+    return max(
+        candidates,
+        key=lambda c: (
+            c.well_placed,
+            c.width * c.height * c.presence * (1.0 if c.method == "border" else 0.9),
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# Home-cam prior
+# --------------------------------------------------------------------------
+
+
+def prior_sample_times(duration_s: float, count: int | None = None) -> list[float]:
+    """Times spread evenly over the whole source for the prior pass."""
+    if count is None:
+        count = int(min(PRIOR_SAMPLES, max(MIN_SAMPLES, round(duration_s / 5))))
+    return sample_times(0.0, duration_s, count)
+
+
+def build_cam_prior(
+    video: Path,
+    *,
+    duration_s: float,
+    source_width: int,
+    source_height: int,
+    samples: int | None = None,
+    detector: FaceDetector | None = None,
+    reader: FrameReader | None = None,
+) -> CamPrior | None:
+    """Learn the streamer's cam from frames spread over the whole source.
+
+    Frames are read and analysed one at a time and only an analysis-size copy
+    is kept, so a 60-sample pass over a 1080p stream stays small in memory.
+    The detector is only created once a frame has been read.
+    """
+    if duration_s <= 0:
+        return None
+    reader = reader or read_frames
+    owned_detector = None
+    detections: list[list[FaceBox]] = []
+    colour: list[Any] = []
+    try:
+        for t in prior_sample_times(duration_s, samples):
+            frames = reader(video, [t])
+            if not frames:
+                continue
+            if detector is None:
+                owned_detector = TiledFaceDetector()
+                detector = owned_detector
+            detections.append(list(detector(frames[0])))
+            colour.append(_analysis_colour(frames[:1])[0])
+    finally:
+        if owned_detector is not None:
+            owned_detector.close()
+    if not colour:
+        return None
+
+    import numpy as np
+
+    return locate_cam_prior(detections, np.stack(colour), source_width, source_height)
+
+
+def locate_cam_prior(
+    detections: Sequence[Sequence[FaceBox]],
+    colour_frames: Any,
+    source_width: int,
+    source_height: int,
+) -> CamPrior | None:
+    """The pure half of :func:`build_cam_prior`.
+
+    1. Places: small faces that recur at one position in a few samples. Each
+       place's border is searched in exactly the samples it was seen in; they
+       come from unrelated scenes, so the overlay's edge stands out.
+    2. Identities: places whose cams look alike (colour signature) are one
+       cam docked in different places over the stream.
+    3. The streamer: the identity on screen in most samples, provided it is on
+       screen often enough and clearly more than any other.
+    """
+    import numpy as np
+
+    sample_count = len(detections)
+    if sample_count == 0 or colour_frames is None or len(colour_frames) != sample_count:
+        return None
+    colour = np.asarray(colour_frames)
+    grey = _grey_stack(colour)
+    min_presence = min(MIN_PRESENCE, PRIOR_MIN_FRAMES / sample_count)
+
+    places: list[dict[str, Any]] = []
+    for cluster in stable_face_clusters(
+        detections, source_width, source_height, min_presence=min_presence
+    ):
+        frames = sorted(cluster.frames)
+        if len(frames) < PRIOR_MIN_FRAMES:
+            continue
+        cam = _cluster_cam(
+            cluster, grey[frames] if grey is not None else None, source_width, source_height
+        )
+        if cam is None or not cam.is_overlay:
+            continue
+        rect = (cam.x, cam.y, cam.width, cam.height)
+        places.append(
+            {
+                "cam": cam,
+                "frames": set(frames),
+                "signature": cam_signature(colour[frames], rect, source_width, source_height),
+            }
+        )
+    if not places:
+        return None
+
+    # Merge places that show the same room, most frequent first.
+    places.sort(key=lambda p: len(p["frames"]), reverse=True)
+    identities: list[dict[str, Any]] = []
+    for place in places:
+        match = next(
+            (
+                identity
+                for identity in identities
+                if signature_distance(place["signature"], identity["signature"])
+                <= PRIOR_MATCH_DISTANCE
+            ),
+            None,
+        )
+        if match is None:
+            identities.append(
+                {
+                    "signature": place["signature"],
+                    "places": [place],
+                    "frames": set(place["frames"]),
+                    "weight": len(place["frames"]),
+                }
+            )
+            continue
+        extra = len(place["frames"])
+        match["signature"] = (match["signature"] * match["weight"] + place["signature"] * extra) / (
+            match["weight"] + extra
+        )
+        match["weight"] += extra
+        match["places"].append(place)
+        match["frames"] |= place["frames"]
+
+    identities.sort(key=lambda i: len(i["frames"]), reverse=True)
+    best = identities[0]
+    presence = len(best["frames"]) / sample_count
+    if presence < PRIOR_MIN_PRESENCE:
+        log.info("No home cam: the most frequent cam is on screen in %.0f%%.", presence * 100)
+        return None
+    if len(identities) > 1:
+        runner_up = len(identities[1]["frames"]) / sample_count
+        if presence < runner_up * PRIOR_DOMINANCE:
+            log.info(
+                "No home cam: two cams are on screen about as often (%.0f%% vs %.0f%%).",
+                presence * 100,
+                runner_up * 100,
+            )
+            return None
+
+    homes = [
+        HomeCam(
+            x=p["cam"].x,
+            y=p["cam"].y,
+            width=p["cam"].width,
+            height=p["cam"].height,
+            face_left=round(p["cam"].face_left, 1),
+            face_top=round(p["cam"].face_top, 1),
+            face_width=round(p["cam"].face_width, 1),
+            face_height=round(p["cam"].face_height, 1),
+            presence=round(len(p["frames"]) / sample_count, 3),
+        )
+        for p in best["places"]
+    ]
+    log.info(
+        "Home cam on screen in %.0f%% of %d samples, at %s.",
+        presence * 100,
+        sample_count,
+        ", ".join(f"{h.width}x{h.height}+{h.x}+{h.y}" for h in homes),
+    )
+    return CamPrior(
+        source_width=source_width,
+        source_height=source_height,
+        signature=[round(float(v), 6) for v in best["signature"]],
+        homes=homes,
+        presence=round(presence, 3),
+        samples=sample_count,
+    )
+
+
+def choose_with_prior(
+    candidates: Sequence[Facecam], colour_frames: Any, prior: CamPrior
+) -> Facecam | None:
+    """Pick the streamer's cam among a clip's candidates using the prior.
+
+    1. A candidate that looks like the home cam (the closest, if several).
+    2. Otherwise a home rect whose region in this clip still shows the home
+       cam: the streamer's face was missed (turned away, an alert over it)
+       while a teammate's was found.
+    3. Otherwise nothing: the cams on screen are strangers', and the plain
+       crop is better than the wrong face on top.
+    """
+    import numpy as np
+
+    reference = np.asarray(prior.signature, dtype=np.float64)
+    sw, sh = prior.source_width, prior.source_height
+
+    def distance(rect: tuple[int, int, int, int]) -> float:
+        return signature_distance(cam_signature(colour_frames, rect, sw, sh), reference)
+
+    scored = sorted(
+        ((distance((c.x, c.y, c.width, c.height)), index) for index, c in enumerate(candidates)),
+    )
+    if scored and scored[0][0] <= PRIOR_MATCH_DISTANCE:
+        d, index = scored[0]
+        log.info("The cam matches the home cam (distance %.2f).", d)
+        return _snap_to_home(candidates[index], prior)
+
+    homes = sorted((distance(home.rect), index) for index, home in enumerate(prior.homes))
+    if homes and homes[0][0] <= PRIOR_MATCH_DISTANCE:
+        d, index = homes[0]
+        home = prior.homes[index]
+        log.info(
+            "Streamer's face missed; the home cam at %dx%d+%d+%d still matches (distance %.2f).",
+            home.width,
+            home.height,
+            home.x,
+            home.y,
+            d,
+        )
+        return Facecam(
+            x=home.x,
+            y=home.y,
+            width=home.width,
+            height=home.height,
+            source_width=sw,
+            source_height=sh,
+            face_left=home.face_left,
+            face_top=home.face_top,
+            face_width=home.face_width,
+            face_height=home.face_height,
+            presence=0.0,
+            method="prior",
+        )
+
+    closest = min([d for d, _ in scored] + [d for d, _ in homes], default=1.0)
+    log.info(
+        "Cams found, but none looks like the home cam (closest %.2f); keeping the crop.", closest
+    )
+    return None
+
+
+def _snap_to_home(cam: Facecam, prior: CamPrior) -> Facecam:
+    """Use the home rect for a cam found at (almost) the same place.
+
+    The home rect's borders were measured over samples from unrelated scenes;
+    a clip's over one scene, where a static backdrop (a lobby) can pull a side
+    onto a scene line. The clip's own face box is kept.
+    """
+    rect = (cam.x, cam.y, cam.width, cam.height)
+    home = max(prior.homes, key=lambda h: _rect_iou(h.rect, rect), default=None)
+    if home is None or _rect_iou(home.rect, rect) < PRIOR_SNAP_IOU:
+        return cam
+    face_cx = cam.face_left + cam.face_width / 2
+    face_cy = cam.face_top + cam.face_height / 2
+    if not (home.x <= face_cx <= home.x + home.width and home.y <= face_cy <= home.y + home.height):
+        return cam
+    return replace(cam, x=home.x, y=home.y, width=home.width, height=home.height)
+
+
+def cam_signature(
+    colour_frames: Any, rect: tuple[int, int, int, int], source_width: int, source_height: int
+) -> Any:
+    """What a cam region looks like: a normalised HSV histogram, averaged.
+
+    ``colour_frames`` are RGB at analysis resolution; ``rect`` is in source
+    pixels. A colour histogram ignores where in the region things are, so the
+    streamer moving about (or the overlay docked elsewhere at another size)
+    barely changes it, while another player's room — other walls, other
+    light — does.
+    """
+    import cv2
+    import numpy as np
+
+    bins = int(np.prod(SIGNATURE_BINS))
+    flat = np.full(bins, 1.0 / bins)
+    frames = np.asarray(colour_frames)
+    if frames.ndim != 4 or len(frames) == 0:
+        return flat
+    _, h, w, _ = frames.shape
+    x, y, rw, rh = rect
+    x0 = max(0, int(round(x * w / source_width)))
+    y0 = max(0, int(round(y * h / source_height)))
+    x1 = min(w, int(round((x + rw) * w / source_width)))
+    y1 = min(h, int(round((y + rh) * h / source_height)))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return flat
+    total = np.zeros(bins, dtype=np.float64)
+    for frame in frames:
+        region = np.ascontiguousarray(frame[y0:y1, x0:x1], dtype=np.uint8)
+        hsv = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist(
+            [hsv], [0, 1, 2], None, list(SIGNATURE_BINS), [0, 180, 0, 256, 0, 256]
+        ).ravel()
+        total += hist / max(1.0, float(hist.sum()))
+    return total / len(frames)
+
+
+def signature_distance(a: Any, b: Any) -> float:
+    """Hellinger distance between two signatures: 0 identical, 1 disjoint."""
+    import numpy as np
+
+    p = np.asarray(a, dtype=np.float64)
+    q = np.asarray(b, dtype=np.float64)
+    if p.shape != q.shape or p.sum() <= 0 or q.sum() <= 0:
+        return 1.0
+    p = p / p.sum()
+    q = q / q.sum()
+    return float(np.sqrt(max(0.0, 1.0 - float(np.sum(np.sqrt(p * q))))))
+
+
+def _rect_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    overlap_w = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    overlap_h = max(0, min(ay + ah, by + bh) - max(ay, by))
+    intersection = overlap_w * overlap_h
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
 # --------------------------------------------------------------------------
 # Stable faces
 # --------------------------------------------------------------------------
@@ -372,6 +866,8 @@ class FaceCluster:
     faces: list[FaceBox]
     #: Number of distinct frames the cluster appears in, over frames sampled.
     presence: float
+    #: Indices of the frames it appears in.
+    frames: frozenset[int] = field(default_factory=frozenset)
 
     @property
     def median_face(self) -> FaceBox:
@@ -384,12 +880,17 @@ class FaceCluster:
 
 
 def stable_face_clusters(
-    detections: Sequence[Sequence[FaceBox]], source_width: int, source_height: int
+    detections: Sequence[Sequence[FaceBox]],
+    source_width: int,
+    source_height: int,
+    *,
+    min_presence: float = MIN_PRESENCE,
 ) -> list[FaceCluster]:
     """Small faces that hold their position across most samples.
 
     Greedy clustering by centre distance, scaled by face size. Each cluster
-    counts at most one face per frame towards its presence.
+    counts at most one face per frame towards its presence. ``min_presence``
+    is lowered by the prior pass, whose samples span scenes a cam is not in.
     """
     frame_count = len(detections)
     if frame_count == 0:
@@ -417,9 +918,14 @@ def stable_face_clusters(
                 best["frames"].add(index)
 
     clusters = [
-        FaceCluster(faces=g["faces"], presence=len(g["frames"]) / frame_count) for g in groups
+        FaceCluster(
+            faces=g["faces"],
+            presence=len(g["frames"]) / frame_count,
+            frames=frozenset(g["frames"]),
+        )
+        for g in groups
     ]
-    stable = [c for c in clusters if c.presence >= MIN_PRESENCE]
+    stable = [c for c in clusters if c.presence >= min_presence]
     stable.sort(key=lambda c: c.presence, reverse=True)
     return stable
 
@@ -807,24 +1313,40 @@ def _clamp(value: float, low: float, high: float) -> float:
 # --------------------------------------------------------------------------
 
 
-def _analysis_frames(frames: Sequence[Any]) -> Any | None:
-    """Downscaled greyscale stack ``(N, h, w)`` for the border search."""
+def _analysis_colour(frames: Sequence[Any]) -> Any | None:
+    """Downscaled RGB stack ``(N, h, w, 3)`` uint8 at analysis resolution."""
     try:
         import cv2
         import numpy as np
     except ImportError:  # pragma: no cover - both are hard dependencies
         return None
 
-    grey = []
+    small = []
     for frame in frames:
         height, width = frame.shape[:2]
         target_w = min(ANALYSIS_WIDTH, width)
         target_h = max(1, round(height * target_w / width))
-        small = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        grey.append(cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32))
-    if not grey or any(g.shape != grey[0].shape for g in grey):
+        small.append(
+            np.ascontiguousarray(
+                cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA),
+                dtype=np.uint8,
+            )
+        )
+    if not small or any(s.shape != small[0].shape for s in small):
         return None
-    return np.stack(grey)
+    return np.stack(small)
+
+
+def _grey_stack(colour: Any | None) -> Any | None:
+    """Greyscale float stack ``(N, h, w)`` of analysis frames for the border search."""
+    if colour is None:
+        return None
+    import cv2
+    import numpy as np
+
+    return np.stack(
+        [cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).astype(np.float32) for frame in colour]
+    )
 
 
 def read_frames(video: Path, times: Sequence[float]) -> list[Any]:
