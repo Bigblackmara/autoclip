@@ -34,6 +34,18 @@ being validated against a fixed golden video set — see
 
 ### Added
 
+- **Facecam + gameplay layout** for 9:16 streamer clips: a new `layout` export
+  setting (`auto` / `split` / `crop`, default `auto`) stacks the detected
+  webcam overlay above a full-height gameplay crop. `auto` splits only for a
+  small, edge-docked cam; `split` splits whenever a cam is found; `crop` skips
+  detection. Job-scoped like the other export options — set it in the New page
+  options, Settings → Export, per clip on Review, or with
+  `autoclip clip --layout`. 1:1 and 16:9 always crop. Detection runs on the CPU,
+  is cached per clip in `work/<job>/facecam/`, and never fails a job.
+- **Home-cam prior** for squad streams: about 60 frames sampled across the
+  whole source decide which cam is the streamer's (cached as
+  `work/<job>/facecam/source-prior.json`), so a teammate's bigger cam no longer
+  wins, and a clip where the streamer's cam can't be matched keeps the crop.
 - **Live Watch** — watch several livestreams at once, around the clock, and clip
   their viral moments while the stream is still going:
   - Multiple concurrent stream watches (streamlink → ffmpeg capture, offline
@@ -74,7 +86,26 @@ being validated against a fixed golden video set — see
   stop on a function word; padding never runs into the neighbouring word; a loud
   reaction right after the last line (measured with ebur128, cached as
   `loudness.json`) is kept, up to 4 s and within the max length; partially
-  overlapping clips are merged or trimmed instead of both shipping.
+  overlapping clips are merged or trimmed instead of both shipping. The
+  highlight prompt now asks for the same: start on the hook, end after the
+  reaction, no overlapping clips. See
+  [How clip boundaries are chosen](README.md#how-clip-boundaries-are-chosen).
+- **Live Watch timing**: stream copy cuts segments at keyframes (~8 s, variable,
+  not the nominal 6 s), but clips, judge trims and audio stamps assumed
+  index × 6 s, so clips started and ended at the wrong moment. Capture now
+  writes ffmpeg's segment list and every consumer uses each segment's real
+  start and length; clips are cut to exactly their start/end.
+- **Live Watch reliability**: chat is no longer scored while a stream is
+  offline (offline chat fired a spurious, paid judge call on every reconnect);
+  slow SSE clients get a resync snapshot instead of silently missing changes;
+  auto-upload runs beside the render workers, so an Instagram publish no longer
+  blocks queued renders, and an interrupted upload no longer invites a
+  duplicate; a YouTube upload that loses its connection mid-transfer resumes;
+  on Windows, capture ffmpeg is killed with the backend instead of being left
+  writing into the buffer. In the UI, removed streams leave other tabs, a 409
+  "already uploading" no longer shows as failed, settings save errors are shown
+  instead of "Saved", the Connect button recovers after Back from the consent
+  page, and older finished uploads are no longer hidden from the list.
 - **YouTube downloads**: yt-dlp is given every installed JavaScript runtime
   (Deno, Node, Bun) for YouTube's player challenge, and `yt-dlp[default]` is a
   dependency. HTTP 403/429 and "only images available" now explain that YouTube

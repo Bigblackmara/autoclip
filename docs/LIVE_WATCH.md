@@ -78,8 +78,11 @@ autoclip live clips        # latest clips, newest first, with judge scores
 ## How the loop works
 
 **Capture.** Each stream is resolved once (streamlink preferred, yt-dlp
-fallback) and copied into 6-second MPEG-TS segments on disk by one long-lived
-ffmpeg. No re-encode, no pipe chain: two decoupled processes, so a reconnect
+fallback) and copied into MPEG-TS segments of about 6 seconds on disk by one
+long-lived ffmpeg. Stream copy can only cut at keyframes, so real segments run
+longer and vary (often ~8 s); ffmpeg's segment list records each one's real
+length, and clips, judge trims and audio timestamps are all timed from those
+real lengths, never from index × 6. No re-encode, no pipe chain: two decoupled processes, so a reconnect
 restarts only the resolution. If the channel is offline or drops, the watcher
 reconnects with exponential backoff (2 s doubling to a 120 s cap, with jitter);
 ten rapid failures park the stream in `error` instead of hot-looping.
@@ -209,7 +212,8 @@ Live settings live in config.json under `"live"` (absent = all defaults), and
 | `uploads.instagram.auto_upload` / `caption_prefix` | `false` / `""` | per-platform upload opt-in |
 
 Two declared knobs aren't wired yet this version and are documented as such:
-`rolling_buffer.segment_s` (segments are a fixed 6 s) and
+`rolling_buffer.segment_s` (capture always targets 6 s; real segments are
+keyframe-cut and timed from their measured lengths) and
 `workers.cpu_budget_percent` / `workers.ram_budget_gb` (advisory, not enforced).
 
 ## Safety nets

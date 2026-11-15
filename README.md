@@ -167,6 +167,33 @@ Everything the UI does is also on the CLI:
 
 Fonts are bundled under the SIL Open Font License, so nothing is fetched at runtime.
 
+## Streamer clips: facecam layout
+
+Gameplay streams with a webcam overlay lose the streamer's face in a plain 9:16 crop. The `layout` export setting can instead stack the facecam on top and a full-height gameplay crop underneath.
+
+| layout | does |
+|---|---|
+| `auto` (default) | splits only when the detected cam looks like an overlay; everything else keeps the crop |
+| `split` | splits whenever a facecam is found at all; with none found, it crops |
+| `crop` | always uses the speaker-following crop, and skips facecam detection |
+
+**When `auto` splits:** the face is small (at most 8% of the frame width), the cam covers at most 36% of the frame, and it is docked against an edge, away from the centre. Talking heads, podcasts and full-screen "just chatting" stretches keep the crop. The cam panel takes 30–42% of the height, following the cam's own shape, and is never stretched; captions sit below the seam.
+
+**Choosing it per job:**
+
+- UI: **Layout (9:16)** under **Options** on the New page (this job only), as the default in **Settings → Export**, or per clip on the Review page before re-exporting.
+- CLI:
+
+```bash
+autoclip clip <url|file> --layout split
+```
+
+**Known limits:**
+
+- In squad lobbies with several cams, the streamer's cam is picked by a home-cam prior: about 60 frames are sampled across the whole source and the cam seen most often is taken as home. A clip where the home cam can't be matched keeps the crop rather than showing a teammate. If the streamer's cam is on screen less than a teammate's, the prior can pick the wrong one.
+- 1:1 and 16:9 always crop.
+- Detection runs on the CPU (MediaPipe) and adds about a minute per long source. Results are cached in `~/.autoclip/work/<job>/facecam/` (`source-prior.json` plus one file per clip), so a retry or re-export doesn't pay it again. A detection failure falls back to the crop and never fails the job.
+
 ## Live Watch
 
 Watch live streams around the clock and cut their viral moments into caption-burned vertical clips while the stream is still going — several streams at once, detection running continuously against each stream's own rolling baseline (audio energy + Twitch chat), an LLM gate that scores the window before a single clip is rendered, and the same transcribe → reframe → captions → export stages a batch clip uses.
@@ -218,6 +245,17 @@ Each stage writes artifacts to `~/.autoclip/work/{job_id}/`, so a retry resumes 
 **Highlight detection returns word indices, not timestamps.** Models are unreliable at arithmetic and completely reliable at copying a number they can see. Timing is looked up from measured word timings afterwards.
 
 **Crop paths never interpolate across a cut.** Shots are detected first and framed independently. Panning through an edit is the most obvious sign of an auto-reframed video.
+
+### How clip boundaries are chosen
+
+The model proposes a word range and quotes its hook; the cut points are then fixed from measured timings:
+
+- **Start on the hook.** When the quoted hook is found near the proposed start, the clip starts there, not on a preamble before it. Up to three leading connectives or hesitations ("and", "but", "so", "um") are dropped.
+- **End on a whole thought.** An end with no punctuation backs off a dangling function word ("the", "to", "let"), and padding never runs into the neighbouring word.
+- **Keep the reaction.** A loud reaction that starts right after the last line (laughter, a shout) is kept, up to 4 s and within the max clip length. Loudness is measured once per job with ffmpeg's ebur128 filter and cached as `loudness.json` in the job folder.
+- **No overlaps.** Partially overlapping clips are merged when the result still fits the max length; otherwise the weaker one is trimmed at a sentence edge, or dropped if what's left is too short.
+
+The prompt asks for the same things: start on the hook, end after the reaction, never return overlapping clips.
 
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the rest, including why several odd-looking choices exist.
 
