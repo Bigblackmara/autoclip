@@ -211,10 +211,14 @@ Live settings live in config.json under `"live"` (absent = all defaults), and
 | `uploads.youtube.auto_upload` / `title_prefix` | `false` / `""` | per-platform upload opt-in |
 | `uploads.instagram.auto_upload` / `caption_prefix` | `false` / `""` | per-platform upload opt-in |
 
-Two declared knobs aren't wired yet this version and are documented as such:
-`rolling_buffer.segment_s` (capture always targets 6 s; real segments are
-keyframe-cut and timed from their measured lengths) and
-`workers.cpu_budget_percent` / `workers.ram_budget_gb` (advisory, not enforced).
+`rolling_buffer.segment_s` is a read-only report, not a knob: capture always
+asks ffmpeg for 6 s segments and a stored value is pinned back to 6 on load.
+Real segments are keyframe-cut and timed from their measured lengths, and the
+capture stall watchdog (3 segments, base 18 s) and the post-roll coverage
+grace (base 24 s) stretch with the longest recent real segment, capped at
+90 s each — so a 20 s-keyframe IRL stream is not restarted in a loop, and a
+dead capture is still caught. `workers.cpu_budget_percent` /
+`workers.ram_budget_gb` are declared but advisory (not enforced) this version.
 
 ## Safety nets
 

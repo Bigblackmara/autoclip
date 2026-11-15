@@ -69,6 +69,11 @@ SEGMENT_LIST_PREFIX = "seglist_"
 #: to disk (safety valve; enforced by the manager, not the buffer itself).
 PENDING_CAP_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
+#: How many of the newest committed segments the adaptive timers look at.
+#: A handful is enough to learn the stream's keyframe interval, few enough
+#: that a one-off long segment (a source hiccup) ages out quickly.
+RECENT_SEGMENTS = 8
+
 #: Copy chunk for extraction. Big enough to be I/O-bound rather than
 #: syscall-bound, small enough that peak RAM never scales with clip length.
 _CHUNK = 1024 * 1024
@@ -324,6 +329,20 @@ class RingBuffer:
             if not self.segments:
                 return None
             return self.segments[-1].end_s
+
+    def recent_segment_max_s(self, count: int = RECENT_SEGMENTS) -> float | None:
+        """Longest real duration among the newest ``count`` committed segments.
+
+        The capture's stall watchdog and the watcher's coverage wait scale
+        with this: segments are keyframe-cut, so a 20 s GOP means a new
+        segment only every ~20 s, however short ``-segment_time`` is. None
+        when nothing is committed yet (callers keep their base timeout).
+        """
+        with self._lock:
+            recent = self.segments[-max(1, int(count)) :]
+            if not recent:
+                return None
+            return max(seg.duration_s for seg in recent)
 
     def index_at(self, t_s: float) -> int:
         """Index of the segment holding stream time ``t_s`` (for pins).
@@ -650,6 +669,26 @@ def discard_segment_files(directory: Path) -> int:
     return removed
 
 
+def adaptive_timeout_s(
+    base_s: float,
+    longest_segment_s: float | None,
+    *,
+    segments: float,
+    ceiling_s: float,
+) -> float:
+    """A timeout that stretches with the stream's real segment length.
+
+    ``max(base, min(ceiling, segments × longest))``: never shorter than the
+    base (the nominal-segment behaviour), stretched for long-GOP streams so a
+    healthy 20 s-keyframe capture is not mistaken for a stall, and capped so
+    a dead capture is still caught. The ceiling never pulls below the base.
+    """
+    base = float(base_s)
+    if longest_segment_s is None or not math.isfinite(longest_segment_s) or longest_segment_s <= 0:
+        return base
+    return max(base, min(float(ceiling_s), float(segments) * float(longest_segment_s)))
+
+
 def _concat(sources: list[Path], target: Path) -> None:
     """Stream-copy ``sources`` into ``target`` in order.
 
@@ -670,12 +709,14 @@ def _concat(sources: list[Path], target: Path) -> None:
 
 __all__ = [
     "PENDING_CAP_BYTES",
+    "RECENT_SEGMENTS",
     "SEGMENT_EXT",
     "SEGMENT_LIST_PREFIX",
     "SEGMENT_S",
     "ExtractedWindow",
     "RingBuffer",
     "SegmentInfo",
+    "adaptive_timeout_s",
     "discard_segment_files",
     "segment_index_at",
     "segment_list_name",

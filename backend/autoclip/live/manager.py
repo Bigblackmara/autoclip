@@ -254,7 +254,8 @@ def _needs_restart(old: LiveSettings, new: LiveSettings) -> bool:
     return (
         old.detection.chat.enabled != new.detection.chat.enabled
         or old.detection.audio.baseline_window_s != new.detection.audio.baseline_window_s
-        or old.rolling_buffer.segment_s != new.rolling_buffer.segment_s
+        # rolling_buffer.segment_s is read-only (pinned to SEGMENT_S), so it
+        # can never change and needs no restart check.
     )
 
 

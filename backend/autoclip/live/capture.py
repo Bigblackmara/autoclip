@@ -41,9 +41,13 @@ Pipeline shape (and why it is two subprocesses at most, never a pipe chain):
    previous ffmpeg's late write) are never committed.
 
    The tailer is also the stall watchdog: when ffmpeg is alive but no
-   segment has been committed for ``stall_timeout_s`` (≈3 segments), the
-   process is killed and an ``"error"`` event fires, so the watcher
-   reconnects instead of sitting on a frozen capture forever.
+   segment has been committed for ≈3 segments, the process is killed and an
+   ``"error"`` event fires, so the watcher reconnects instead of sitting on
+   a frozen capture forever. "3 segments" means 3 × the longest RECENT real
+   segment (never less than ``stall_timeout_s``, at most
+   ``STALL_CEILING_S``): a stream with a 20 s keyframe interval only closes
+   a segment every ~20 s, and a fixed 18 s timeout would restart it in a
+   loop.
 
 Events go through ``on_event(kind, detail)`` with a *string* detail (the
 watcher marshals them onto its event loop and logs the text): ``"started"``
@@ -75,7 +79,14 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .buffer import SEGMENT_EXT, SEGMENT_S, RingBuffer, segment_list_name, segment_name
+from .buffer import (
+    SEGMENT_EXT,
+    SEGMENT_S,
+    RingBuffer,
+    adaptive_timeout_s,
+    segment_list_name,
+    segment_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -97,9 +108,16 @@ TAILER_POLL_S = 0.5
 #: than this fails the input instead of hanging the process forever.
 RW_TIMEOUT_S = 15.0
 
-#: Stall watchdog: ffmpeg alive but no segment committed for this long
-#: (≈3 segments) means a frozen capture — kill it so the watcher reconnects.
+#: Stall watchdog: ffmpeg alive but no segment committed for ≈3 segments
+#: means a frozen capture — kill it so the watcher reconnects. This is the
+#: BASE (3 nominal segments); the live limit is STALL_SEGMENTS × the longest
+#: recent real segment when that is longer, capped at STALL_CEILING_S.
 STALL_TIMEOUT_S = 3 * SEGMENT_S
+#: Segments of silence that count as a stall (scales with real lengths).
+STALL_SEGMENTS = 3.0
+#: Upper bound of the adaptive stall limit: even a long-GOP stream (or one
+#: freak segment after a source hiccup) cannot hide a dead capture longer.
+STALL_CEILING_S = 90.0
 
 #: The first segment gets a longer grace: resolution, HLS startup and the
 #: first full segment all have to happen before anything can commit.
@@ -176,6 +194,8 @@ class StreamCapture:
         poll_s: float = TAILER_POLL_S,
         drain_grace_s: float = DRAIN_GRACE_S,
         stall_timeout_s: float | None = STALL_TIMEOUT_S,
+        stall_segments: float = STALL_SEGMENTS,
+        stall_ceiling_s: float = STALL_CEILING_S,
         first_segment_timeout_s: float | None = FIRST_SEGMENT_TIMEOUT_S,
         duration_probe: Callable[[Path], float | None] | None | object = _AUTO,
     ) -> None:
@@ -188,6 +208,8 @@ class StreamCapture:
         self.poll_s = poll_s
         self.drain_grace_s = drain_grace_s
         self.stall_timeout_s = stall_timeout_s
+        self.stall_segments = stall_segments
+        self.stall_ceiling_s = stall_ceiling_s
         self.first_segment_timeout_s = first_segment_timeout_s
         #: Fallback for a segment with no list row: file → seconds (or None).
         self._duration_probe: Callable[[Path], float | None] | None = (
@@ -477,9 +499,28 @@ class StreamCapture:
                 self._kill_stalled(now - last_progress)
             time.sleep(self.poll_s)
 
+    def stall_limit_s(self) -> float | None:
+        """Seconds without a new segment that count as a stall (None = off).
+
+        Before this capture's first commit: the first-segment grace. After:
+        ``stall_timeout_s`` stretched to ``stall_segments`` × the longest
+        recent segment in the buffer (shared across reconnects, so a respawn
+        keeps what the stream taught us), capped at ``stall_ceiling_s``.
+        """
+        if not self.committed:
+            return self.first_segment_timeout_s or None
+        if not self.stall_timeout_s:
+            return None
+        return adaptive_timeout_s(
+            self.stall_timeout_s,
+            self.buffer.recent_segment_max_s(),
+            segments=self.stall_segments,
+            ceiling_s=self.stall_ceiling_s,
+        )
+
     def _stalled(self, idle_s: float) -> bool:
-        limit = self.stall_timeout_s if self.committed else self.first_segment_timeout_s
-        return bool(limit) and idle_s >= float(limit)  # type: ignore[arg-type]
+        limit = self.stall_limit_s()
+        return limit is not None and idle_s >= float(limit)
 
     def _kill_stalled(self, idle_s: float) -> None:
         """No new segment for too long: kill ffmpeg; the waiter reports it."""
@@ -1006,6 +1047,8 @@ __all__ = [
     "RESOLVE_TIMEOUT_S",
     "RW_TIMEOUT_S",
     "SEGMENT_TIME_S",
+    "STALL_CEILING_S",
+    "STALL_SEGMENTS",
     "STALL_TIMEOUT_S",
     "TAILER_POLL_S",
     "StreamCapture",
