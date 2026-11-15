@@ -67,8 +67,23 @@ export interface Clip {
   user_trimmed: boolean
   caption_style: string
   ratio: string
+  /** The job's layout setting; what a re-export uses unless told otherwise. */
+  layout: Layout
   exports: ExportRecord[]
 }
+
+/**
+ * Frame layout for 9:16 clips. `auto` stacks a detected facecam overlay above
+ * the gameplay (streamer clips) and crops everything else; `split` asks for
+ * the stacked layout whenever a facecam is found; `crop` never stacks.
+ */
+export type Layout = 'auto' | 'split' | 'crop'
+
+export const LAYOUTS: { value: Layout; label: string }[] = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'split', label: 'Facecam + gameplay' },
+  { value: 'crop', label: 'Crop' },
+]
 
 export interface Word {
   text: string
@@ -146,6 +161,7 @@ export interface Settings {
     prefer_hardware_encoder: boolean
     crf: number
     write_srt: boolean
+    layout: Layout
   }
   insecure_secret_storage: boolean
   keys_present: Record<string, boolean>
@@ -188,6 +204,7 @@ export interface JobSettingsOverrides {
   max_clips?: number
   caption_style?: string
   ratio?: string
+  layout?: Layout
 }
 
 /** An API error carrying the server's message and its actionable hint. */
@@ -297,10 +314,16 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
-  exportClip: (clipId: string, ratio: string, style: string, writeSrt = false) =>
+  exportClip: (
+    clipId: string,
+    ratio: string,
+    style: string,
+    writeSrt = false,
+    layout?: Layout,
+  ) =>
     request<ExportRecord>(`/api/clips/${clipId}/export`, {
       method: 'POST',
-      body: JSON.stringify({ ratio, style, write_srt: writeSrt }),
+      body: JSON.stringify({ ratio, style, write_srt: writeSrt, layout }),
     }),
 
   captionStyles: () => request<CaptionStyle[]>('/api/caption-styles'),

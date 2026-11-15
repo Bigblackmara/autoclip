@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import {
   api,
+  type Layout,
   type ProviderStatus,
   type Settings as SettingsData,
   type SettingsPatch,
@@ -242,6 +243,18 @@ export function Settings() {
             value={settings.export.ratio}
             onChange={(value) => patch({ export: { ratio: value } })}
             options={['9:16', '1:1', '16:9']}
+          />
+          <Select
+            label="Layout (9:16)"
+            hint="Gameplay streams: stack the streamer's facecam above the game instead of cropping it out."
+            value={settings.export.layout}
+            onChange={(value) => patch({ export: { layout: value as Layout } })}
+            options={['auto', 'split', 'crop']}
+            labels={{
+              auto: 'Auto — facecam + gameplay when a cam is found',
+              split: 'Facecam + gameplay',
+              crop: 'Crop — follow the speaker',
+            }}
           />
           <NumberField
             label="Loudness target (LUFS)"

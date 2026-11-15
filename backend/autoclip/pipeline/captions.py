@@ -248,6 +248,7 @@ def build_ass(
     width: int,
     height: int,
     time_offset_s: float = 0.0,
+    margin_v_ratio: float | None = None,
 ) -> pysubs2.SSAFile:
     """Build an ASS subtitle file for a clip.
 
@@ -265,6 +266,10 @@ def build_ass(
 
     scale = height / REFERENCE_HEIGHT
     subs.styles[STYLE_NAME] = _build_ass_style(style, height=height, scale=scale)
+    if margin_v_ratio is not None:
+        # Layouts with a panel the captions must stay clear of (the split
+        # layout's facecam) override the preset's distance from the bottom.
+        subs.styles[STYLE_NAME].marginv = round(height * margin_v_ratio)
 
     groups = group_words(words, max_words=style.max_words)
 
@@ -403,9 +408,20 @@ def write_ass(
     width: int,
     height: int,
     time_offset_s: float = 0.0,
+    margin_v_ratio: float | None = None,
 ) -> Path:
-    """Render captions to an .ass file and return its path."""
-    subs = build_ass(words, style, width=width, height=height, time_offset_s=time_offset_s)
+    """Render captions to an .ass file and return its path.
+
+    ``margin_v_ratio`` overrides the style's bottom margin (fraction of height).
+    """
+    subs = build_ass(
+        words,
+        style,
+        width=width,
+        height=height,
+        time_offset_s=time_offset_s,
+        margin_v_ratio=margin_v_ratio,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     subs.save(str(path), encoding="utf-8")
     return path

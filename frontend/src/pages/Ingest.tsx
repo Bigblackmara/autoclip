@@ -5,8 +5,10 @@ import {
   ApiError,
   api,
   formatDuration,
+  LAYOUTS,
   type Job,
   type JobSettingsOverrides,
+  type Layout,
   type ProviderStatus,
   type Settings,
 } from '../api'
@@ -304,6 +306,26 @@ function AdvancedOptions({
                 { value: 'small', label: 'small — balanced' },
                 { value: 'medium', label: 'medium' },
                 { value: 'large-v3', label: 'large-v3 — slowest, best' },
+              ]}
+            />
+            {/* Streams with a facecam overlay: stack the cam above the
+                gameplay instead of cropping it out of the 9:16 frame. */}
+            <Selector
+              label="Layout (9:16)"
+              value={overrides.layout ?? ''}
+              onChange={(v) => set('layout', (v || undefined) as Layout | undefined)}
+              options={[
+                {
+                  value: '',
+                  label: `Use default${
+                    defaults
+                      ? ` — ${LAYOUTS.find((l) => l.value === defaults.export.layout)?.label ?? defaults.export.layout}`
+                      : ''
+                  }`,
+                },
+                { value: 'auto', label: 'Auto — facecam + gameplay when a cam is found' },
+                { value: 'split', label: 'Facecam + gameplay' },
+                { value: 'crop', label: 'Crop — follow the speaker' },
               ]}
             />
             <NumberField
