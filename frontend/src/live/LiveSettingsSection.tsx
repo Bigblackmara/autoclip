@@ -284,7 +284,7 @@ export function LiveSettingsSection({
 
       <Section
         title="Buffer & clip timing"
-        note={`How much of each stream is kept on disk, and what a clip includes around its moment. Streams are recorded in fixed ${formatSeconds(buffer.segment_s)} segments.`}
+        note={`How much of each stream is kept on disk, and what a clip includes around its moment. Streams are recorded in segments of about ${formatSeconds(buffer.segment_s)} (cut at keyframes, so real lengths vary; clips are timed from the real lengths).`}
       >
         <div key={revision} className="grid gap-x-8 gap-y-6 sm:grid-cols-2">
           <NumberField

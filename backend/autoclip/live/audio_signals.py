@@ -31,10 +31,13 @@ Emission policy (what A4/A8 can rely on):
   wouldn't happen in time, and after it no further signals fire until a
   non-spike second (or an unobserved time gap) re-arms the edge.
 
-Stream time base: second ``i`` of segment ``index`` lands at
-``t_s = index * SEGMENT_S + i``. Each .ts file decodes standalone (ffmpeg
-resets its timeline per input), so cross-second alignment is bounded by the
-segment's own encoder priming — small next to a 6 s grid.
+Stream time base: second ``i`` of a segment lands at ``t_s = start_s + i``,
+where ``start_s`` is the segment's REAL start from the buffer's per-segment
+index (stream copy cuts at keyframes, so segments are not ``SEGMENT_S``
+long). A segment-like without ``start_s`` falls back to the nominal
+``index * SEGMENT_S``. Each .ts file decodes standalone (ffmpeg resets its
+timeline per input), so cross-second alignment is bounded by the segment's
+own encoder priming.
 """
 
 from __future__ import annotations
@@ -259,10 +262,16 @@ class AudioSignalAnalyzer:
         path: Path,
         *,
         stop_event: threading.Event | None = None,
+        start_s: float | None = None,
     ) -> list[DetectorSignal]:
-        """Decode and analyze buffer segment ``index``; emits via ``on_signal``."""
+        """Decode and analyze buffer segment ``index``; emits via ``on_signal``.
+
+        ``start_s`` is the segment's real stream start (the buffer's index);
+        None falls back to the nominal ``index * segment_s``.
+        """
         pcm = decode_segment_pcm(path, stop_event=stop_event)
-        return self.analyze_pcm(pcm, t_start_s=index * self._segment_s)
+        t_start_s = index * self._segment_s if start_s is None else float(start_s)
+        return self.analyze_pcm(pcm, t_start_s=t_start_s)
 
     def analyze_pcm(self, pcm: np.ndarray, t_start_s: float) -> list[DetectorSignal]:
         """Analyze raw PCM starting at stream time ``t_start_s``.
@@ -486,7 +495,12 @@ def process_pass(
                 log.info("epoch changed at segment %d; baseline reset", seg.index)
             last_epoch = seg.epoch
         try:
-            signals = analyzer.analyze_segment(seg.index, seg.path, stop_event=stop_event)
+            signals = analyzer.analyze_segment(
+                seg.index,
+                seg.path,
+                stop_event=stop_event,
+                start_s=getattr(seg, "start_s", None),
+            )
         except AnalysisCancelled:
             raise
         except (FFmpegError, OSError) as exc:

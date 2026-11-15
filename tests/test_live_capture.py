@@ -154,8 +154,9 @@ class TestNameParsing:
 
 class TestConstants:
     def test_segment_time_matches_buffer(self) -> None:
-        # One constant maps index → seconds for A2/A4/A6; drift is silent
-        # corruption of every detector timestamp.
+        # The -segment_time asked of ffmpeg, and the nominal fallback length
+        # of a segment without a list row. Real times come from the list
+        # (tests/test_live_segment_timing.py), never from index * this.
         assert SEGMENT_TIME_S == 6.0
 
     def test_tailer_defaults_are_sane(self) -> None:

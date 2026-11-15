@@ -81,6 +81,16 @@ def fake_upload_modules(monkeypatch: pytest.MonkeyPatch) -> _FakeUploads:
     """
     fake = _FakeUploads()
 
+    # Import the REAL package (and its real submodules) BEFORE any fake is
+    # installed. Otherwise, when this file runs first in a process, the
+    # import below executes ``uploads/__init__.py`` against the fakes: the
+    # package is then cached for the rest of the session with the fake
+    # submodules bound as its attributes (and monkeypatch "restores" those
+    # fakes at teardown), so later suites — test_live_api's upload tests —
+    # silently talk to these stubs. Layered over real state, every patch
+    # below is undone exactly.
+    import autoclip.live.uploads  # noqa: F401
+
     def install(name: str, **attrs: Any) -> types.ModuleType:
         mod = types.ModuleType(name)
         for key, value in attrs.items():
@@ -123,10 +133,9 @@ def fake_upload_modules(monkeypatch: pytest.MonkeyPatch) -> _FakeUploads:
         save_tokens=lambda *a: None,
     )
 
-    # In a suite run the REAL uploads package is already imported, and
-    # ``from .uploads import youtube`` resolves through the package's
-    # cached submodule attributes — not sys.modules. Patch both paths.
-    # (raising=False: the package holds no youtube attr until first import)
+    # The REAL uploads package is imported (above), and ``from .uploads
+    # import youtube`` resolves through the package's cached submodule
+    # attributes — not sys.modules. Patch both paths.
     import autoclip.live.uploads as _uploads_pkg
 
     monkeypatch.setattr(

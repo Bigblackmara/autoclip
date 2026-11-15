@@ -20,6 +20,16 @@ Pipeline shape (and why it is two subprocesses at most, never a pipe chain):
    (streamlink | ffmpeg) would tie ffmpeg's lifetime to a third party's
    socket; two decoupled processes mean a reconnect restarts only resolution.
 
+   ``-segment_time`` is only a TARGET: with ``-c copy`` the muxer can cut at
+   keyframes only, so a 4 s GOP yields 8 s, 4 s, 8 s ... segments. ffmpeg
+   therefore also writes a CSV segment list (``-segment_list seglist_<n>.csv
+   -segment_list_type csv -segment_list_flags +live``: one
+   ``name,start,end`` row appended as each segment closes — verified on the
+   ffmpeg 9 build), and the tailer hands each segment's real duration to the
+   buffer, whose per-segment time index every consumer reads. A missing row
+   (a killed ffmpeg's last segment) falls back to an ffprobe of the file,
+   then to the nominal length.
+
 3. **Tail.** A daemon thread commits segments strictly in sequence, starting
    at the number this ffmpeg was told to start at: segment N is committed
    only once segment N+1 exists (the segment muxer closes N before it opens
@@ -63,15 +73,20 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
-from .buffer import SEGMENT_EXT, SEGMENT_S, RingBuffer, segment_name
+from .buffer import SEGMENT_EXT, SEGMENT_S, RingBuffer, segment_list_name, segment_name
 
 log = logging.getLogger(__name__)
 
-#: Seconds of stream time per ffmpeg segment. Re-exported from the buffer so
-#: capture and buffer can never drift apart on the one constant that maps
-#: index → seconds for every downstream consumer.
+#: ``-segment_time`` asked of ffmpeg — a nominal target (real segments are
+#: keyframe-cut, see the module docstring). Re-exported from the buffer so the
+#: fallback length a segment gets without a list row matches what was asked.
 SEGMENT_TIME_S = SEGMENT_S
+
+#: Sentinel: "pick the duration probe for me" (real ffprobe for a real
+#: ffmpeg spawn, none for an injected spawn — test doubles write no media).
+_AUTO = object()
 
 #: Tailer poll interval. One interval of commit latency is harmless
 #: (downstream detectors see the segment a moment later); a premature commit
@@ -162,6 +177,7 @@ class StreamCapture:
         drain_grace_s: float = DRAIN_GRACE_S,
         stall_timeout_s: float | None = STALL_TIMEOUT_S,
         first_segment_timeout_s: float | None = FIRST_SEGMENT_TIMEOUT_S,
+        duration_probe: Callable[[Path], float | None] | None | object = _AUTO,
     ) -> None:
         self.url = url
         self.buffer = buffer
@@ -173,6 +189,20 @@ class StreamCapture:
         self.drain_grace_s = drain_grace_s
         self.stall_timeout_s = stall_timeout_s
         self.first_segment_timeout_s = first_segment_timeout_s
+        #: Fallback for a segment with no list row: file → seconds (or None).
+        self._duration_probe: Callable[[Path], float | None] | None = (
+            (probe_segment_duration if spawn is None else None)
+            if duration_probe is _AUTO
+            else duration_probe  # type: ignore[assignment]
+        )
+        #: ffmpeg's CSV segment list for the current spawn (set just before
+        #: spawning, so an injected spawn can write one too). None = no list.
+        self.segment_list_path: Path | None = None
+        #: index -> real duration parsed from the list, until committed.
+        self._list_durations: dict[int, float] = {}
+        #: Bytes of the list already parsed, and an unterminated last line.
+        self._list_offset = 0
+        self._list_partial = b""
 
         self._proc: subprocess.Popen | None = None
         self._tailer: threading.Thread | None = None
@@ -212,6 +242,9 @@ class StreamCapture:
             if self._stop_flag.is_set():
                 return
             self._next_index = self._next_start_number()
+            # Per-spawn name: a respawn never reads (or truncates under the
+            # reader) the previous ffmpeg's list.
+            self.segment_list_path = self.buffer.directory / segment_list_name(self._next_index)
             self._spawn_ffmpeg(stream_url)
             if self._stop_flag.is_set():
                 # stop() landed while Popen ran: it is waiting on this lock
@@ -245,6 +278,7 @@ class StreamCapture:
         for t in (self._tailer, self._waiter, self._stderr_reader):
             if t is not None and t is not current:
                 t.join(timeout=join_timeout)
+        self._drop_segment_list()
         self._stop_done.set()
 
     @property
@@ -322,6 +356,15 @@ class StreamCapture:
             "1",
             "-segment_start_number",
             str(start_number),
+            # Real per-segment start/end times (stream copy cuts at
+            # keyframes, so segments are NOT segment_time long). CSV rows
+            # are appended as each segment closes; +live keeps it streaming.
+            "-segment_list",
+            str(self.segment_list_path or self.buffer.directory / segment_list_name(start_number)),
+            "-segment_list_type",
+            "csv",
+            "-segment_list_flags",
+            "+live",
             # Harmless on mpegts (verified byte-identical output) and pinned
             # by the frozen work order; left in for argv parity with the doc.
             "-movflags",
@@ -426,6 +469,9 @@ class StreamCapture:
                     ffmpeg_dead_since = now
                 elif now - ffmpeg_dead_since >= self.drain_grace_s:
                     self._poll_once(final=True)
+                    # Every segment is committed; the list has served its
+                    # purpose (its durations now live on the SegmentInfos).
+                    self._drop_segment_list()
                     break
             elif self._stalled(now - last_progress):
                 self._kill_stalled(now - last_progress)
@@ -456,6 +502,9 @@ class StreamCapture:
         """
         directory = self.buffer.directory
         progressed = False
+        # Rows for N are written before N+1 is opened, so reading the list
+        # first means every segment found closed below already has its row.
+        self._read_segment_list()
         while not self._stop_flag.is_set():
             index = self._next_index
             path = directory / segment_name(index)
@@ -476,10 +525,71 @@ class StreamCapture:
                 progressed = True
         return progressed
 
+    def _read_segment_list(self) -> None:
+        """Parse rows ffmpeg appended to the segment list since the last read.
+
+        Incremental (a day-long watch appends ~15k rows) and line-exact: an
+        unterminated last line is kept for the next read, because a half-
+        flushed ``seg_000003.ts,18.0,2`` would parse as a bogus end time.
+        A file shorter than what was read means it was rewritten: start over.
+        """
+        path = self.segment_list_path
+        if path is None:
+            return
+        try:
+            size = path.stat().st_size
+            if size < self._list_offset:
+                self._list_offset, self._list_partial = 0, b""
+            if size == self._list_offset:
+                return
+            with open(path, "rb") as handle:
+                handle.seek(self._list_offset)
+                chunk = handle.read(size - self._list_offset)
+        except OSError:
+            return  # not created yet (no segment closed), or briefly locked
+        self._list_offset += len(chunk)
+        data = self._list_partial + chunk
+        lines = data.split(b"\n")
+        self._list_partial = lines.pop()  # b"" when data ended with a newline
+        for raw in lines:
+            row = parse_segment_list_row(raw.decode("utf-8", "replace"))
+            if row is not None and row[0] >= self._next_index:
+                self._list_durations[row[0]] = row[1]
+
+    def _segment_duration(self, index: int, path: Path) -> float | None:
+        """Real duration of a closed segment: list row → probe → None."""
+        duration = self._list_durations.pop(index, None)
+        if duration is not None:
+            return duration
+        if self._duration_probe is None or self.segment_list_path is None:
+            # No list at all (test double, old caller): the buffer's nominal
+            # fallback keeps the old timeline without spawning ffprobe.
+            return None
+        try:
+            return self._duration_probe(path)
+        except Exception:
+            log.debug("tailer: duration probe failed for %s", path.name, exc_info=True)
+            return None
+
+    def _drop_segment_list(self) -> None:
+        path = self.segment_list_path
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Windows: ffmpeg still dying with the file open. A new watch
+            # lifecycle's discard_segment_files sweeps stale lists.
+            log.debug("could not delete segment list %s", path, exc_info=True)
+
     def _commit_index(self, index: int) -> bool:
         """Hand one closed segment to the buffer (it re-stats the size)."""
         try:
-            self.buffer.commit_segment(index)
+            duration = self._segment_duration(index, self.buffer.directory / segment_name(index))
+            if duration is None:
+                self.buffer.commit_segment(index)
+            else:
+                self.buffer.commit_segment(index, duration_s=duration)
         except ValueError as exc:
             # The buffer refused a state change (duplicate or out-of-order
             # commit). Log and keep tailing: killing a whole live stream over
@@ -542,6 +652,37 @@ def index_from_name(name: str) -> int:
     if not is_segment_name(name):
         raise ValueError(f"not a segment name: {name!r}")
     return int(name[4:-3])
+
+
+def parse_segment_list_row(line: str) -> tuple[int, float] | None:
+    """``seg_000012.ts,48.07,56.07`` → ``(12, 8.0)``; None for anything else.
+
+    The segment muxer's CSV times are in ffmpeg's INPUT timeline (they ignore
+    ``-reset_timestamps`` and restart with every spawn), so only the
+    difference is used — the buffer chains durations into its own clock.
+    """
+    parts = line.strip().rsplit(",", 2)
+    if len(parts) != 3:
+        return None
+    name = parts[0].strip().strip('"').replace("\\", "/").rsplit("/", 1)[-1]
+    if not is_segment_name(name):
+        return None
+    try:
+        start, end = float(parts[1]), float(parts[2])
+    except ValueError:
+        return None
+    duration = end - start
+    if not (0.0 < duration < 3600.0):
+        return None
+    return index_from_name(name), duration
+
+
+def probe_segment_duration(path: Path) -> float | None:
+    """ffprobe fallback for a segment the list never described."""
+    from ..pipeline.ffmpeg import probe
+
+    duration = probe(path).duration_s
+    return float(duration) if duration and duration > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -872,5 +1013,7 @@ __all__ = [
     "index_from_name",
     "is_segment_name",
     "kill_process_tree",
+    "parse_segment_list_row",
+    "probe_segment_duration",
     "resolve_stream_url",
 ]

@@ -5,8 +5,19 @@ tracks what's on disk, prunes anything older than the retention window and the
 disk cap, and can extract a contiguous range on demand for clipping.
 
 Segment naming: ``seg_{index:06d}.ts`` where ``index`` counts from the start of
-the watch (not from zero each reconnect). Small integers map to wall-clock
-monotonically; index → seconds is ``index * SEGMENT_S``.
+the watch (not from zero each reconnect).
+
+Stream time is NOT ``index * SEGMENT_S``. The capture stream-copies, so
+ffmpeg can only cut at keyframes: with ``-segment_time 6`` and a 4 s GOP the
+segments come out 8 s, 4 s, 8 s ... (variable). Every segment therefore
+carries its real ``start_s``/``duration_s``: the duration comes from ffmpeg's
+segment list (``capture.py``), and the start is the running sum of the
+durations before it, so the clock stays monotonic and gap-free within a
+watch. Every time ↔ segment mapping below (extraction, pins, pruning, the
+watcher's stream clock) reads that index, never the nominal length. When no
+real duration is known (old callers, test doubles, a killed ffmpeg's last
+segment) a segment falls back to the nominal ``SEGMENT_S`` — which is exactly
+the old ``index * SEGMENT_S`` timeline.
 
 Implementation notes (why it looks like this):
 
@@ -42,11 +53,17 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-#: Seconds of stream time per segment file.
+#: NOMINAL seconds per segment file: the ``-segment_time`` ffmpeg is asked
+#: for, and the fallback duration of a segment whose real length is unknown.
+#: Real segments run longer (and vary) because stream copy cuts at keyframes
+#: only — never convert index ↔ seconds with this; use the per-segment index.
 SEGMENT_S = 6.0
 #: Extension for segments. MPEG-TS is resilient to being cut mid-GOP, which is
 #: exactly what a rolling live buffer needs.
 SEGMENT_EXT = ".ts"
+#: ffmpeg's per-spawn segment list (``seglist_<start index>.csv``) lives in
+#: the buffer directory next to the segments it describes.
+SEGMENT_LIST_PREFIX = "seglist_"
 
 #: Hard ceiling on in-process pending clip bytes before watchers stall capture
 #: to disk (safety valve; enforced by the manager, not the buffer itself).
@@ -62,6 +79,11 @@ def segment_name(index: int) -> str:
     return f"seg_{index:06d}{SEGMENT_EXT}"
 
 
+def segment_list_name(start_index: int) -> str:
+    """Name of the segment list an ffmpeg numbering from ``start_index`` writes."""
+    return f"{SEGMENT_LIST_PREFIX}{start_index:06d}.csv"
+
+
 @dataclass
 class SegmentInfo:
     """Metadata for one segment on disk."""
@@ -72,6 +94,37 @@ class SegmentInfo:
     #: Segments written after a reconnect get a new ``epoch`` so clipping can
     #: refuse ranges that would jump across a discontinuity.
     epoch: int = 0
+    #: Stream time this segment's media starts at. ``None`` (hand-built
+    #: infos, old test doubles) means the nominal ``index * SEGMENT_S``.
+    start_s: float | None = None
+    #: Real media length (from ffmpeg's segment list); nominal when unknown.
+    duration_s: float = SEGMENT_S
+
+    def __post_init__(self) -> None:
+        if self.start_s is None:
+            self.start_s = self.index * SEGMENT_S
+
+    @property
+    def end_s(self) -> float:
+        """Stream time this segment's media ends at (exclusive)."""
+        return float(self.start_s) + self.duration_s  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class ExtractedWindow:
+    """What :meth:`RingBuffer.extract_window` actually wrote.
+
+    Extraction copies WHOLE segments, so the file usually starts before the
+    requested start and ends after the requested end. ``start_s`` is the
+    stream time of the file's first frame: media time ``t`` in the file is
+    stream time ``start_s + t`` (transcript word times, trims, render cuts).
+    """
+
+    path: Path
+    start_s: float
+    end_s: float
+    start_index: int
+    end_index: int
 
 
 class RingBuffer:
@@ -100,6 +153,10 @@ class RingBuffer:
         self._last_committed: dict[int, int] = {}
         #: Cumulative stream seconds deleted by prune() — stats only.
         self._clipped_s = 0.0
+        #: (index, end_s) of the newest segment ever committed. Survives
+        #: pruning, so the stream clock keeps running even if the disk cap
+        #: deleted every held segment.
+        self._clock: tuple[int, float] | None = None
 
         # Eager mkdir: the capture layer (and tests) write segment files
         # before any commit, and a buffer pointing at a missing directory is
@@ -129,8 +186,18 @@ class RingBuffer:
                 path.unlink(missing_ok=True)
             return path
 
-    def commit_segment(self, index: int, *, epoch: int | None = None) -> SegmentInfo:
+    def commit_segment(
+        self,
+        index: int,
+        *,
+        epoch: int | None = None,
+        duration_s: float | None = None,
+    ) -> SegmentInfo:
         """Register a fully written segment after ffmpeg closes it.
+
+        ``duration_s`` is the segment's real media length (ffmpeg's segment
+        list); ``None`` or nonsense falls back to the nominal ``SEGMENT_S``.
+        The segment's ``start_s`` is derived from the segments before it.
 
         Returns the committed SegmentInfo. Commits are strictly ordered per
         epoch; a commit for an older index than one already registered raises.
@@ -162,7 +229,16 @@ class RingBuffer:
                     f"segment file {path.name} is not on disk; commit only after"
                     " ffmpeg has fully written and closed the file"
                 ) from exc
-            info = SegmentInfo(index=index, path=path, size_bytes=size, epoch=seg_epoch)
+            if duration_s is None or not math.isfinite(duration_s) or duration_s <= 0:
+                duration_s = SEGMENT_S
+            info = SegmentInfo(
+                index=index,
+                path=path,
+                size_bytes=size,
+                epoch=seg_epoch,
+                start_s=self._start_for(index),
+                duration_s=float(duration_s),
+            )
             self.segments.append(info)
             if len(self.segments) > 1 and self.segments[-2].index > info.index:
                 # Only reachable when a previous epoch's tailer commits late
@@ -170,6 +246,8 @@ class RingBuffer:
                 # newest, so keep it index-sorted.
                 self.segments.sort(key=lambda seg: seg.index)
             self._last_committed[seg_epoch] = index
+            if self._clock is None or index > self._clock[0]:
+                self._clock = (index, info.end_s)
             return info
 
     def begin_epoch(self) -> int:
@@ -185,7 +263,7 @@ class RingBuffer:
         with self._lock:
             if not self.segments:
                 return 0.0
-            return (self.segments[-1].index - self.segments[0].index + 1) * SEGMENT_S
+            return self.segments[-1].end_s - float(self.segments[0].start_s)  # type: ignore[arg-type]
 
     def clipped_seconds(self) -> float:
         """Seconds freed/lost (pruned or beyond cap) — for stats only."""
@@ -222,26 +300,40 @@ class RingBuffer:
         with self._lock:
             if not self.segments:
                 raise ValueError("buffer holds no segments; nothing to compute a pre-roll from")
-            newest = self.segments[-1].index
-            oldest = self.segments[0].index
             if seconds < 0:
                 seconds = 0.0
-            # floor, never ceil: subscription math must over-cover, never
-            # under-cover — a pre-roll one segment short silently cuts the
-            # moment's setup line, and no metric ever catches that.
-            target = newest - math.floor(seconds / SEGMENT_S)
-            return max(oldest, min(newest, target))
+            # Step back over WHOLE older segments while their real durations
+            # still fit in ``seconds`` — the time-based form of the old
+            # ``newest - floor(seconds / SEGMENT_S)`` (floor, never ceil).
+            target = self.segments[-1].index
+            budget = seconds
+            for seg in reversed(self.segments[:-1]):
+                if seg.duration_s > budget + 1e-9:
+                    break
+                budget -= seg.duration_s
+                target = seg.index
+            return target
 
     def covered_until_s(self) -> float | None:
         """Stream time up to which committed segments exist (None if empty).
 
-        ``(newest index + 1) * SEGMENT_S`` — the end of the newest committed
-        segment. A clip window ending after this has not been captured yet.
+        The real end of the newest committed segment. A clip window ending
+        after this has not been captured yet.
         """
         with self._lock:
             if not self.segments:
                 return None
-            return (self.segments[-1].index + 1) * SEGMENT_S
+            return self.segments[-1].end_s
+
+    def index_at(self, t_s: float) -> int:
+        """Index of the segment holding stream time ``t_s`` (for pins).
+
+        Before the oldest held segment → the oldest; past the newest → the
+        nominal extrapolation beyond it; an empty buffer → nominal. A pin at
+        the returned index therefore shields everything from ``t_s`` on.
+        """
+        with self._lock:
+            return self._index_at_locked(t_s)
 
     def extract(
         self,
@@ -253,7 +345,8 @@ class RingBuffer:
     ) -> Path:
         """Concatenate the range [start_s, end_s) of stream time into ``target``.
 
-        Caller must hold a per-stream clipping lock so a prune race can't cut
+        Thin wrapper over :meth:`extract_window` for callers that only need
+        the path. Caller must hold a per-stream clipping lock so a prune race can't cut
         the segment set underneath us. The buffer prunes nothing while a
         extraction pin is held— see ``pin_oldest``.
 
@@ -263,31 +356,49 @@ class RingBuffer:
         epoch-straddling range still raises (no way to tell which side
         matters).
         """
+        return self.extract_window(start_s, end_s, target, anchor_s=anchor_s).path
+
+    def extract_window(
+        self,
+        start_s: float,
+        end_s: float,
+        target: Path,
+        *,
+        anchor_s: float | None = None,
+    ) -> ExtractedWindow:
+        """:meth:`extract`, also reporting the media span actually written.
+
+        Whole segments are copied, so the file covers ``[result.start_s,
+        result.end_s)`` ⊇ the requested range (clamped to what is held).
+        Consumers that place a moment inside the file — the judge's word
+        offsets, the render's cut points — subtract ``result.start_s``.
+        """
         if end_s <= start_s:
             raise ValueError(f"end_s ({end_s}) must exceed start_s ({start_s})")
         target = Path(target)
         with self._lock:
             if not self.segments:
                 raise ValueError("buffer holds no segments; nothing to extract")
-            oldest = self.segments[0].index
-            newest = self.segments[-1].index
-            # seconds → index: first segment touching start_s, last segment
-            # touching end_s (end_s itself excluded — the range is half-open),
-            # then both clamped to the segments that actually exist.
-            raw_start = math.floor(max(start_s, 0.0) / SEGMENT_S)
-            raw_end = math.ceil(end_s / SEGMENT_S) - 1
-            if raw_start > newest:
+            oldest = self.segments[0]
+            newest = self.segments[-1]
+            # seconds → index through the REAL per-segment times: first
+            # segment whose media reaches past start_s, last segment starting
+            # before end_s (end_s itself excluded — the range is half-open),
+            # both clamped to the segments that actually exist.
+            start_s = max(start_s, 0.0)
+            if start_s >= newest.end_s - 1e-9:
                 raise ValueError(
-                    f"range starts at index {raw_start}, ahead of the newest"
-                    f" captured index {newest}; nothing to extract there yet"
+                    f"range starts at {start_s:.1f}s, ahead of the newest captured"
+                    f" segment {newest.index} (ends {newest.end_s:.1f}s); nothing to"
+                    " extract there yet"
                 )
-            if raw_end < oldest:
+            if end_s <= float(oldest.start_s) + 1e-9:  # type: ignore[arg-type]
                 raise ValueError(
-                    f"range ends below the oldest retained segment ({oldest});"
+                    f"range ends below the oldest retained segment ({oldest.index});"
                     " it has already been pruned"
                 )
-            start_index = max(raw_start, oldest)
-            end_index = min(raw_end, newest)
+            start_index = next(s.index for s in self.segments if s.end_s > start_s + 1e-9)
+            end_index = max(s.index for s in self.segments if s.start_s < end_s - 1e-9)
             if anchor_s is not None:
                 start_index, end_index = self._clamp_to_anchor_epoch(
                     start_index, end_index, anchor_s
@@ -296,13 +407,21 @@ class RingBuffer:
             # releasing the lock between those steps would let a prune delete
             # the range we just chose.
             paths = self.range_paths(start_index, end_index)
+            held = {s.index: s for s in self.segments}
+            window = ExtractedWindow(
+                path=target,
+                start_s=float(held[start_index].start_s),  # type: ignore[arg-type]
+                end_s=held[end_index].end_s,
+                start_index=start_index,
+                end_index=end_index,
+            )
             self.pin_oldest(start_index)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             _concat(paths, target)
         finally:
             self.unpin(start_index)
-        return target
+        return window
 
     def pin_oldest(self, index: int) -> None:
         """Prevent pruning of segments at or above ``index`` until un-pinned.
@@ -341,7 +460,10 @@ class RingBuffer:
         with self._lock:
             if not self.segments:
                 return 0
-            now = now_index if now_index is not None else self.segments[-1].index
+            # Ages are measured in REAL stream time from the newest segment's
+            # start (or ``now_index``'s), so long keyframe-cut segments do
+            # not stretch the retention window.
+            now_s = self._start_for_now(now_index)
             freed = 0
 
             # Pass 1 — retention. Age is monotonic along the sorted list, so
@@ -350,7 +472,7 @@ class RingBuffer:
             # bytes.
             while self.segments:
                 seg = self.segments[0]
-                if (now - seg.index) * SEGMENT_S < self.retain_s:
+                if now_s - float(seg.start_s) < self.retain_s:  # type: ignore[arg-type]
                     break
                 if self._shielded(seg.index):
                     break
@@ -400,7 +522,7 @@ class RingBuffer:
         in_range = [s for s in self.segments if start_index <= s.index <= end_index]
         if len({s.epoch for s in in_range}) <= 1:
             return start_index, end_index
-        anchor_index = max(start_index, min(end_index, math.floor(max(anchor_s, 0.0) / SEGMENT_S)))
+        anchor_index = max(start_index, min(end_index, self._index_at_locked(anchor_s)))
         anchor = min(in_range, key=lambda s: (abs(s.index - anchor_index), -s.index))
         position = in_range.index(anchor)
         first = last = position
@@ -418,6 +540,50 @@ class RingBuffer:
         )
         return in_range[first].index, in_range[last].index
 
+    def _start_for(self, index: int) -> float:
+        """Stream start of a NEW segment ``index``: the end of the one before.
+
+        The predecessor is the nearest lower index still held, or the clock
+        record of the newest ever committed (which survives pruning). Index
+        gaps (a skipped zero-byte segment) count nominally, so an all-nominal
+        buffer reproduces the old ``index * SEGMENT_S`` timeline exactly.
+        Called under the lock.
+        """
+        pred: tuple[int, float] | None = None
+        for seg in self.segments:
+            if seg.index >= index:
+                break
+            pred = (seg.index, seg.end_s)
+        clock = self._clock
+        if clock is not None and clock[0] < index and (pred is None or clock[0] > pred[0]):
+            pred = clock
+        if pred is None:
+            return index * SEGMENT_S
+        return pred[1] + (index - pred[0] - 1) * SEGMENT_S
+
+    def _start_for_now(self, now_index: int | None) -> float:
+        """Stream time prune() measures ages from. Called under the lock."""
+        newest = self.segments[-1]
+        newest_start = float(newest.start_s)  # type: ignore[arg-type]
+        if now_index is None:
+            return newest_start
+        for seg in self.segments:
+            if seg.index == now_index:
+                return float(seg.start_s)  # type: ignore[arg-type]
+        return newest_start + (now_index - newest.index) * SEGMENT_S
+
+    def _index_at_locked(self, t_s: float) -> int:
+        """See :meth:`index_at`. Called under the lock."""
+        t_s = max(0.0, float(t_s))
+        if not self.segments:
+            return int(t_s // SEGMENT_S)
+        newest = self.segments[-1]
+        if t_s >= newest.end_s:
+            return newest.index + 1 + int((t_s - newest.end_s) // SEGMENT_S)
+        # The holder of t_s — or, in a hole / before the oldest, the next
+        # held segment (a pin there still covers t_s onward).
+        return next(seg.index for seg in self.segments if t_s < seg.end_s)
+
     def _shielded(self, index: int) -> bool:
         """Whether any pin shields the segment at ``index`` (pin at or below it)."""
         return any(pin <= index for pin in self._pins)
@@ -433,13 +599,29 @@ class RingBuffer:
             log.debug("segment %s is in use; deferring delete", seg.path.name)
             return 0
         self.segments.remove(seg)
-        self._clipped_s += SEGMENT_S
+        self._clipped_s += seg.duration_s
         return seg.size_bytes
 
 
-def discard_segment_files(directory: Path) -> int:
-    """Delete every ``seg_*.ts`` file in ``directory``; returns files removed.
+def segment_index_at(buffer: object, t_s: float) -> int:
+    """Segment index holding stream time ``t_s`` on any buffer-like (pins).
 
+    Uses :meth:`RingBuffer.index_at` (the real per-segment index); minimal
+    test doubles without it get the nominal ``t_s // SEGMENT_S``.
+    """
+    index_at = getattr(buffer, "index_at", None)
+    if callable(index_at):
+        try:
+            return int(index_at(t_s))
+        except Exception:
+            log.debug("index_at(%s) failed; using the nominal index", t_s, exc_info=True)
+    return int(max(0.0, t_s) // SEGMENT_S)
+
+
+def discard_segment_files(directory: Path) -> int:
+    """Delete every ``seg_*.ts`` (and stale ``seglist_*.csv``) in ``directory``.
+
+    Returns the number of files removed.
     A fresh RingBuffer knows nothing about files a previous lifecycle left
     behind, while a fresh ffmpeg numbers from 0 — so stale high-index files
     would be committed as if new and every real segment refused as out of
@@ -454,7 +636,9 @@ def discard_segment_files(directory: Path) -> int:
         return 0
     for entry in entries:
         name = entry.name
-        if not (name.startswith("seg_") and name.endswith(SEGMENT_EXT)):
+        is_segment = name.startswith("seg_") and name.endswith(SEGMENT_EXT)
+        is_list = name.startswith(SEGMENT_LIST_PREFIX) and name.endswith(".csv")
+        if not (is_segment or is_list):
             continue
         try:
             entry.unlink()
@@ -487,9 +671,13 @@ def _concat(sources: list[Path], target: Path) -> None:
 __all__ = [
     "PENDING_CAP_BYTES",
     "SEGMENT_EXT",
+    "SEGMENT_LIST_PREFIX",
     "SEGMENT_S",
+    "ExtractedWindow",
     "RingBuffer",
     "SegmentInfo",
     "discard_segment_files",
+    "segment_index_at",
+    "segment_list_name",
     "segment_name",
 ]

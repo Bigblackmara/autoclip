@@ -17,7 +17,9 @@ log = logging.getLogger(__name__)
 
 
 class LiveRollingBufferSettings(BaseModel):
-    #: Seconds of stream time per .ts segment.
+    #: Target seconds per .ts segment (capture currently always asks ffmpeg
+    #: for buffer.SEGMENT_S). Real segments are keyframe-cut and vary; the
+    #: buffer times clips from their real lengths, never from this.
     segment_s: float = 6.0
     #: How much of the stream to keep on disk, in minutes.
     retain_minutes: float = 5.0

@@ -84,6 +84,7 @@ from .buffer import (  # noqa: F401  (PENDING_CAP_BYTES: manager)
     SEGMENT_S,
     RingBuffer,
     discard_segment_files,
+    segment_index_at,
 )
 from .circuit import JudgeCircuitBreaker, PerStreamCooldown, TokenBucket  # noqa: F401
 from .judge import JudgeBudgetExhausted, LiveJudgement, judge_window
@@ -94,6 +95,15 @@ from .signals import DetectorSignal, SignalKind, SignalWindow
 from .states import StreamState, can_transition, is_terminal
 
 log = logging.getLogger(__name__)
+
+
+def _segment_start(segment: Any) -> float:
+    """A SegmentInfo-like's real start; nominal for doubles without one."""
+    start = getattr(segment, "start_s", None)
+    if start is None:
+        return float(segment.index) * SEGMENT_S
+    return float(start)
+
 
 # -- wiring constants -----------------------------------------------------------
 
@@ -1018,11 +1028,11 @@ class StreamWatcher:
     def _stream_now(self) -> float:
         """Stream seconds captured so far — the shared detector timeline.
 
-        Segment indices are global to the watch (A1: they never reset within
-        a lifecycle), so ``index * SEGMENT_S`` is a monotonic stream clock.
-        Chat's ``clock`` and audio's segment-derived times therefore share
-        one base — which is what makes the trigger's combined window math
-        meaningful.
+        The newest segment's REAL start time (the buffer chains real,
+        keyframe-cut durations into a monotonic clock; ``index * SEGMENT_S``
+        drifts by seconds per segment). Chat's ``clock`` and audio's
+        segment-derived times therefore share one base — which is what makes
+        the trigger's combined window math meaningful.
         """
         buffer = self._buffer
         if buffer is None:
@@ -1030,7 +1040,7 @@ class StreamWatcher:
         try:
             segments = buffer.segments
             if segments:
-                return float(segments[-1].index) * SEGMENT_S
+                return _segment_start(segments[-1])
         except Exception:
             pass
         return 0.0
@@ -1392,7 +1402,10 @@ class StreamWatcher:
         start earlier than the render window when ``judge_context_s`` gave
         the judge extra lead-up), so a trim point is first converted to
         stream time via ``judge_start_s + word time``, then clamped into the
-        render window. Advice that would tighten below TRIM_MIN_S, or trim
+        render window. ``judge_start_s`` must be the stream time of the
+        judge FILE's first frame (the extraction's real media start, not the
+        requested start: whole segments are copied, and keyframe-cut
+        segments make that gap several seconds). Advice that would tighten below TRIM_MIN_S, or trim
         to a range entirely outside the render window, is ignored wholesale
         — a judge with bad taste in pacing shouldn't shrink a clip into
         nothing or blow past the pre-roll the buffer holds.
@@ -1466,7 +1479,9 @@ class StreamWatcher:
         segments = getattr(buffer, "segments", None)
         with contextlib.suppress(Exception):
             if segments:
-                return (float(segments[-1].index) + 1.0) * SEGMENT_S
+                newest = segments[-1]
+                duration = float(getattr(newest, "duration_s", SEGMENT_S))
+                return _segment_start(newest) + duration
         return None
 
     async def _await_coverage(self, end_s: float) -> None:
@@ -1501,7 +1516,7 @@ class StreamWatcher:
         pin = getattr(self._buffer, "pin_oldest", None)
         if pin is None:
             return None
-        index = int(max(0.0, start_s) // SEGMENT_S)
+        index = segment_index_at(self._buffer, start_s)
         try:
             pin(index)
         except Exception:
@@ -1517,11 +1532,20 @@ class StreamWatcher:
             with contextlib.suppress(Exception):
                 unpin(index)
 
-    async def _extract(self, start_s: float, end_s: float, target: Path, anchor_s: float) -> None:
-        """Threaded buffer extract, epoch-clamped to the trigger when supported."""
+    async def _extract(
+        self, start_s: float, end_s: float, target: Path, anchor_s: float
+    ) -> float | None:
+        """Threaded buffer extract, epoch-clamped to the trigger when supported.
+
+        Returns the stream time the written file's media starts at (whole
+        segments are copied, so usually before ``start_s``), or None when
+        the buffer can't say (minimal test doubles).
+        """
         from .clip_factory import _buffer_extract
 
-        await asyncio.to_thread(_buffer_extract, self._buffer, start_s, end_s, target, anchor_s)
+        return await asyncio.to_thread(
+            _buffer_extract, self._buffer, start_s, end_s, target, anchor_s
+        )
 
     async def _process_candidate(self, window: SignalWindow, decision: Any) -> None:
         """Turn one triggered window into a judged, enqueued clip candidate.
@@ -1607,11 +1631,17 @@ class StreamWatcher:
             judge_start_s = max(0.0, trigger_end_s - context_s) if context_s > 0 else clip_start_s
             # The post-roll is still in the future when the trigger fires.
             await self._await_coverage(clip_end_s)
+            # Stream time of the judge file's first frame: transcript word
+            # times are relative to it. None → the requested start (old
+            # behaviour, for buffers that can't report it).
+            judge_media_start_s: float | None = None
             try:
                 # extract() validates + pins + concatenates + unpins in one
                 # call (A1); a pruned range raises a clear error the
                 # candidate path records verbatim.
-                await self._extract(judge_start_s, judge_end_s, source_path, trigger_end_s)
+                judge_media_start_s = await self._extract(
+                    judge_start_s, judge_end_s, source_path, trigger_end_s
+                )
                 await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
             except Exception as exc:
                 if context_s > 0:
@@ -1626,7 +1656,9 @@ class StreamWatcher:
                     )
                     judge_start_s = clip_start_s
                     try:
-                        await self._extract(clip_start_s, clip_end_s, source_path, trigger_end_s)
+                        judge_media_start_s = await self._extract(
+                            clip_start_s, clip_end_s, source_path, trigger_end_s
+                        )
                         await asyncio.to_thread(self._deps.audio_extract, source_path, audio_path)
                     except Exception as exc2:
                         raise RuntimeError(f"window extraction failed: {exc2}") from exc2
@@ -1682,11 +1714,15 @@ class StreamWatcher:
             if breaker is not None:
                 with contextlib.suppress(Exception):
                     breaker.success()
+            if judge_media_start_s is None:
+                judge_media_start_s = judge_start_s
             self._save_verdict(
                 directory,
                 judgement,
                 judge_start_s=judge_start_s,
                 judge_end_s=judge_end_s,
+                # Stream time of the saved transcript's t=0.
+                judge_media_start_s=judge_media_start_s,
                 signals=signals,
             )
 
@@ -1708,7 +1744,7 @@ class StreamWatcher:
                 return
 
             final_start, final_end = self._trim_window(
-                judgement, words, clip_start_s, clip_end_s, judge_start_s
+                judgement, words, clip_start_s, clip_end_s, judge_media_start_s
             )
             # Verdict passed: mark the cooldown so this stream cools down even
             # if the enqueue below drops the item under queue/disk pressure.

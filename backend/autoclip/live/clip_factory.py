@@ -21,6 +21,15 @@ wrap them:
   window manifest guards the reuse against a row whose window was revised
   between attempts, which would otherwise silently render the wrong moment.
 
+Extraction copies WHOLE segments, and stream-copied segments are cut at
+keyframes (often 8 s+, variable), so ``raw.ts`` usually starts seconds before
+``clip_start_s`` and ends after ``clip_end_s``. The buffer reports the real
+stream time of the file's first frame; it is recorded in the window manifest
+(``media_start_s``) and the render cuts ``[clip_start_s, clip_end_s)`` out of
+the file at exactly that offset. A manifest without it (staged before this
+existed, or by a buffer that can't report it) renders the whole file, as
+before.
+
 The remux is where the MPEG-TS quirks of concatenated ``-reset_timestamps``
 segments surface (packet-corrupt warnings, DTS jumps), which is exactly why it
 gets the one real-ffmpeg test in this module's suite rather than a mock.
@@ -46,7 +55,7 @@ from ..pipeline.reframe import ReframeConfig, build_crop_path
 from ..pipeline.reframe.croppath import CropPath
 from ..pipeline.transcript import Transcript
 from . import gpu
-from .buffer import SEGMENT_S, RingBuffer
+from .buffer import RingBuffer, segment_index_at
 from .models import LiveClipRow
 from .paths import clip_dir
 
@@ -188,16 +197,33 @@ def _validate_row(clip_row: LiveClipRow) -> captions.CaptionStyle:
 # -- window manifest --------------------------------------------------------
 
 
-def _window_matches(work: Path, clip_row: LiveClipRow) -> bool:
-    """True when artifacts in ``work`` were produced for this exact window."""
+def _read_manifest(work: Path) -> dict | None:
     manifest = work / WINDOW_NAME
     if not manifest.is_file():
-        return False
+        return None
     try:
         decoded: object = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(decoded, dict):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _manifest_media_start(work: Path) -> float | None:
+    """Stream time of ``raw.ts``'s first frame, if the manifest recorded it."""
+    decoded = _read_manifest(work)
+    if decoded is None:
+        return None
+    try:
+        value = decoded.get("media_start_s")
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _window_matches(work: Path, clip_row: LiveClipRow) -> bool:
+    """True when artifacts in ``work`` were produced for this exact window."""
+    decoded = _read_manifest(work)
+    if decoded is None:
         return False
     try:
         start = float(decoded.get("clip_start_s", -1.0))  # type: ignore[arg-type]
@@ -207,38 +233,87 @@ def _window_matches(work: Path, clip_row: LiveClipRow) -> bool:
     return abs(start - clip_row.clip_start_s) < 1e-6 and abs(end - clip_row.clip_end_s) < 1e-6
 
 
-def _write_window_manifest(work: Path, clip_row: LiveClipRow) -> None:
-    write_window_manifest(work, clip_row.clip_start_s, clip_row.clip_end_s)
+def _write_window_manifest(
+    work: Path, clip_row: LiveClipRow, media_start_s: float | None = None
+) -> None:
+    write_window_manifest(work, clip_row.clip_start_s, clip_row.clip_end_s, media_start_s)
 
 
-def write_window_manifest(work: Path, clip_start_s: float, clip_end_s: float) -> None:
-    """Record which window ``raw.ts`` in ``work`` was cut for."""
-    (work / WINDOW_NAME).write_text(
-        json.dumps({"clip_start_s": clip_start_s, "clip_end_s": clip_end_s}),
-        encoding="utf-8",
-    )
+def write_window_manifest(
+    work: Path,
+    clip_start_s: float,
+    clip_end_s: float,
+    media_start_s: float | None = None,
+) -> None:
+    """Record which window ``raw.ts`` in ``work`` was cut for.
+
+    ``media_start_s`` is the stream time of ``raw.ts``'s first frame (None
+    when the buffer could not say — the render then keeps the whole file).
+    """
+    record: dict[str, float] = {"clip_start_s": clip_start_s, "clip_end_s": clip_end_s}
+    if media_start_s is not None:
+        record["media_start_s"] = float(media_start_s)
+    (work / WINDOW_NAME).write_text(json.dumps(record), encoding="utf-8")
 
 
 def _buffer_extract(
     buffer: Any, start_s: float, end_s: float, target: Path, anchor_s: float | None
-) -> None:
-    """``buffer.extract`` with the trigger anchor when the buffer supports it.
+) -> float | None:
+    """Extract ``[start_s, end_s)``; the file's real media start (stream s).
 
-    The anchor lets a window that straddles a reconnect clamp to the
-    trigger's epoch instead of failing; minimal test buffers without the
-    keyword are called the old way.
+    Prefers ``extract_window`` (the real RingBuffer), which reports where
+    the whole-segment copy actually starts. Minimal test buffers with only
+    ``extract`` return None (start unknown). The anchor lets a window that
+    straddles a reconnect clamp to the trigger's epoch instead of failing;
+    buffers without the keyword are called the old way.
     """
-    if anchor_s is not None and _accepts_anchor(buffer):
+    extract_window = getattr(buffer, "extract_window", None)
+    if callable(extract_window):
+        if anchor_s is not None and _accepts_anchor(extract_window):
+            window = extract_window(start_s, end_s, target, anchor_s=anchor_s)
+        else:
+            window = extract_window(start_s, end_s, target)
+        start = getattr(window, "start_s", None)
+        return None if start is None else float(start)
+    if anchor_s is not None and _accepts_anchor(buffer.extract):
         buffer.extract(start_s, end_s, target, anchor_s=anchor_s)
     else:
         buffer.extract(start_s, end_s, target)
+    return None
 
 
-def _accepts_anchor(buffer: Any) -> bool:
+def _accepts_anchor(method: Any) -> bool:
     try:
-        return "anchor_s" in inspect.signature(buffer.extract).parameters
+        return "anchor_s" in inspect.signature(method).parameters
     except (TypeError, ValueError, AttributeError):
         return False
+
+
+def _render_span(
+    clip_row: LiveClipRow, media_start_s: float | None, duration: float
+) -> tuple[float, float]:
+    """Where ``[clip_start_s, clip_end_s)`` sits inside the extracted file.
+
+    Stream time ``t`` is file time ``t - media_start_s``. Unknown start, or a
+    span that collapses after clamping to the file, keeps the whole file
+    (the pre-index behaviour) rather than rendering a sliver.
+    """
+    if media_start_s is None or duration <= 0:
+        return 0.0, duration
+    start = min(max(0.0, clip_row.clip_start_s - media_start_s), duration)
+    end = min(max(0.0, clip_row.clip_end_s - media_start_s), duration)
+    if end - start < 1.0:
+        log.warning(
+            "Clip %s window %.1fs..%.1fs falls outside its extract (starts %.1fs, %.1fs long);"
+            " rendering the whole extract.",
+            clip_row.id,
+            clip_row.clip_start_s,
+            clip_row.clip_end_s,
+            media_start_s,
+            duration,
+        )
+        return 0.0, duration
+    return start, end
 
 
 def window_staged(clip_row: LiveClipRow) -> bool:
@@ -270,14 +345,14 @@ def stage_window(
     work = clip_dir(clip_id)
     work.mkdir(parents=True, exist_ok=True)
     raw = work / RAW_NAME
-    _buffer_extract(buffer, clip_start_s, clip_end_s, raw, anchor_s)
+    media_start_s = _buffer_extract(buffer, clip_start_s, clip_end_s, raw, anchor_s)
     if not _valid_file(raw):
         raise ClipProductionError(
             f"live clip {clip_id} [extract]: the staged window is empty",
             stage="extract",
             clip_id=clip_id,
         )
-    write_window_manifest(work, clip_start_s, clip_end_s)
+    write_window_manifest(work, clip_start_s, clip_end_s, media_start_s)
     return raw
 
 
@@ -338,12 +413,15 @@ def _extract_window(
             "the clip window was never staged and the stream's rolling buffer is gone"
             " (stream paused or removed)",
         )
-    pin_index = int(clip_row.clip_start_s // SEGMENT_S)
+    pin_index = segment_index_at(buffer, clip_row.clip_start_s)
     buffer.pin_oldest(pin_index)
+    media_start_s: float | None = None
     try:
         try:
             anchor = clip_row.trigger_end_s if clip_row.trigger_end_s > 0 else None
-            _buffer_extract(buffer, clip_row.clip_start_s, clip_row.clip_end_s, target, anchor)
+            media_start_s = _buffer_extract(
+                buffer, clip_row.clip_start_s, clip_row.clip_end_s, target, anchor
+            )
         except Exception as exc:
             _fail(
                 "extract",
@@ -364,14 +442,14 @@ def _extract_window(
             buffer.unpin(pin_index)
         except Exception:  # never mask the real failure with an unpin glitch
             log.warning("Unpinning segment %d failed; the pin will expire on close.", pin_index)
-    _write_window_manifest(target.parent, clip_row)
+    _write_window_manifest(target.parent, clip_row, media_start_s)
     tracker.finish("extract")
 
 
 def _remux(raw: Path, destination: Path, clip_id: str) -> None:
     """Copy the .ts range into a seekable faststart MP4 — container only.
 
-    Live extracts are MPEG-TS: whole 6-second segments concatenated, so the
+    Live extracts are MPEG-TS: whole (keyframe-cut) segments concatenated, so the
     stream carries a timestamp discontinuity at every segment boundary and
     may open mid-GOP (the extraction starts at an arbitrary second).
     ``+genpts`` fills gaps in packet timestamps and ``make_zero`` keeps the
@@ -496,9 +574,12 @@ def produce(
         tracker.finish("remux")
 
     duration = info.duration_s or (clip_row.clip_end_s - clip_row.clip_start_s)
+    # The clip's own span inside the whole-segment extract (file seconds).
+    render_start, render_end = _render_span(clip_row, _manifest_media_start(work), duration)
 
-    # 3 — Whisper input. Word times come back relative to the extraction, so no
-    # offset arithmetic is ever needed downstream.
+    # 3 — Whisper input: the whole extract, so word times are file-relative —
+    # the same timeline the crop path and export cut [render_start, render_end)
+    # from (export shifts captions by its start_s).
     if not _valid_file(audio):
         tracker.begin("audio")
         try:
@@ -555,8 +636,8 @@ def produce(
         try:
             crop_path = build_crop_path(
                 normalized,
-                start_s=0.0,
-                end_s=duration,
+                start_s=render_start,
+                end_s=render_end,
                 transcript=transcript,
                 config=ReframeConfig(aspect_w=aspect_w, aspect_h=aspect_h),
             )
@@ -577,8 +658,8 @@ def produce(
     request = export.ExportRequest(
         source=normalized,
         destination=destination,
-        start_s=0.0,
-        end_s=duration,
+        start_s=render_start,
+        end_s=render_end,
         crop_path=crop_path,
         words=transcript.words,
         style=style,
