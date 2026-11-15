@@ -179,6 +179,7 @@ class TestLongGopStallWatchdog:
             cap.start()
             _produce(buffer, cap, 3, GOP20, real_gap_s=GOP20 / SCALE)
             assert wait_until(proc.killed.is_set)
+            assert wait_until(lambda: any(k == "error" for k, _ in events))
         finally:
             cap.stop()
         assert any(k == "error" and "stalled" in d for k, d in events)
@@ -239,6 +240,8 @@ class TestLongGopStallWatchdog:
             assert wait_until(lambda: cap.committed == 1)
             assert cap.stall_limit_s() == STALL_CEILING_S
             assert wait_until(proc.killed.is_set)
+            # The waiter reports the kill; stop() before that would mute it.
+            assert wait_until(lambda: any(k == "error" for k, _ in events))
         finally:
             cap.stop()
         assert any(k == "error" and "stalled" in d for k, d in events)
