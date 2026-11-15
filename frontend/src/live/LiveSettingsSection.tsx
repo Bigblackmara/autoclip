@@ -1,684 +1,627 @@
 /**
- * Live Watch settings section (F3).
+ * Live Watch settings.
  *
- * Self-contained by work order: pages/Settings.tsx's Field / NumberField /
- * Select are module-private and must not be edited, so typed equivalents are
- * inlined in this file and only liveApi + the shared ErrorNote are imported.
+ * Edits stage a draft; nothing leaves the browser until Save, and Save sends
+ * the complete merged object (the server validates and replaces the whole
+ * `live` section, then applies it to the running watchers at once).
  *
- * How this screen behaves, and why it isn't the obvious version:
- *
- * - Editing stages a draft; nothing leaves the browser until Save. Each
- *   top-level section (enable / buffer / rate limits / detection / uploads /
- *   workers) is deep-compared against the last loaded snapshot, and the
- *   sticky bar lists exactly which sections carry unsaved changes. Save is
- *   disabled until at least one section is dirty, and Revert drops the draft.
- * - The PUT sends the COMPLETE merged settings object, not just the dirty
- *   sections. A server that validates a full LiveSettings body (the plain
- *   FastAPI `body: LiveSettings` reading of the /api/live/settings contract)
- *   would default-reset every field the user never touched if it received a
- *   partial body — pydantic fills missing sections with defaults. Sending
- *   the whole merged object is safe under merge-semantics servers too, so it
- *   is the shape that works everywhere. Section-level dirty flags drive the
- *   bar copy only.
- * - Numbers parse strictly: an empty or malformed draft is an inline error
- *   and is never silently coerced into a value, placeholders never stand in
- *   for real values, and fields the backend types as int reject decimals
- *   instead of truncating behind the user's back.
- *
- * Contract deviations the integrator must know about (also in the report):
- *
- * - The rights attestation is NOT sent through liveApi — live/api.ts is
- *   frozen for this worker. setAttestation() POSTs directly to
- *   `POST /api/live/uploads/attestation` with `{"accepted": true}`, the
- *   endpoint A10 must expose for A7's keyring gate (A7 refuses uploads until
- *   live_rights_attestation="accepted:<date>"). Errors are decoded from the
- *   body's `detail` the same way request() in api.ts does.
- * - The frozen backend docstring has no read endpoint for the attestation
- *   state, so the UI can only confirm an acceptance it posted itself, this
- *   session. If A10 adds GET status, wire it into the initial load.
+ * - Every number field validates as you type and reports to this parent, so
+ *   Save is blocked while any field holds something that isn't a value. Fields
+ *   are remounted on Save and Revert (`key={revision}`), which is what makes
+ *   Revert reset a half-typed field instead of leaving its text behind.
+ * - Detection and Workers are tuning knobs most people never touch; they sit
+ *   behind an Advanced disclosure. Knobs this version doesn't enforce aren't
+ *   offered as if they did.
+ * - The draft's upload preferences live in Settings → Uploads with the rest of
+ *   the upload setup (UploadsSettings).
  */
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 
-import { liveApi, type LiveSettingsData } from '../live/api'
 import { ErrorNote } from '../components/ErrorNote'
+import { asError, errorText, liveApi, type LiveSettingsData } from './api'
+import { plural } from './format'
+import { UploadsSettings } from './UploadsSettings'
+import { announce, scrollToElement } from './ui'
 
-type AuthStatus = { connected: boolean; account: string | null }
-type Platform = 'youtube' | 'instagram'
-
-/** Drives the sticky bar's "Unsaved: …" copy. Order matches the sections. */
+/** Drives the save bar's "Unsaved: …" copy. Order matches the page. */
 const SECTION_TITLES: ReadonlyArray<{ key: keyof LiveSettingsData; title: string }> = [
-  { key: 'enabled', title: 'Enable' },
+  { key: 'enabled', title: 'Live Watch on/off' },
   { key: 'rolling_buffer', title: 'Buffer' },
-  { key: 'rate_limit', title: 'Rate limits' },
-  { key: 'detection', title: 'Detection' },
+  { key: 'rate_limit', title: 'Judge' },
   { key: 'uploads', title: 'Uploads' },
+  { key: 'detection', title: 'Detection' },
   { key: 'workers', title: 'Workers' },
 ]
 
+interface NumberSpec {
+  min?: number
+  max?: number
+  integer?: boolean
+}
+
 /**
- * Strict number parsing. Returns the value, or the user-facing reason it
- * cannot become one. Never coerces: '' is not 0, '3.5' is not 3 in an integer
- * field, and out-of-range is rejected rather than clamped.
+ * Strict parsing: the value, or the reason it can't be one. Never coerces —
+ * '' is not 0, '3.5' is not 3 in a whole-number field, and out of range is
+ * an error rather than a silent clamp.
  */
-function parseNumber(
-  raw: string,
-  spec: { min?: number; max?: number; integer?: boolean },
-): number | string {
+function parseNumber(raw: string, spec: NumberSpec): number | string {
   const text = raw.trim()
-  if (text === '') return 'Enter a number'
+  if (text === '') return 'Enter a number.'
   const parsed = Number(text)
-  if (!Number.isFinite(parsed)) return 'Not a number'
-  if (spec.integer && !Number.isInteger(parsed)) return 'Whole numbers only'
-  if (parsed < (spec.min ?? Number.NEGATIVE_INFINITY)) {
-    return spec.max !== undefined ? `Between ${spec.min} and ${spec.max}` : `At least ${spec.min}`
+  if (!Number.isFinite(parsed)) return 'That isn’t a number.'
+  if (spec.integer && !Number.isInteger(parsed)) return 'Whole numbers only.'
+  if (spec.min !== undefined && parsed < spec.min) {
+    return spec.max !== undefined ? `Between ${spec.min} and ${spec.max}.` : `At least ${spec.min}.`
   }
-  if (parsed > (spec.max ?? Number.POSITIVE_INFINITY)) return `At most ${spec.max}`
+  if (spec.max !== undefined && parsed > spec.max) {
+    return spec.min !== undefined ? `Between ${spec.min} and ${spec.max}.` : `At most ${spec.max}.`
+  }
   return parsed
 }
 
-/** Minimal deep-equal for the settings tree (plain JSON objects/arrays only). */
+/** Minimal deep-equal for the settings tree (plain JSON objects only). */
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true
   if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
   const left = a as Record<string, unknown>
   const right = b as Record<string, unknown>
-  const leftKeys = Object.keys(left)
-  if (leftKeys.length !== Object.keys(right).length) return false
-  return leftKeys.every((key) => key in right && deepEqual(left[key], right[key]))
+  const keys = Object.keys(left)
+  if (keys.length !== Object.keys(right).length) return false
+  return keys.every((key) => key in right && deepEqual(left[key], right[key]))
 }
 
-function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+function formatSeconds(seconds: number): string {
+  if (seconds < 90) return `${Math.round(seconds)} s`
+  const minutes = seconds / 60
+  return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} min`
 }
 
-/**
- * Best-effort error message from a non-2xx Response, mirroring the `detail`
- * decoding request() does — so server hints reach the user here too.
- */
-async function describeHttpError(response: Response): Promise<string> {
-  let message = `${response.status} ${response.statusText}`
-  try {
-    const body = (await response.json()) as { detail?: unknown }
-    if (typeof body.detail === 'string') {
-      message = body.detail
-    } else if (body.detail && typeof body.detail === 'object') {
-      const detail = body.detail as { message?: unknown; hint?: unknown }
-      const parts = [
-        typeof detail.message === 'string' ? detail.message : '',
-        typeof detail.hint === 'string' ? detail.hint : '',
-      ].filter(Boolean)
-      if (parts.length > 0) message = parts.join(' — ')
-    }
-  } catch {
-    /* Body had no JSON; the status line is the best we have. */
-  }
-  return message
-}
+type Validity = (key: string, label: string, error: string | null) => void
 
-export function LiveSettingsSection() {
+export function LiveSettingsSection({
+  onSettingsChange,
+  onDirtyChange,
+  focusEnableSignal,
+  focusUploadsSignal,
+  authRefreshSignal,
+}: {
+  /** The saved settings, on load and after every save. */
+  onSettingsChange: (saved: LiveSettingsData) => void
+  /** True while the draft differs from what's saved (or can't be saved). */
+  onDirtyChange: (dirty: boolean) => void
+  /** Bumped to scroll to and focus the on/off switch. */
+  focusEnableSignal: number
+  /** Bumped to scroll to the uploads setup. */
+  focusUploadsSignal: number
+  /** Bumped when upload status should be re-read (back from a consent page). */
+  authRefreshSignal: number
+}) {
   const [saved, setSaved] = useState<LiveSettingsData | null>(null)
   const [draft, setDraft] = useState<LiveSettingsData | null>(null)
+  const [revision, setRevision] = useState(0)
+  const [invalid, setInvalid] = useState<Record<string, { label: string; error: string }>>({})
   const [loadError, setLoadError] = useState<Error | null>(null)
   const [saveError, setSaveError] = useState<Error | null>(null)
   const [saving, setSaving] = useState(false)
-  const [justSaved, setJustSaved] = useState(false)
+  const [lastSave, setLastSave] = useState<{ applied: boolean } | null>(null)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const enableRef = useRef<HTMLInputElement>(null)
+  const uploadsRef = useRef<HTMLElement>(null)
+  const pendingFocus = useRef<'enable' | 'uploads' | null>(null)
+  const reportSettings = useRef(onSettingsChange)
+  reportSettings.current = onSettingsChange
+  const ids = { enable: useId(), advanced: useId() }
 
-  const [auth, setAuth] = useState<{ youtube: AuthStatus | null; instagram: AuthStatus | null }>({
-    youtube: null,
-    instagram: null,
-  })
-  const [authBusy, setAuthBusy] = useState<Platform | null>(null)
-  const [authError, setAuthError] = useState<{ youtube: string | null; instagram: string | null }>({
-    youtube: null,
-    instagram: null,
-  })
-
-  const [attestationChecked, setAttestationChecked] = useState(false)
-  const [attestationBusy, setAttestationBusy] = useState(false)
-  const [attestationError, setAttestationError] = useState<string | null>(null)
-  const [attestationRecorded, setAttestationRecorded] = useState(false)
-
-  const load = () => {
+  const load = useCallback(() => {
     setLoadError(null)
     liveApi
       .getSettings()
       .then((data) => {
         setSaved(data)
         setDraft(data)
+        setInvalid({})
+        setRevision((current) => current + 1)
+        reportSettings.current(data)
       })
-      .catch((err: unknown) => setLoadError(err instanceof Error ? err : new Error(messageOf(err))))
-  }
-
-  const recordAuthError = (platform: Platform, message: string | null) =>
-    setAuthError((prev) =>
-      platform === 'youtube' ? { ...prev, youtube: message } : { ...prev, instagram: message },
-    )
-
-  const loadAuth = (platform: Platform) => {
-    const call = platform === 'youtube' ? liveApi.youTubeAuthStatus() : liveApi.instagramAuthStatus()
-    call
-      .then((status) => {
-        setAuth((prev) =>
-          platform === 'youtube' ? { ...prev, youtube: status } : { ...prev, instagram: status },
-        )
-        recordAuthError(platform, null)
-      })
-      .catch((err: unknown) => recordAuthError(platform, `Status unavailable: ${messageOf(err)}`))
-  }
-
-  // OAuth consent happens in the tab window.open() gave us, and the callback
-  // lands on the backend — so the reliable moment to re-read status is when
-  // the user comes back to THIS tab.
-  useEffect(() => {
-    const onFocus = () => {
-      loadAuth('youtube')
-      loadAuth('instagram')
-    }
-    window.addEventListener('focus', onFocus)
-    return () => window.removeEventListener('focus', onFocus)
+      .catch((error: unknown) => setLoadError(asError(error)))
   }, [])
 
-  useEffect(() => {
-    load()
-    loadAuth('youtube')
-    loadAuth('instagram')
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(load, [load])
+
+  const onValidity = useCallback<Validity>((key, label, error) => {
+    setInvalid((current) => {
+      if (error === null) {
+        if (!(key in current)) return current
+        const next = { ...current }
+        delete next[key]
+        return next
+      }
+      if (current[key]?.error === error) return current
+      return { ...current, [key]: { label, error } }
+    })
   }, [])
 
-  const connect = async (platform: Platform) => {
-    if (authBusy) return
-    setAuthBusy(platform)
-    recordAuthError(platform, null)
-    try {
-      const start =
-        platform === 'youtube'
-          ? await liveApi.startYouTubeAuth()
-          : await liveApi.startInstagramAuth()
-      if (!start.redirect_url) throw new Error('The server returned no redirect URL')
-      window.open(start.redirect_url, '_blank', 'noopener,noreferrer')
-    } catch (err: unknown) {
-      recordAuthError(platform, messageOf(err))
-    } finally {
-      setAuthBusy(null)
-    }
-  }
-
-  /**
-   * Rights attestation — the one call that bypasses liveApi (see the header
-   * note: api.ts is frozen for F3). Contract: POST /api/live/uploads/attestation
-   * with {"accepted": true}; A7 persists the keyring flag and unlocks uploads.
-   */
-  const setAttestation = async () => {
-    if (!attestationChecked || attestationBusy) return
-    setAttestationBusy(true)
-    setAttestationError(null)
-    try {
-      const response = await fetch('/api/live/uploads/attestation', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accepted: true }),
-      })
-      if (!response.ok) throw new Error(await describeHttpError(response))
-      setAttestationRecorded(true)
-    } catch (err: unknown) {
-      setAttestationError(messageOf(err))
-    } finally {
-      setAttestationBusy(false)
-    }
-  }
-
-  const isDirty = (key: keyof LiveSettingsData): boolean =>
-    !!draft && !!saved && !deepEqual(draft[key], saved[key])
-
-  const dirtyTitles = SECTION_TITLES.filter((s) => isDirty(s.key)).map((s) => s.title)
+  const dirtyTitles =
+    draft && saved
+      ? SECTION_TITLES.filter(({ key }) => !deepEqual(draft[key], saved[key])).map(({ title }) => title)
+      : []
   const dirty = dirtyTitles.length > 0
+  const invalidList = Object.values(invalid)
+  const blocked = invalidList.length > 0
+
+  useEffect(() => {
+    onDirtyChange(dirty || blocked)
+  }, [dirty, blocked, onDirtyChange])
+
+  useEffect(() => {
+    if (dirty) setLastSave(null)
+  }, [dirty])
+
+  // "Turn on in Settings" and "Open upload settings" land here. The panel may
+  // have just been un-hidden, or still be loading: try now, and again on load.
+  const runPendingFocus = useCallback(() => {
+    const target = pendingFocus.current
+    if (!target) return
+    const element = target === 'enable' ? enableRef.current : uploadsRef.current
+    if (!element) return
+    pendingFocus.current = null
+    requestAnimationFrame(() => {
+      scrollToElement(element, target === 'enable' ? 'center' : 'start')
+      if (target === 'enable') element.focus({ preventScroll: true })
+    })
+  }, [])
+
+  useEffect(() => {
+    if (focusEnableSignal > 0) {
+      pendingFocus.current = 'enable'
+      runPendingFocus()
+    }
+  }, [focusEnableSignal, runPendingFocus])
+
+  useEffect(() => {
+    if (focusUploadsSignal > 0) {
+      pendingFocus.current = 'uploads'
+      runPendingFocus()
+    }
+  }, [focusUploadsSignal, runPendingFocus])
+
+  useEffect(() => {
+    if (draft) runPendingFocus()
+  }, [draft, runPendingFocus])
 
   const save = async () => {
-    if (!draft || !dirty || saving) return
+    if (!draft || !dirty || saving || blocked) return
     setSaving(true)
     setSaveError(null)
     try {
-      // Full merged object on purpose — a full-body-validating server must not
-      // see a partial body it would fill with defaults.
-      const next = await liveApi.putSettings(draft)
+      const { applied, ...next } = await liveApi.putSettings(draft)
       setSaved(next)
       setDraft(next)
-      setJustSaved(true)
-      setTimeout(() => setJustSaved(false), 1600)
-    } catch (err: unknown) {
-      setSaveError(err instanceof Error ? err : new Error(messageOf(err)))
+      setInvalid({})
+      setRevision((current) => current + 1)
+      setLastSave({ applied: applied === true })
+      announce(applied ? 'Settings saved and applied to the running watchers.' : 'Settings saved.')
+      onSettingsChange(next)
+    } catch (error) {
+      setSaveError(asError(error))
+      announce(`Settings not saved: ${errorText(error)}`)
     } finally {
       setSaving(false)
     }
   }
 
   const revert = () => {
-    if (saved) setDraft(saved)
+    if (!saved) return
+    setDraft(saved)
+    setInvalid({})
+    setSaveError(null)
+    setRevision((current) => current + 1)
+    announce('Changes reverted.')
   }
 
-  // Section updaters — explicit per section so the compiler checks every key
-  // instead of trusting a generic computed-property spread.
+  // Section updaters — explicit per section so the compiler checks every key.
   const setEnabled = (enabled: boolean) => setDraft((d) => (d ? { ...d, enabled } : d))
   const setBuffer = (patch: Partial<LiveSettingsData['rolling_buffer']>) =>
     setDraft((d) => (d ? { ...d, rolling_buffer: { ...d.rolling_buffer, ...patch } } : d))
   const setRate = (patch: Partial<LiveSettingsData['rate_limit']>) =>
     setDraft((d) => (d ? { ...d, rate_limit: { ...d.rate_limit, ...patch } } : d))
   const setAudio = (patch: Partial<LiveSettingsData['detection']['audio']>) =>
-    setDraft((d) => (d ? { ...d, detection: { ...d.detection, audio: { ...d.detection.audio, ...patch } } } : d))
+    setDraft((d) =>
+      d ? { ...d, detection: { ...d.detection, audio: { ...d.detection.audio, ...patch } } } : d,
+    )
   const setChat = (patch: Partial<LiveSettingsData['detection']['chat']>) =>
-    setDraft((d) => (d ? { ...d, detection: { ...d.detection, chat: { ...d.detection.chat, ...patch } } } : d))
-  const setYouTube = (patch: Partial<LiveSettingsData['uploads']['youtube']>) =>
-    setDraft((d) => (d ? { ...d, uploads: { ...d.uploads, youtube: { ...d.uploads.youtube, ...patch } } } : d))
-  const setInstagram = (patch: Partial<LiveSettingsData['uploads']['instagram']>) =>
-    setDraft((d) => (d ? { ...d, uploads: { ...d.uploads, instagram: { ...d.uploads.instagram, ...patch } } } : d))
+    setDraft((d) =>
+      d ? { ...d, detection: { ...d.detection, chat: { ...d.detection.chat, ...patch } } } : d,
+    )
+  const setUploads = (uploads: LiveSettingsData['uploads']) => setDraft((d) => (d ? { ...d, uploads } : d))
   const setWorkers = (patch: Partial<LiveSettingsData['workers']>) =>
     setDraft((d) => (d ? { ...d, workers: { ...d.workers, ...patch } } : d))
 
   if (loadError) {
     return (
-      <div className="max-w-4xl pt-8">
+      <div className="max-w-4xl pt-10">
         <ErrorNote error={loadError} />
         <button onClick={load} className="btn btn-ghost mt-4">
-          Retry
+          Try again
         </button>
       </div>
     )
   }
 
-  if (!draft) return <p className="max-w-4xl pt-8 text-sm text-ink-500">Loading…</p>
+  if (!draft) return <p className="max-w-4xl pt-10 text-sm text-ink-500">Loading settings…</p>
+
+  const buffer = draft.rolling_buffer
+  const retentionS = buffer.retain_minutes * 60
+  const rollS = buffer.pre_roll_s + buffer.post_roll_s
+  const field = { onValidity }
+  const advancedDirty = dirtyTitles.includes('Detection') || dirtyTitles.includes('Workers')
 
   return (
-    <div className="max-w-4xl pt-8">
-      <div className="rise border-b border-ink-800 pb-5">
-        <h2 className="font-display text-3xl leading-none text-ink-100">Live settings</h2>
-        <p className="mt-2 text-xs text-ink-500">
-          Staged edits — one Save commits every changed section to the watch workers.
-        </p>
-      </div>
+    <div className="max-w-4xl">
+      <p className="mt-8 max-w-prose text-sm leading-relaxed text-ink-400">
+        Changes are staged until you save. Saving applies them to the running watchers right
+        away — no restart.
+      </p>
 
-      <Section title="Enable Live Watch">
+      <Section title="Live Watch" note="The master switch for watching and clipping.">
         <Toggle
+          id={ids.enable}
+          inputRef={enableRef}
           label="Watch streams and clip moments automatically"
-          hint="Records every added stream into a rolling buffer and reacts to detected moments — capture costs CPU and disk even when nothing is found."
+          hint="Each stream on your list is recorded into a rolling buffer. Capture costs CPU and disk even when nothing is found."
           checked={draft.enabled}
           onChange={setEnabled}
         />
       </Section>
 
-      <Section title="Rolling buffer" note="The disk-backed window every stream is recorded into.">
-        <div className="grid gap-5 sm:grid-cols-2">
-          <NumberField
-            label="Segment length (s)"
-            hint="Stream time per buffer segment on disk."
-            value={draft.rolling_buffer.segment_s}
-            min={0.1}
-            onCommit={(v) => setBuffer({ segment_s: v })}
-          />
-          <NumberField
-            label="Retain (min)"
-            hint="How much of each stream is kept, waiting for a trigger."
-            value={draft.rolling_buffer.retain_minutes}
-            min={0.1}
-            onCommit={(v) => setBuffer({ retain_minutes: v })}
-          />
-          <NumberField
-            label="Max disk (MB)"
-            hint="Hard cap for one stream's buffer."
-            value={draft.rolling_buffer.max_disk_mb}
-            integer
-            min={1}
-            onCommit={(v) => setBuffer({ max_disk_mb: v })}
-          />
-          <NumberField
-            label="Pre-roll (s)"
-            hint="Seconds kept before the trigger moment, so clips start early enough."
-            value={draft.rolling_buffer.pre_roll_s}
-            min={0}
-            onCommit={(v) => setBuffer({ pre_roll_s: v })}
-          />
-          <NumberField
-            label="Judge context (s)"
-            hint="How much lead-up the AI judge reads before a trigger. Higher = smarter picks, slightly slower judging."
-            value={draft.rolling_buffer.judge_context_s}
-            min={0}
-            onCommit={(v) => setBuffer({ judge_context_s: v })}
-          />
-          <NumberField
-            label="Post-roll (s)"
-            hint="Seconds kept after the moment ends, so clips don't cut the punchline."
-            value={draft.rolling_buffer.post_roll_s}
-            min={0}
-            onCommit={(v) => setBuffer({ post_roll_s: v })}
-          />
-        </div>
-      </Section>
-
-      <Section title="Rate limits" note="Every judge call spends LLM tokens — these are the brakes.">
-        <div className="grid gap-5 sm:grid-cols-2">
-          <NumberField
-            label="Judge calls / min"
-            hint="Max candidate windows per stream per minute — each one costs tokens."
-            value={draft.rate_limit.judge_per_minute}
-            integer
-            min={1}
-            onCommit={(v) => setRate({ judge_per_minute: v })}
-          />
-          <NumberField
-            label="Judge calls / hour"
-            hint="Per-stream hourly cap — the main throttle on long streams."
-            value={draft.rate_limit.judge_per_hour}
-            integer
-            min={1}
-            onCommit={(v) => setRate({ judge_per_hour: v })}
-          />
-          <NumberField
-            label="Judge calls / day"
-            hint="Per-stream daily ceiling — the strict budget backstop."
-            value={draft.rate_limit.judge_per_day}
-            integer
-            min={1}
-            onCommit={(v) => setRate({ judge_per_day: v })}
-          />
-          <NumberField
-            label="Min score (0-100)"
-            hint="Verdicts scoring below this are dropped — higher keeps fewer, better clips."
-            value={draft.rate_limit.judge_min_score}
-            integer
-            min={0}
-            max={100}
-            onCommit={(v) => setRate({ judge_min_score: v })}
-          />
-          <NumberField
-            label="Cooldown (s)"
-            hint="Quiet time after a clip before the same stream can spend tokens again."
-            value={draft.rate_limit.cooldown_s}
-            min={0}
-            onCommit={(v) => setRate({ cooldown_s: v })}
-          />
-        </div>
-      </Section>
-
       <Section
-        title="Detection"
-        note="Cheap always-on signals that choose which windows the LLM judge sees."
+        title="Buffer & clip timing"
+        note={`How much of each stream is kept on disk, and what a clip includes around its moment. Streams are recorded in fixed ${formatSeconds(buffer.segment_s)} segments.`}
       >
-        <h3 className="eyebrow">Audio</h3>
-        <div className="mt-3 grid gap-5 sm:grid-cols-2">
+        <div key={revision} className="grid gap-x-8 gap-y-6 sm:grid-cols-2">
           <NumberField
-            label="Baseline window (s)"
-            hint="Recent audio the loudness baseline is averaged over."
-            value={draft.detection.audio.baseline_window_s}
-            min={1}
-            onCommit={(v) => setAudio({ baseline_window_s: v })}
+            {...field}
+            name="retain_minutes"
+            label="Keep (minutes)"
+            hint="How much of each stream stays on disk, waiting for a moment."
+            value={buffer.retain_minutes}
+            spec={{ min: 0.1 }}
+            onChange={(v) => setBuffer({ retain_minutes: v })}
           />
           <NumberField
-            label="Spike z-score"
-            hint="How many deviations louder than baseline counts as a spike."
-            value={draft.detection.audio.spike_z}
-            min={0.1}
-            onCommit={(v) => setAudio({ spike_z: v })}
+            {...field}
+            name="max_disk_mb"
+            label="Disk cap per stream (MB)"
+            hint="Hard ceiling for one stream’s buffer, whatever the minutes say."
+            value={buffer.max_disk_mb}
+            spec={{ min: 1, integer: true }}
+            onChange={(v) => setBuffer({ max_disk_mb: v })}
           />
           <NumberField
-            label="RMS floor (0-1)"
-            hint="Below this loudness a spike is ignored — quiet streams can't hype."
-            value={draft.detection.audio.floor_rms}
-            min={0}
-            max={1}
-            onCommit={(v) => setAudio({ floor_rms: v })}
+            {...field}
+            name="pre_roll_s"
+            label="Pre-roll (s)"
+            hint="Seconds kept before the moment, so the clip starts early enough."
+            value={buffer.pre_roll_s}
+            spec={{ min: 0 }}
+            onChange={(v) => setBuffer({ pre_roll_s: v })}
           />
           <NumberField
-            label="Max sustained (s)"
-            hint="Longest run of spike seconds treated as one burst."
-            value={draft.detection.audio.max_sustained_s}
-            min={1}
-            onCommit={(v) => setAudio({ max_sustained_s: v })}
+            {...field}
+            name="post_roll_s"
+            label="Post-roll (s)"
+            hint="Seconds kept after it, so the clip doesn’t cut the punchline."
+            value={buffer.post_roll_s}
+            spec={{ min: 0 }}
+            onChange={(v) => setBuffer({ post_roll_s: v })}
+          />
+          <NumberField
+            {...field}
+            name="judge_context_s"
+            label="Judge context (s)"
+            hint="Lead-up the AI judge reads before a moment. More context, smarter picks, slightly slower verdicts."
+            value={buffer.judge_context_s}
+            spec={{ min: 0 }}
+            onChange={(v) => setBuffer({ judge_context_s: v })}
           />
         </div>
+        {(rollS > retentionS || buffer.judge_context_s > retentionS) && (
+          <div className="mt-6 space-y-2 border-l-2 border-sodium-600 pl-4 text-sm leading-relaxed text-ink-300">
+            {rollS > retentionS && (
+              <p>
+                Pre-roll plus post-roll ({formatSeconds(rollS)}) is longer than the buffer keeps (
+                {formatSeconds(retentionS)}). The start of each clip would already be gone — keep
+                more minutes or shorten the rolls.
+              </p>
+            )}
+            {buffer.judge_context_s > retentionS && (
+              <p className="text-ink-400">
+                The judge can only read what the buffer holds, so its context is capped at{' '}
+                {formatSeconds(retentionS)}.
+              </p>
+            )}
+          </div>
+        )}
+      </Section>
 
-        <h3 className="eyebrow mt-8">Chat</h3>
-        <div className="mt-3">
-          <Toggle
-            label="Read Twitch chat"
-            hint="Chat rate is the second detection signal — the only chat source in v1."
-            checked={draft.detection.chat.enabled}
-            onChange={(v) => setChat({ enabled: v })}
-          />
-        </div>
-        <div className="mt-5 grid gap-5 sm:grid-cols-2">
+      <Section title="Judge & budget" note="Every judged window is one LLM call on your key — these are the brakes.">
+        <div key={revision} className="grid gap-x-8 gap-y-6 sm:grid-cols-2">
           <NumberField
-            label="Baseline window (s)"
-            hint="Chat history the message-rate baseline uses."
-            value={draft.detection.chat.baseline_window_s}
-            min={1}
-            onCommit={(v) => setChat({ baseline_window_s: v })}
+            {...field}
+            name="judge_min_score"
+            label="Minimum score (0–100)"
+            hint="Moments the judge scores below this are dropped, with the score kept. Higher means fewer, better clips."
+            value={draft.rate_limit.judge_min_score}
+            spec={{ min: 0, max: 100, integer: true }}
+            onChange={(v) => setRate({ judge_min_score: v })}
           />
           <NumberField
-            label="Rate z-score"
-            hint="Message-rate deviation that counts as a chat spike."
-            value={draft.detection.chat.rate_z}
-            min={0.1}
-            onCommit={(v) => setChat({ rate_z: v })}
+            {...field}
+            name="cooldown_s"
+            label="Cooldown (s)"
+            hint="Quiet time after a clip before the same stream can trigger again."
+            value={draft.rate_limit.cooldown_s}
+            spec={{ min: 0 }}
+            onChange={(v) => setRate({ cooldown_s: v })}
           />
           <NumberField
-            label="Floor msgs / min"
-            hint="Below this rate chat counts as quiet, whatever the z-score says."
-            value={draft.detection.chat.floor_msgs_per_min}
-            min={0}
-            onCommit={(v) => setChat({ floor_msgs_per_min: v })}
+            {...field}
+            name="judge_per_minute"
+            label="Judge calls per minute"
+            hint="Per stream."
+            value={draft.rate_limit.judge_per_minute}
+            spec={{ min: 1, integer: true }}
+            onChange={(v) => setRate({ judge_per_minute: v })}
           />
           <NumberField
-            label="Emotes per 100 msgs"
-            hint="Emote / CAPS words per 100 messages flagged as hype."
-            value={draft.detection.chat.emotes_threshold}
-            min={0}
-            onCommit={(v) => setChat({ emotes_threshold: v })}
+            {...field}
+            name="judge_per_hour"
+            label="Judge calls per hour"
+            hint="Per stream — the main throttle on long streams."
+            value={draft.rate_limit.judge_per_hour}
+            spec={{ min: 1, integer: true }}
+            onChange={(v) => setRate({ judge_per_hour: v })}
           />
           <NumberField
-            label="Hype train msgs / min"
-            hint="Above this velocity, flag immediately regardless of other signals."
-            value={draft.detection.chat.hypetrain_msgs_per_min}
-            min={1}
-            onCommit={(v) => setChat({ hypetrain_msgs_per_min: v })}
+            {...field}
+            name="judge_per_day"
+            label="Judge calls per day"
+            hint="Per stream — the hard ceiling on spend."
+            value={draft.rate_limit.judge_per_day}
+            spec={{ min: 1, integer: true }}
+            onChange={(v) => setRate({ judge_per_day: v })}
           />
         </div>
       </Section>
 
       <Section
         title="Uploads"
-        note="Official platform APIs via OAuth — credentials stay in your OS keyring."
+        note="Optional. Clips go out through the official APIs with your own OAuth app; tokens and secrets stay in your OS keyring."
+        sectionRef={uploadsRef}
       >
-        <p className="rounded-lg border border-sodium-500/30 bg-sodium-500/5 p-4 text-sm leading-relaxed text-ink-300">
-          <strong className="text-sodium-400">
-            You are responsible for having the rights or permission to clip and repost each
-            streamer's content
-          </strong>
-          , and for following each platform's terms of service. Auto-upload refuses to run
-          until you accept the attestation below.
-        </p>
+        <UploadsSettings
+          uploads={draft.uploads}
+          onChange={setUploads}
+          draftDirty={dirty || blocked}
+          refreshSignal={authRefreshSignal}
+        />
+      </Section>
 
-        <div className="mt-6 grid items-start gap-10 sm:grid-cols-2">
-          <div className="space-y-5">
-            <h3 className="eyebrow">YouTube</h3>
-            <Toggle
-              label="Auto-upload finished clips"
-              hint="Uploads to the connected channel as soon as a clip renders."
-              checked={draft.uploads.youtube.auto_upload}
-              onChange={(v) => setYouTube({ auto_upload: v })}
-            />
-            <Field
-              label="Title prefix"
-              placeholder="e.g. [LIVE]"
-              hint="Prepended to every auto-uploaded title."
-              value={draft.uploads.youtube.title_prefix}
-              onCommit={(v) => setYouTube({ title_prefix: v })}
-            />
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                onClick={() => void connect('youtube')}
-                disabled={authBusy !== null}
-                className="btn btn-ghost"
-              >
-                {authBusy === 'youtube' ? 'Opening…' : auth.youtube?.connected ? 'Reconnect' : 'Connect'}
-              </button>
-              <StatusChip status={auth.youtube} />
-            </div>
-            {authError.youtube && (
-              <p className="text-xs leading-snug text-signal-bad">{authError.youtube}</p>
-            )}
-          </div>
-
-          <div className="space-y-5">
-            <h3 className="eyebrow">Instagram</h3>
-            <Toggle
-              label="Auto-upload finished clips"
-              hint="Publishes as a Reel as soon as a clip renders. Needs a professional account."
-              checked={draft.uploads.instagram.auto_upload}
-              onChange={(v) => setInstagram({ auto_upload: v })}
-            />
-            <Field
-              label="Caption prefix"
-              placeholder="e.g. 🔥"
-              hint="Prepended to every auto-uploaded caption."
-              value={draft.uploads.instagram.caption_prefix}
-              onCommit={(v) => setInstagram({ caption_prefix: v })}
-            />
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                onClick={() => void connect('instagram')}
-                disabled={authBusy !== null}
-                className="btn btn-ghost"
-              >
-                {authBusy === 'instagram' ? 'Opening…' : auth.instagram?.connected ? 'Reconnect' : 'Connect'}
-              </button>
-              <StatusChip status={auth.instagram} />
-            </div>
-            {authError.instagram && (
-              <p className="text-xs leading-snug text-signal-bad">{authError.instagram}</p>
-            )}
-          </div>
-        </div>
-
+      <section className="mt-16">
         <button
-          onClick={() => {
-            loadAuth('youtube')
-            loadAuth('instagram')
-          }}
-          className="btn btn-quiet mt-4 text-xs"
+          type="button"
+          onClick={() => setAdvancedOpen((open) => !open)}
+          aria-expanded={advancedOpen}
+          aria-controls={ids.advanced}
+          className="btn btn-quiet -ml-1"
         >
-          Recheck connection status
+          <span
+            aria-hidden
+            className="inline-block transition-transform duration-300"
+            style={{ transform: advancedOpen ? 'rotate(90deg)' : 'none' }}
+          >
+            ›
+          </span>
+          {advancedOpen ? 'Hide advanced tuning' : 'Advanced tuning'}
+          {!advancedOpen && advancedDirty && <span className="text-sodium-500">· unsaved</span>}
         </button>
+        <p className="mt-1 text-xs text-ink-500">Detection thresholds and worker limits. The defaults suit most streams.</p>
 
-        <div className="mt-8 border-l-2 border-sodium-600 pl-4">
-          <label className="flex items-start gap-3 text-sm text-ink-200">
-            <input
-              type="checkbox"
-              checked={attestationChecked}
-              onChange={(e) => setAttestationChecked(e.target.checked)}
-              className="mt-0.5 size-4 accent-sodium-500"
+        <div id={ids.advanced} hidden={!advancedOpen} className="rise">
+          <Section title="Detection — audio" note="Loudness spikes measured against each stream’s own baseline.">
+            <div key={revision} className="grid gap-x-8 gap-y-6 sm:grid-cols-2">
+              <NumberField
+                {...field}
+                name="audio_baseline"
+                label="Baseline window (s)"
+                hint="Recent audio the loudness baseline is averaged over."
+                value={draft.detection.audio.baseline_window_s}
+                spec={{ min: 1 }}
+                onChange={(v) => setAudio({ baseline_window_s: v })}
+              />
+              <NumberField
+                {...field}
+                name="spike_z"
+                label="Spike z-score"
+                hint="How many deviations above the baseline count as a spike."
+                value={draft.detection.audio.spike_z}
+                spec={{ min: 0.1 }}
+                onChange={(v) => setAudio({ spike_z: v })}
+              />
+              <NumberField
+                {...field}
+                name="floor_rms"
+                label="Loudness floor (0–1)"
+                hint="Below this level a spike is ignored, so a quiet stream can’t fake hype."
+                value={draft.detection.audio.floor_rms}
+                spec={{ min: 0, max: 1 }}
+                onChange={(v) => setAudio({ floor_rms: v })}
+              />
+              <NumberField
+                {...field}
+                name="max_sustained"
+                label="Longest burst (s)"
+                hint="The longest run of spike seconds still counted as one moment."
+                value={draft.detection.audio.max_sustained_s}
+                spec={{ min: 1 }}
+                onChange={(v) => setAudio({ max_sustained_s: v })}
+              />
+            </div>
+          </Section>
+
+          <Section title="Detection — Twitch chat" note="Message rate and hype, read from the public chat — no account needed.">
+            <Toggle
+              label="Read Twitch chat"
+              hint="The second detection signal. Twitch is the only chat source in this version."
+              checked={draft.detection.chat.enabled}
+              onChange={(v) => setChat({ enabled: v })}
             />
-            <span>
-              I have the rights to clip these streams
-              <span className="mt-1 block text-xs leading-snug text-ink-500">
-                Accepted once, stored in your OS keyring — uploads stay refused while it is unset.
-              </span>
-            </span>
-          </label>
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <button
-              onClick={() => void setAttestation()}
-              disabled={!attestationChecked || attestationBusy}
-              className="btn btn-primary"
-            >
-              {attestationBusy ? 'Recording…' : 'Set attestation'}
-            </button>
-            {attestationRecorded && (
-              <span className="text-xs text-signal-good">recorded — uploads unlocked</span>
-            )}
-            {attestationError && (
-              <p className="max-w-prose text-xs leading-snug text-signal-bad">{attestationError}</p>
-            )}
-          </div>
-        </div>
-      </Section>
+            <div key={revision} className="mt-6 grid gap-x-8 gap-y-6 sm:grid-cols-2">
+              <NumberField
+                {...field}
+                name="chat_baseline"
+                label="Baseline window (s)"
+                hint="Chat history the message-rate baseline uses."
+                value={draft.detection.chat.baseline_window_s}
+                spec={{ min: 1 }}
+                onChange={(v) => setChat({ baseline_window_s: v })}
+              />
+              <NumberField
+                {...field}
+                name="rate_z"
+                label="Rate z-score"
+                hint="Message-rate deviation that counts as a chat spike."
+                value={draft.detection.chat.rate_z}
+                spec={{ min: 0.1 }}
+                onChange={(v) => setChat({ rate_z: v })}
+              />
+              <NumberField
+                {...field}
+                name="floor_msgs"
+                label="Quiet below (msgs/min)"
+                hint="Under this rate chat counts as quiet, whatever the z-score says."
+                value={draft.detection.chat.floor_msgs_per_min}
+                spec={{ min: 0 }}
+                onChange={(v) => setChat({ floor_msgs_per_min: v })}
+              />
+              <NumberField
+                {...field}
+                name="emotes"
+                label="Hype words per 100 msgs"
+                hint="Emote and CAPS words per 100 messages that read as hype."
+                value={draft.detection.chat.emotes_threshold}
+                spec={{ min: 0 }}
+                onChange={(v) => setChat({ emotes_threshold: v })}
+              />
+              <NumberField
+                {...field}
+                name="hypetrain"
+                label="Hype train (msgs/min)"
+                hint="Above this velocity a moment fires outright."
+                value={draft.detection.chat.hypetrain_msgs_per_min}
+                spec={{ min: 1 }}
+                onChange={(v) => setChat({ hypetrain_msgs_per_min: v })}
+              />
+            </div>
+          </Section>
 
-      <Section title="Workers" note="Resource ceilings for watching and rendering.">
-        <div className="grid gap-5 sm:grid-cols-3">
-          <NumberField
-            label="Max concurrent streams"
-            hint="Each watched stream runs its own ffmpeg capture."
-            value={draft.workers.max_concurrent_streams}
-            integer
-            min={1}
-            onCommit={(v) => setWorkers({ max_concurrent_streams: v })}
-          />
-          <NumberField
-            label="Clip workers"
-            hint="Heavy render jobs at once — more than one fights for the GPU."
-            value={draft.workers.clip_queue_workers}
-            integer
-            min={1}
-            onCommit={(v) => setWorkers({ clip_queue_workers: v })}
-          />
-          <NumberField
-            label="Clip queue max"
-            hint="Queued clips; overflow is dropped with a warning, not queued."
-            value={draft.workers.clip_queue_max}
-            integer
-            min={1}
-            onCommit={(v) => setWorkers({ clip_queue_max: v })}
-          />
+          <Section title="Workers & disk" note="How much runs at once, and how much disk Live Watch may use.">
+            <div key={revision} className="grid gap-x-8 gap-y-6 sm:grid-cols-3">
+              <NumberField
+                {...field}
+                name="max_streams"
+                label="Streams at once"
+                hint="Each watched stream runs its own ffmpeg capture."
+                value={draft.workers.max_concurrent_streams}
+                spec={{ min: 1, integer: true }}
+                onChange={(v) => setWorkers({ max_concurrent_streams: v })}
+              />
+              <NumberField
+                {...field}
+                name="clip_workers"
+                label="Render workers"
+                hint="Renders at once. More than one fights over the GPU."
+                value={draft.workers.clip_queue_workers}
+                spec={{ min: 1, integer: true }}
+                onChange={(v) => setWorkers({ clip_queue_workers: v })}
+              />
+              <NumberField
+                {...field}
+                name="queue_max"
+                label="Render queue size"
+                hint="Accepted clips waiting to render. Overflow is dropped with a reason."
+                value={draft.workers.clip_queue_max}
+                spec={{ min: 1, integer: true }}
+                onChange={(v) => setWorkers({ clip_queue_max: v })}
+              />
+            </div>
+            {(typeof draft.workers.disk_budget_mb === 'number' ||
+              typeof draft.workers.min_free_disk_mb === 'number') && (
+              <div key={`disk-${revision}`} className="mt-6 grid gap-x-8 gap-y-6 sm:grid-cols-2">
+                {typeof draft.workers.disk_budget_mb === 'number' && (
+                  <NumberField
+                    {...field}
+                    name="disk_budget_mb"
+                    label="Disk budget (MB)"
+                    hint="Everything Live Watch keeps except finished clips: buffers, work in progress, leftovers of rejected moments. Over it, the oldest go first; then new moments are refused."
+                    value={draft.workers.disk_budget_mb}
+                    spec={{ min: 1, integer: true }}
+                    onChange={(v) => setWorkers({ disk_budget_mb: v })}
+                  />
+                )}
+                {typeof draft.workers.min_free_disk_mb === 'number' && (
+                  <NumberField
+                    {...field}
+                    name="min_free_disk_mb"
+                    label="Keep free on disk (MB)"
+                    hint="New moments are refused while the drive has less free space than this."
+                    value={draft.workers.min_free_disk_mb}
+                    spec={{ min: 0, integer: true }}
+                    onChange={(v) => setWorkers({ min_free_disk_mb: v })}
+                  />
+                )}
+              </div>
+            )}
+            <p className="mt-6 text-xs leading-relaxed text-ink-500">
+              The CPU and RAM budgets in config.json are advisory in this version — nothing
+              enforces them yet, so they aren’t offered here.
+            </p>
+          </Section>
         </div>
-        <div className="mt-5 grid gap-5 sm:grid-cols-2">
-          <NumberField
-            label="CPU budget (%)"
-            hint="Percent of logical cores budgeted for live analysis passes."
-            value={draft.workers.cpu_budget_percent}
-            integer
-            min={1}
-            max={100}
-            onCommit={(v) => setWorkers({ cpu_budget_percent: v })}
-          />
-          <NumberField
-            label="RAM budget (GB)"
-            hint="Advisory combined memory cap for the heavy stages."
-            value={draft.workers.ram_budget_gb}
-            integer
-            min={1}
-            onCommit={(v) => setWorkers({ ram_budget_gb: v })}
-          />
-        </div>
-      </Section>
+      </section>
 
       {saveError && (
-        <div className="mt-8">
+        <div className="mt-10">
           <ErrorNote error={saveError} onDismiss={() => setSaveError(null)} />
         </div>
       )}
 
-      <div className="sticky bottom-0 mt-12 border-t border-ink-800 bg-ink-900 py-4">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <p className="text-xs text-ink-400">
-            {dirty ? (
-              <>
-                Unsaved:{' '}
-                <span className="text-sodium-400">{dirtyTitles.join(', ')}</span>
-              </>
+      <div className="sticky bottom-0 z-10 mt-14 border-t border-ink-800 bg-ink-900/95 py-4 backdrop-blur-[2px]">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <p className="min-w-0 text-xs leading-snug" aria-live="polite">
+            {blocked ? (
+              <span className="text-signal-bad">
+                Fix {plural(invalidList.length, 'field')} before saving:{' '}
+                {invalidList.map((item) => item.label).join(', ')}
+              </span>
+            ) : dirty ? (
+              <span className="text-ink-400">
+                Unsaved: <span className="text-sodium-400">{dirtyTitles.join(', ')}</span>
+              </span>
+            ) : lastSave ? (
+              <span className="text-signal-good">
+                {lastSave.applied ? 'Saved — applied to the running watchers.' : 'Saved.'}
+              </span>
             ) : (
-              'No unsaved changes.'
+              <span className="text-ink-500">All changes saved.</span>
             )}
           </p>
           <div className="flex items-center gap-3">
-            <span
-              className="text-xs text-signal-good transition-opacity duration-300"
-              style={{ opacity: justSaved ? 1 : 0 }}
-            >
-              saved
-            </span>
-            <button onClick={revert} disabled={!dirty || saving} className="btn btn-ghost">
+            <button onClick={revert} disabled={(!dirty && !blocked) || saving} className="btn btn-ghost">
               Revert
             </button>
-            <button onClick={() => void save()} disabled={!dirty || saving} className="btn btn-primary">
+            <button onClick={() => void save()} disabled={!dirty || saving || blocked} className="btn btn-primary">
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
@@ -691,150 +634,142 @@ export function LiveSettingsSection() {
 function Section({
   title,
   note,
+  sectionRef,
   children,
 }: {
   title: string
   note?: string
+  sectionRef?: React.Ref<HTMLElement>
   children: React.ReactNode
 }) {
+  const headingId = useId()
   return (
-    <section className="rise mt-14">
+    <section ref={sectionRef} aria-labelledby={headingId} className="rise mt-14 scroll-mt-6">
       <div className="border-b border-ink-800 pb-2">
-        <h3 className="eyebrow">{title}</h3>
-        {note && <p className="mt-1 text-xs text-ink-500">{note}</p>}
+        <h2 id={headingId} className="eyebrow">
+          {title}
+        </h2>
+        {note && <p className="mt-1 text-xs leading-relaxed text-ink-500">{note}</p>}
       </div>
-      <div className="mt-5">{children}</div>
+      <div className="mt-6">{children}</div>
     </section>
   )
 }
 
-function StatusChip({ status }: { status: AuthStatus | null }) {
-  if (!status) return <span className="text-xs text-ink-600">status unknown</span>
-  if (status.connected) {
-    return (
-      <span className="text-xs text-signal-good">
-        connected{status.account ? ` · ${status.account}` : ''}
-      </span>
-    )
-  }
-  return <span className="text-xs text-ink-500">not connected</span>
-}
-
-/** Text input committing on blur, so the draft isn't touched per keystroke. */
-function Field({
-  label,
-  hint,
-  value,
-  placeholder,
-  onCommit,
-}: {
-  label: string
-  hint?: string
-  value: string
-  placeholder?: string
-  onCommit: (value: string) => void
-}) {
-  const [draft, setDraft] = useState(value)
-  useEffect(() => setDraft(value), [value])
-
-  return (
-    <label className="block">
-      <span className="eyebrow">{label}</span>
-      <input
-        className="field mt-1 text-sm"
-        value={draft}
-        placeholder={placeholder}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => draft !== value && onCommit(draft)}
-        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-        spellCheck={false}
-      />
-      {hint && <span className="mt-1.5 block text-xs leading-snug text-ink-500">{hint}</span>}
-    </label>
-  )
-}
-
 /**
- * Number input with strict parsing: an empty or malformed draft is an inline
- * error and never becomes a value — invalid edits simply don't enter the
- * draft, so Save can't ship them.
+ * Number input that validates on every keystroke and reports to the parent.
+ * A valid value goes straight into the draft; an invalid one shows its reason
+ * here and blocks Save there. The text is this field's own state — it never
+ * re-syncs from `value` mid-edit (that would eat "0." while typing "0.05");
+ * the parent remounts the field to reset it.
  */
 function NumberField({
+  name,
   label,
   hint,
   value,
-  min,
-  max,
-  integer,
-  onCommit,
+  spec,
+  onChange,
+  onValidity,
 }: {
+  name: string
   label: string
   hint?: string
   value: number
-  min?: number
-  max?: number
-  integer?: boolean
-  onCommit: (value: number) => void
+  spec: NumberSpec
+  onChange: (value: number) => void
+  onValidity: Validity
 }) {
-  const [draft, setDraft] = useState(String(value))
-  const [touched, setTouched] = useState(false)
+  const [text, setText] = useState(() => String(value))
+  const id = useId()
+  const noteId = `${id}-note`
+  const parsed = parseNumber(text, spec)
+  const error = typeof parsed === 'string' ? parsed : null
 
+  // Report the starting state too: a stored value outside the range shows up
+  // immediately. The cleanup un-reports on remount and unmount.
   useEffect(() => {
-    setDraft(String(value))
-    setTouched(false)
-  }, [value])
-
-  const parsed = parseNumber(draft, { min, max, integer })
-  const error = typeof parsed === 'string' && (touched || draft.trim() !== '') ? parsed : null
+    const initial = parseNumber(String(value), spec)
+    onValidity(name, label, typeof initial === 'string' ? initial : null)
+    return () => onValidity(name, label, null)
+    // Mount-only by design; the parent remounts the field to reset it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return (
-    <label className="block">
-      <span className="eyebrow">{label}</span>
+    <div>
+      <label htmlFor={id} className="eyebrow">
+        {label}
+      </label>
       <input
-        type="number"
-        className="field numeric mt-1 text-sm"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          // Flag the field even when the draft is empty, so a blank input is
-          // visibly wrong instead of silently meaning zero.
-          setTouched(true)
-          if (typeof parsed === 'number' && parsed !== value) onCommit(parsed)
+        id={id}
+        type="text"
+        inputMode="decimal"
+        autoComplete="off"
+        className={`field numeric mt-1 text-sm ${error ? 'border-b-signal-bad' : ''}`}
+        value={text}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error || hint ? noteId : undefined}
+        onChange={(event) => {
+          const next = event.target.value
+          setText(next)
+          const result = parseNumber(next, spec)
+          if (typeof result === 'string') {
+            onValidity(name, label, result)
+          } else {
+            onValidity(name, label, null)
+            if (result !== value) onChange(result)
+          }
         }}
-        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
       />
-      {error ? (
-        <span className="mt-1.5 block text-xs leading-snug text-signal-bad">{error}</span>
-      ) : (
-        hint && <span className="mt-1.5 block text-xs leading-snug text-ink-500">{hint}</span>
+      {(error || hint) && (
+        <p id={noteId} className={`mt-1.5 text-xs leading-snug ${error ? 'text-signal-bad' : 'text-ink-500'}`}>
+          {error ?? hint}
+        </p>
       )}
-    </label>
+    </div>
   )
 }
 
 function Toggle({
+  id,
+  inputRef,
   label,
   hint,
   checked,
   onChange,
 }: {
+  id?: string
+  inputRef?: React.Ref<HTMLInputElement>
   label: string
   hint?: string
   checked: boolean
   onChange: (checked: boolean) => void
 }) {
+  const fallbackId = useId()
+  const inputId = id ?? fallbackId
+  const hintId = `${inputId}-hint`
   return (
-    <label className="flex items-start gap-3 text-sm text-ink-200">
+    <div className="flex items-start gap-3">
       <input
+        id={inputId}
+        ref={inputRef}
         type="checkbox"
         checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 size-4 accent-sodium-500"
+        onChange={(event) => onChange(event.target.checked)}
+        aria-describedby={hint ? hintId : undefined}
+        className="mt-0.5 size-4 shrink-0 accent-sodium-500"
       />
-      <span>
-        {label}
-        {hint && <span className="mt-1 block text-xs leading-snug text-ink-500">{hint}</span>}
-      </span>
-    </label>
+      <div>
+        <label htmlFor={inputId} className="text-sm text-ink-200">
+          {label}
+        </label>
+        {hint && (
+          <p id={hintId} className="mt-1 text-xs leading-snug text-ink-500">
+            {hint}
+          </p>
+        )}
+      </div>
+    </div>
   )
 }
