@@ -114,6 +114,13 @@ class LiveClipRow:
         )
 
 
+#: (clip_id, platform) pairs with an upload running in this process. The
+#: manual upload route and the auto-upload path both claim it with no await
+#: between check and claim, so neither can start a second upload of the
+#: same clip to the same platform while the other one runs.
+UPLOADS_IN_FLIGHT: set[tuple[str, str]] = set()
+
+
 @dataclass
 class LiveUploadRow:
     id: str

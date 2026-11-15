@@ -525,7 +525,8 @@ class TwitchChatReader:
     * ``t_s`` on every signal comes from the injected ``clock`` — pass one
       aligned with the stream's capture timeline (the default is
       ``time.monotonic``, i.e. process time, which will NOT match the
-      buffer's epoch).
+      buffer's epoch). A clock returning ``None`` pauses scoring (the
+      stream is not being captured).
 
     Preconditions: ``channel`` is a non-empty Twitch channel name (use
     ``channel_from_url`` or ``make_chat_reader``, which validate it);
@@ -542,7 +543,7 @@ class TwitchChatReader:
         on_state: OnState | None = None,
         ws_url: str = TWITCH_IRC_WS_URL,
         nick: str = ANON_NICK,
-        clock: Callable[[], float] | None = None,
+        clock: Callable[[], float | None] | None = None,
         backoff_base: float = 1.0,
         backoff_cap: float = BACKOFF_CAP_S,
         socket_timeout_s: float = SOCKET_TIMEOUT_S,
@@ -699,14 +700,27 @@ class TwitchChatReader:
                     saw_traffic = True
                     self._session_read_traffic = True
                     nick, text = parsed
-                    for signal in self._scorer.observe(self._clock(), nick, text):
-                        self._emit(signal)
+                    self._observe(nick, text)
             return saw_traffic or joined
         finally:
             with self._ws_lock:
                 self._ws = None
             with contextlib.suppress(Exception):
                 ws.close()
+
+    def _observe(self, nick: str, text: str) -> None:
+        """Score one chat message at the clock's stream time.
+
+        A clock returning ``None`` means the stream is not being captured
+        (offline, reconnecting): the message is not scored. Stream time is
+        frozen then, so every offline message would pile into one bucket
+        and fire a spurious spike — a paid judge call — on reconnect.
+        """
+        t_s = self._clock()
+        if t_s is None:
+            return
+        for signal in self._scorer.observe(t_s, nick, text):
+            self._emit(signal)
 
     def _is_join_echo(self, line: str) -> bool:
         msg = line

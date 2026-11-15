@@ -336,6 +336,9 @@ class StreamCapture:
             stdin=subprocess.DEVNULL,
             creationflags=_new_process_group_flags(),
         )
+        # stop() kills the tree on every orderly exit; the job covers the
+        # disorderly ones (crash, console closed, killed from Task Manager).
+        bind_to_host_lifetime(self._proc)
 
     def _next_start_number(self) -> int:
         """Segment number ffmpeg starts numbering at.
@@ -714,6 +717,119 @@ def _new_process_group_flags() -> int:
     return 0
 
 
+#: Windows job object every capture ffmpeg is assigned to; created lazily,
+#: its handle held for the life of this process (see bind_to_host_lifetime).
+_HOST_JOB: int | None = None
+_HOST_JOB_LOCK = threading.Lock()
+
+
+def _create_kill_on_close_job() -> int:
+    """A new Windows job object whose processes die when its last handle closes."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimits),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_object_extended_limit_information = 9
+    job_object_limit_kill_on_job_close = 0x2000
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    info = ExtendedLimits()
+    info.BasicLimitInformation.LimitFlags = job_object_limit_kill_on_job_close
+    if not kernel32.SetInformationJobObject(
+        job, job_object_extended_limit_information, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        raise OSError(error, "SetInformationJobObject failed")
+    return int(job)
+
+
+def _assign_to_job(job: int, proc: subprocess.Popen) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    handle = getattr(proc, "_handle", None)
+    if handle is None:
+        raise OSError("process has no Windows handle")
+    if not kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(int(handle))):
+        raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+
+def bind_to_host_lifetime(proc: subprocess.Popen) -> bool:
+    """Windows: make ``proc`` die with this process, however this process dies.
+
+    ``CREATE_NEW_PROCESS_GROUP`` detaches ffmpeg from the console, so when
+    the backend crashed or was killed, the capture kept running for as long
+    as the broadcast did — writing segments nobody prunes into the stream's
+    buffer folder and holding its files open. A kill-on-close job object
+    owned by this process ends every capture the moment the process is
+    gone. Best effort: returns False (logged) where unsupported.
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return False
+    global _HOST_JOB
+    try:
+        with _HOST_JOB_LOCK:
+            if _HOST_JOB is None:
+                _HOST_JOB = _create_kill_on_close_job()
+            job = _HOST_JOB
+        _assign_to_job(job, proc)
+    except Exception:  # noqa: BLE001 - a missing job must never block a capture
+        log.warning("could not tie ffmpeg (pid %s) to AutoClip's lifetime", proc.pid, exc_info=True)
+        return False
+    return True
+
+
 def kill_process_tree(pid: int) -> None:
     """Kill a process and all its descendants.
 
@@ -752,6 +868,7 @@ __all__ = [
     "STALL_TIMEOUT_S",
     "TAILER_POLL_S",
     "StreamCapture",
+    "bind_to_host_lifetime",
     "index_from_name",
     "is_segment_name",
     "kill_process_tree",

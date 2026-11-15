@@ -41,6 +41,10 @@ QUEUE_SIZE = 64
 #: own reconnect heuristic, keeping the connection visibly alive.
 HEARTBEAT_S = 15.0
 
+#: Synthetic event a subscriber receives after the broker dropped events
+#: for it (queue full): its view is stale and must be refetched.
+RESYNC = "resync"
+
 
 @dataclass
 class Event:
@@ -62,6 +66,8 @@ class EventBroker:
         # _publish_on_loop runs via call_soon_threadsafe), so plain dict/set
         # access needs no lock — that is the invariant bind_loop establishes.
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
+        #: Subscriber queues that dropped an event since their last read.
+        self._overflowed: set[asyncio.Queue[Event]] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
@@ -91,8 +97,10 @@ class EventBroker:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                # Slow client: losing an intermediate frame is harmless,
-                # the next one carries the current state.
+                # Slow client: the dropped frame may have been the only
+                # one carrying a change (a clip turning ready), so the
+                # subscriber is told to resync instead of silently drifting.
+                self._overflowed.add(queue)
                 log.debug("Dropped live event for a slow subscriber on %s.", channel)
 
     # -- subscribing -------------------------------------------------------
@@ -104,6 +112,14 @@ class EventBroker:
 
         try:
             while True:
+                if queue in self._overflowed and queue.empty():
+                    # Events were dropped after the backlog just delivered:
+                    # one ``resync`` tells the subscriber its view is stale
+                    # (the SSE layer turns it into a ``snapshot`` frame and
+                    # the client refetches).
+                    self._overflowed.discard(queue)
+                    yield Event(type=RESYNC)
+                    continue
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
                 except TimeoutError:
@@ -111,6 +127,7 @@ class EventBroker:
                     continue
                 yield event
         finally:
+            self._overflowed.discard(queue)
             subscribers = self._subscribers.get(channel)
             if subscribers is not None:
                 subscribers.discard(queue)

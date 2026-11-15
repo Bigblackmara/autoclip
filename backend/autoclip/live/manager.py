@@ -66,6 +66,7 @@ import contextlib
 import inspect
 import logging
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,7 @@ from typing import Any
 from . import events
 from .buffer import PENDING_CAP_BYTES
 from .circuit import JudgeCircuitBreaker
-from .models import LiveClipRow, LiveStreamRow, LiveUploadRow, utcnow
+from .models import UPLOADS_IN_FLIGHT, LiveClipRow, LiveStreamRow, LiveUploadRow, utcnow
 from .settings import (
     LiveSettings,
     LiveStreamConfig,
@@ -116,6 +117,9 @@ TEARDOWN_WAIT_S = 20.0
 #: is treated as garbage (never race a candidate creating its folder).
 JANITOR_INTERVAL_S = 300.0
 ORPHAN_MIN_AGE_S = 600.0
+
+#: Auto-uploads running at once (each one is a long network transfer).
+AUTO_UPLOAD_CONCURRENCY = 2
 
 #: Raised to the API when Live Watch is switched off in settings.
 LIVE_OFF_DETAIL = "Live Watch is turned off. Turn it on in Live settings."
@@ -329,6 +333,9 @@ class LiveManager:
         self._workers: list[asyncio.Task] = []
         self._busy_workers: set[asyncio.Task] = set()
         self._janitor: asyncio.Task | None = None
+        #: Auto-uploads run beside the render workers, never inside them.
+        self._upload_tasks: set[asyncio.Task] = set()
+        self._upload_slots: asyncio.Semaphore | None = None
         self._lifecycle: asyncio.Lock | None = None
         #: Disk budget verdict from the last janitor pass.
         self._disk_over_budget = False
@@ -410,8 +417,9 @@ class LiveManager:
         }
         if snapshot is not None:
             payload["state_detail"] = snapshot.get("detail") or ""
-            if snapshot.get("error"):
-                payload["last_error"] = snapshot["error"]
+            # Always sent, null included: a patch without the key kept a
+            # cleared error on screen until the next poll.
+            payload["last_error"] = snapshot.get("error") or None
         with contextlib.suppress(Exception):
             self._publish(STREAMS_CHANNEL, "stream_state", payload)
 
@@ -478,6 +486,11 @@ class LiveManager:
             self._janitor.cancel()
             awaitables.append(self._janitor)
         self._janitor = None
+        # Auto-uploads are only cancelled, not awaited: an upload already
+        # running in its thread finishes and records its own outcome.
+        for task in list(self._upload_tasks):
+            task.cancel()
+        self._upload_slots = None
         queue = self._queue
         if queue is not None:
             # Queued (never started) work is interrupted, not silently lost:
@@ -673,6 +686,9 @@ class LiveManager:
                     "stream_id": stream_id,
                     "state": "ended",
                     "enabled": False,
+                    # Other open tabs drop the row instead of showing a
+                    # paused stream whose Resume answers 404.
+                    "removed": True,
                 },
             )
 
@@ -1251,7 +1267,11 @@ class LiveManager:
             if await asyncio.to_thread(self._clip_tombstoned, item.clip_id):
                 log.info("Clip %s was discarded; auto-upload skipped.", item.clip_id)
                 return
-            if self._upload_blocked(item.clip_id, platform):
+            key = (item.clip_id, platform)
+            # Check + claim + row with no await in between: a manual upload
+            # of the same clip/platform (which claims the same key) can
+            # never run alongside this one.
+            if key in UPLOADS_IN_FLIGHT or self._upload_blocked(item.clip_id, platform):
                 continue
             row_id = new_stream_id()
             try:
@@ -1265,19 +1285,59 @@ class LiveManager:
                 id=row_id, clip_id=item.clip_id, platform=platform, status="uploading"
             )
             store_call(self._store.create_upload, upload_row)
-
-            def _run_upload(up_coro: Any) -> Any:
-                import asyncio as _a
-
-                return _a.run(up_coro)
-
+            UPLOADS_IN_FLIGHT.add(key)
+            # The UI shows the upload as running at once (no manual
+            # "Upload" button that would only answer 409).
+            self._publish(
+                CLIPS_CHANNEL,
+                "upload",
+                {
+                    "id": row_id,
+                    "clip_id": item.clip_id,
+                    "platform": platform,
+                    "status": "uploading",
+                },
+            )
+            fn = _yt_mod.upload_youtube if platform == "youtube" else _ig_mod.upload_instagram
+            meta = _Meta(title=upload_title.strip() or "Untitled clip")
+            started = threading.Event()
             try:
-                meta = _Meta(title=upload_title.strip() or "Untitled clip")
-                if platform == "youtube":
-                    up_coro = _yt_mod.upload_youtube(rendered_path, meta)
-                else:
-                    up_coro = _ig_mod.upload_instagram(rendered_path, meta)
-                result = await asyncio.to_thread(_run_upload, up_coro)
+                await asyncio.to_thread(
+                    self._upload_in_thread, started, key, row_id, fn, rendered_path, meta
+                )
+            except asyncio.CancelledError:
+                if not started.is_set():
+                    # The thread never ran (cancelled in the executor queue):
+                    # nothing was sent, so the claim and the row are ours.
+                    UPLOADS_IN_FLIGHT.discard(key)
+                    with contextlib.suppress(Exception):
+                        store_call(
+                            self._store.update_upload, row_id, status="failed", error="interrupted"
+                        )
+                raise
+
+    def _upload_in_thread(
+        self,
+        started: threading.Event,
+        key: tuple[str, str],
+        row_id: str,
+        fn: Any,
+        rendered_path: str,
+        meta: Any,
+    ) -> None:
+        """Run one auto-upload to its end and record the outcome (worker thread).
+
+        The outcome is written HERE, not by the awaiting coroutine: a
+        stop() cancels that coroutine but cannot cancel this thread, and an
+        upload that finished with nobody recording it stayed "uploading",
+        then "failed: interrupted" after a restart — inviting a retry that
+        posts the clip twice.
+        """
+        started.set()
+        clip_id, platform = key
+        try:
+            try:
+                result = asyncio.run(fn(rendered_path, meta))
             except Exception as exc:
                 name = type(exc).__name__
                 skipped = name in ("RightsNotAccepted", "NotLinkedError")
@@ -1291,27 +1351,31 @@ class LiveManager:
                 self._publish(
                     CLIPS_CHANNEL,
                     "upload",
-                    {"clip_id": item.clip_id, "platform": platform, "status": status},
+                    {"id": row_id, "clip_id": clip_id, "platform": platform, "status": status},
                 )
-                log.info("Auto-upload %s for clip %s: %s", status, item.clip_id, exc)
-                continue
+                log.info("Auto-upload %s for clip %s: %s", status, clip_id, exc)
+                return
+            url = str(getattr(result, "url", "") or "")
             store_call(
                 self._store.update_upload,
                 row_id,
                 status="done",
-                upload_url=str(getattr(result, "url", "") or ""),
+                upload_url=url,
                 platform_media_id=str(getattr(result, "media_id", "") or ""),
             )
             self._publish(
                 CLIPS_CHANNEL,
                 "upload",
                 {
-                    "clip_id": item.clip_id,
+                    "id": row_id,
+                    "clip_id": clip_id,
                     "platform": platform,
                     "status": "done",
-                    "url": str(getattr(result, "url", "") or ""),
+                    "url": url,
                 },
             )
+        finally:
+            UPLOADS_IN_FLIGHT.discard(key)
 
     def _upload_blocked(self, clip_id: str, platform: str) -> bool:
         """An upload for this clip/platform is running or already succeeded."""
@@ -1496,7 +1560,34 @@ class LiveManager:
                 rendered_path=str(rendered) if rendered else "",
                 title=title,
             )
-        await self._maybe_auto_upload(item, ready_row, title)
+        self._spawn_auto_upload(item, ready_row, title)
+
+    def _spawn_auto_upload(self, item: ClipWorkItem, clip_row: Any, title: str) -> None:
+        """Auto-upload off the render worker (an Instagram publish polls for
+        minutes; with one worker every queued render — and every new
+        candidate past ``clip_queue_max`` — waited behind it)."""
+        uploads_cfg = getattr(self._live, "uploads", None)
+        if not any(
+            getattr(getattr(uploads_cfg, name, None), "auto_upload", False)
+            for name in ("youtube", "instagram")
+        ):
+            return
+        if self._upload_slots is None:
+            self._upload_slots = asyncio.Semaphore(AUTO_UPLOAD_CONCURRENCY)
+        slots = self._upload_slots
+
+        async def run() -> None:
+            async with slots:
+                await self._maybe_auto_upload(item, clip_row, title)
+
+        task = asyncio.get_running_loop().create_task(run(), name=f"live-upload-{item.clip_id}")
+        self._upload_tasks.add(task)
+        task.add_done_callback(self._upload_done)
+
+    def _upload_done(self, task: asyncio.Task) -> None:
+        self._upload_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("Auto-upload task died: %r", task.exception())
 
 
 class _RowJudgement:

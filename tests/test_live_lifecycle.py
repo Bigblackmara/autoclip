@@ -755,6 +755,8 @@ class TestAutoUploadThroughRender:
         manager = LiveManager(settings=settings, produce=produce, registry=FakeRegistry())
 
         await manager._render_one(_queued_clip(stream_row, "c-up"))
+        # Auto-upload runs beside the render worker, not inside it.
+        await asyncio.gather(*manager._upload_tasks)
 
         rendered = str(clip_dir("c-up") / "final.mp4")
         assert uploaded == [

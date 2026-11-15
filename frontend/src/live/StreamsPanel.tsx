@@ -274,6 +274,16 @@ export function StreamsPanel({
       if (event.type !== 'stream_state') return
       const data = event.data
       const id = typeof data.stream_id === 'string' ? data.stream_id : null
+      if (id && data.removed === true) {
+        // Removed (here or in another tab): drop the row. Patching it to
+        // "off" showed a paused stream whose Resume only answered 404.
+        const prev = streamsRef.current
+        if (prev && prev.some((row) => row.id === id)) {
+          commitStreams(prev.filter((row) => row.id !== id))
+          epochRef.current += 1
+        }
+        return
+      }
       const patch = streamPatch(data)
       if (id && Object.keys(patch).length > 0 && patchRow(id, patch)) {
         epochRef.current += 1
@@ -746,21 +756,15 @@ function StreamRow({
         <div id={confirmId} className="pb-4 sm:flex sm:justify-end">
           <ConfirmInline
             question={
-              count !== null
-                ? count > 0
-                  ? `Remove ${name} and its ${plural(count, 'clip')}?`
-                  : `Remove ${name}? It has no clips yet.`
+              // clip_count counts READY clips only; removal deletes every
+              // clip of the stream (failed and queued ones too).
+              count !== null && count > 0
+                ? `Remove ${name} and all of its clips (${count} ready)?`
                 : `Remove ${name} and all of its clips?`
             }
             detail="Its buffer and clip files are deleted too. This can’t be undone."
             confirmLabel="Remove"
-            confirmName={
-              count === null
-                ? `Yes, remove ${name} and all of its clips`
-                : count > 0
-                  ? `Yes, remove ${name} and its ${plural(count, 'clip')}`
-                  : `Yes, remove ${name}`
-            }
+            confirmName={`Yes, remove ${name} and all of its clips`}
             busy={busy === 'remove'}
             onConfirm={onRemove}
             onCancel={onCancelRemove}

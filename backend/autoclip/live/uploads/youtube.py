@@ -203,7 +203,24 @@ async def _put_file(
         try:
             response = await http.put(session.session_uri, content=content, headers=headers)
         except httpx.HTTPError as exc:
-            raise UploadApiError(f"upload transport failed: {type(exc).__name__}") from exc
+            # A dropped connection or a read timeout can hit AFTER Google
+            # stored every byte (the video exists). Failing here recorded
+            # the upload as failed and a retry posted the clip twice; the
+            # session is still open, so ask it what it holds and resume.
+            last_error = UploadApiError(f"upload transport failed: {type(exc).__name__}")
+            last_error.__cause__ = exc
+            if attempt >= max_retries:
+                break
+            offset = await _probe_offset(http, bundle, session)
+            log.info(
+                "YouTube resumable retry %d/%d after %s, from byte %d/%d",
+                attempt + 1,
+                max_retries,
+                type(exc).__name__,
+                offset,
+                session.size,
+            )
+            continue
         if response.status_code < 400:
             try:
                 return response.json()

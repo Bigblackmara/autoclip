@@ -450,6 +450,14 @@ export function ClipsPanel({
         else refreshUploads()
         announce(`${quoted(clip)} uploaded to ${name}.`)
       } catch (error) {
+        if (errorStatus(error) === 409 && error instanceof Error && /already/i.test(error.message)) {
+          // Not a failure: an upload of this clip (an auto-upload, or another
+          // tab) is running or done. An action error here would stick and
+          // mask that upload's success as "failed · retry".
+          announce(`${quoted(clip)} is already being uploaded to ${name}.`)
+          refreshUploads()
+          return
+        }
         const message =
           error instanceof Error ? describeUploadError(error.message, platform).message : errorText(error)
         setActionError(key, message)

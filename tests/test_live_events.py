@@ -33,7 +33,7 @@ import threading
 
 import pytest
 from autoclip.live import events
-from autoclip.live.events import HEARTBEAT_S, QUEUE_SIZE, Event, EventBroker
+from autoclip.live.events import HEARTBEAT_S, QUEUE_SIZE, RESYNC, Event, EventBroker
 
 
 @pytest.fixture
@@ -261,14 +261,16 @@ class TestBoundedQueues:
         assert broker.subscriber_count("live:slow") == 1
 
         # Drain via the generator itself: exactly the first QUEUE_SIZE
-        # events, in order, then nothing but heartbeats.
+        # events, in order, then ONE resync (frames were dropped: the
+        # subscriber must refetch), then nothing but heartbeats.
         received = []
         while True:
             event = await agen.__anext__()
             if event.type == "heartbeat":
                 break
             received.append(event)
-        assert [e.data["i"] for e in received] == list(range(QUEUE_SIZE))
+        assert received[-1].type == RESYNC
+        assert [e.data["i"] for e in received[:-1]] == list(range(QUEUE_SIZE))
 
         await agen.aclose()
         assert broker.subscriber_count("live:slow") == 0

@@ -62,6 +62,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from sse_starlette.sse import EventSourceResponse
 
+from ..live.models import UPLOADS_IN_FLIGHT
 from .schemas_live import (
     LiveAttestationIn,
     LiveClipOut,
@@ -514,10 +515,11 @@ async def _finish_upload_row(
     return out
 
 
-#: (clip_id, platform) pairs with a manual upload request in flight in this
-#: process — checked and claimed with no await in between, so a double
-#: click cannot slip two uploads past the DB check.
-_uploads_in_flight: set[tuple[str, str]] = set()
+#: (clip_id, platform) pairs with an upload in flight in this process —
+#: checked and claimed with no await in between, so a double click cannot
+#: slip two uploads past the DB check. Shared with the manager's
+#: auto-upload, which claims the same keys.
+_uploads_in_flight: set[tuple[str, str]] = UPLOADS_IN_FLIGHT
 
 
 def _upload_http_error(exc: Exception) -> HTTPException:
@@ -856,6 +858,38 @@ def _frontend_event_name(watcher_event: str) -> str | None:
     return _FRONTEND_EVENT.get(watcher_event)
 
 
+#: Merged events one SSE connection may hold for a slow client. Past it the
+#: feed drops events and sends a ``snapshot`` resync instead (the frontend
+#: refetches on it) — an unbounded merge queue would defeat the broker's
+#: own per-subscriber bound and grow without limit behind a stalled socket.
+SSE_FEED_QUEUE = 256
+
+
+class _Feed:
+    """One SSE connection's merged, bounded event queue."""
+
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_FEED_QUEUE)
+        #: Set when an event had to be dropped: the client must resync.
+        self.overflowed = False
+
+    def offer(self, event: dict) -> None:
+        if event.get("type") == "resync":  # the broker dropped events for us
+            self.overflowed = True
+            return
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.overflowed = True
+
+    def drain(self) -> None:
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+
 async def _sse_generator(request: Request, channels: list[str]):
     """The SSE body: initial snapshot, then every channel's mapped events.
 
@@ -864,22 +898,35 @@ async def _sse_generator(request: Request, channels: list[str]):
     traffic in arrival order. The broker is bound to THIS loop first: in a
     no-worker process nothing else has bound it, and discard/upload
     publishes from request handlers must still marshal safely.
+
+    The channels are subscribed BEFORE the snapshot frame goes out: the
+    client refetches on ``snapshot``, so anything published after that
+    refetch must already be on its way to this feed. A feed that falls
+    behind (slow client) is bounded: overflow drops the backlog and sends
+    another ``snapshot`` so the client refetches instead of silently
+    missing a state change.
     """
     from ..live import events as live_events
 
     live_events.bind_loop(asyncio.get_running_loop())
-    yield {"event": "snapshot", "data": json.dumps({"resync": True})}
-
-    queue: asyncio.Queue = asyncio.Queue()
-    pumps = [asyncio.create_task(_pump(channel, queue)) for channel in channels]
+    feed = _Feed()
+    pumps = [asyncio.create_task(_pump(channel, feed)) for channel in channels]
     global _sse_feeds_open
     _sse_feeds_open += 1
     try:
+        # Let every pump register its subscription before the snapshot.
+        await asyncio.sleep(0)
+        yield {"event": "snapshot", "data": json.dumps({"resync": True})}
         while True:
             if await request.is_disconnected():
                 break
+            if feed.overflowed:
+                feed.overflowed = False
+                feed.drain()
+                yield {"event": "snapshot", "data": json.dumps({"resync": True})}
+                continue
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                event = await asyncio.wait_for(feed.queue.get(), timeout=15.0)
             except TimeoutError:
                 yield {"event": "heartbeat", "data": json.dumps({})}
                 continue
@@ -938,12 +985,12 @@ def _state_patch(event: dict, channels: list[str]) -> dict:
     return data
 
 
-async def _pump(channel: str, queue: asyncio.Queue) -> None:
-    """Forward one channel's events into the shared feed queue, forever."""
+async def _pump(channel: str, feed: _Feed) -> None:
+    """Forward one channel's events into the connection's bounded feed."""
     from ..live.events import subscribe
 
     async for event in subscribe(channel):
-        await queue.put(event)
+        feed.offer(event)
 
 
 @router.get("/events")

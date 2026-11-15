@@ -1035,6 +1035,19 @@ class StreamWatcher:
             pass
         return 0.0
 
+    def _chat_clock(self) -> float | None:
+        """Chat's stream clock: ``None`` while no capture is running.
+
+        Stream time stands still while the stream is offline or
+        reconnecting, so chat scored then would pile into one rate bucket
+        (and one hype-velocity window) and fire a spurious spike — a paid
+        judge call on the reconnect moment — every time the stream comes
+        back. The chat reader skips messages while this returns ``None``.
+        """
+        if self._capture is None or self._stopping:
+            return None
+        return self._stream_now()
+
     def _start_signal_workers(self) -> None:
         """Start audio + chat worker threads once per watcher lifecycle.
 
@@ -1086,7 +1099,7 @@ class StreamWatcher:
                 self._live,
                 on_signal=self.submit_signal,
                 stop_event=stop_event,
-                clock=self._stream_now,
+                clock=self._chat_clock,
             )
             if ran is False:
                 log.debug("Stream %s: no chat signal for this URL.", self.id)

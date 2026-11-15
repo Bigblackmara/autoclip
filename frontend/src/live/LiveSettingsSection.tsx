@@ -104,7 +104,7 @@ export function LiveSettingsSection({
   const [loadError, setLoadError] = useState<Error | null>(null)
   const [saveError, setSaveError] = useState<Error | null>(null)
   const [saving, setSaving] = useState(false)
-  const [lastSave, setLastSave] = useState<{ applied: boolean } | null>(null)
+  const [lastSave, setLastSave] = useState<{ applied: boolean; applyError?: string } | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const enableRef = useRef<HTMLInputElement>(null)
   const uploadsRef = useRef<HTMLElement>(null)
@@ -195,13 +195,20 @@ export function LiveSettingsSection({
     setSaving(true)
     setSaveError(null)
     try {
-      const { applied, ...next } = await liveApi.putSettings(draft)
+      // apply_error is response metadata, not a setting: keep it out of the draft.
+      const { applied, apply_error: applyError, ...next } = await liveApi.putSettings(draft)
       setSaved(next)
       setDraft(next)
       setInvalid({})
       setRevision((current) => current + 1)
-      setLastSave({ applied: applied === true })
-      announce(applied ? 'Settings saved and applied to the running watchers.' : 'Settings saved.')
+      setLastSave({ applied: applied === true, applyError: applyError || undefined })
+      announce(
+        applyError
+          ? `Settings saved, but not applied: ${applyError}`
+          : applied
+            ? 'Settings saved and applied to the running watchers.'
+            : 'Settings saved.',
+      )
       onSettingsChange(next)
     } catch (error) {
       setSaveError(asError(error))
@@ -608,6 +615,10 @@ export function LiveSettingsSection({
             ) : dirty ? (
               <span className="text-ink-400">
                 Unsaved: <span className="text-sodium-400">{dirtyTitles.join(', ')}</span>
+              </span>
+            ) : lastSave?.applyError ? (
+              <span className="text-signal-bad">
+                Saved, but the running watchers did not take it: {lastSave.applyError}
               </span>
             ) : lastSave ? (
               <span className="text-signal-good">

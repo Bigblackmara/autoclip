@@ -286,6 +286,17 @@ function PlatformSetup({
     void load()
   }, [load, refreshSignal])
 
+  // Connect navigates away and never resets "Opening…" itself. Back from the
+  // consent page restores this page from the back/forward cache with that
+  // state frozen, which left the button disabled until a full reload.
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setConnecting(false)
+    }
+    window.addEventListener('pageshow', onPageShow)
+    return () => window.removeEventListener('pageshow', onPageShow)
+  }, [])
+
   const saveCredentials = async (event: React.FormEvent) => {
     event.preventDefault()
     if (!clientId.trim() || !clientSecret.trim() || savingCredentials) return

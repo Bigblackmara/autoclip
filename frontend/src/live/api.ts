@@ -39,7 +39,7 @@ export interface LiveStream {
   state: LiveStreamState
   state_detail: string
   last_error: string | null
-  /** Clips recorded for this stream, any status. Absent on older servers. */
+  /** READY clips of this stream (not failed/queued ones). Absent on older servers. */
   clip_count?: number
   created_at: string
   updated_at: string
@@ -192,7 +192,11 @@ export interface LiveSettingsData {
 }
 
 /** PUT /api/live/settings answer: the stored settings, plus whether they went live. */
-export type LiveSettingsSaved = LiveSettingsData & { applied?: boolean }
+export type LiveSettingsSaved = LiveSettingsData & {
+  applied?: boolean
+  /** Why the running feature did not take the save (``applied`` false); the save stands. */
+  apply_error?: string
+}
 
 export interface LivePlatformStatus {
   connected: boolean
@@ -239,7 +243,9 @@ export const liveApi = {
   clipMediaUrl: (id: string, attempt = 0) =>
     attempt > 0 ? `/api/live/clips/${id}/media?attempt=${attempt}` : `/api/live/clips/${id}/media`,
 
-  listUploads: () => request<LiveUpload[]>('/api/live/uploads'),
+  // Beyond the server's default 200 rows: the wall holds up to 100 clips x 2
+  // platforms plus retries, and a clip missing its "done" row offers Upload again.
+  listUploads: () => request<LiveUpload[]>('/api/live/uploads?limit=1000'),
   uploadClip: (id: string, platform: LivePlatform) =>
     request<LiveUpload>(`/api/live/clips/${id}/upload`, {
       method: 'POST',

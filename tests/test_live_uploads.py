@@ -563,6 +563,59 @@ class TestYouTubeUpload:
         )
         assert result.media_id == "vid10"
 
+    async def test_transport_error_after_the_bytes_landed_resumes_not_fails(
+        self, fake_keyring, attested, linked_youtube, clip_file
+    ) -> None:
+        """A read timeout on the final PUT must not record a failure.
+
+        Google may already hold the whole file (the video exists); failing
+        here made the user retry and the clip was posted twice. The open
+        session is probed instead and the finished resource fetched.
+        """
+        size = clip_file.stat().st_size
+        steps = ["timeout", "probe-complete", "final"]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(
+                    200, headers={"Location": "https://upload.session/xyz?token=t1"}
+                )
+            step = steps.pop(0)
+            if step == "timeout":
+                raise httpx.ReadTimeout("read timed out", request=request)
+            if step == "probe-complete":
+                assert request.headers.get("Content-Range") == f"bytes */{size}"
+                return httpx.Response(200, json={"id": "vid11"})
+            assert request.headers.get("Content-Range") == f"bytes */{size}"
+            return httpx.Response(200, json={"id": "vid11", "snippet": {"channelTitle": "C"}})
+
+        transport = RecordingTransport(handler)
+        result = await uploads.upload_youtube(
+            clip_file, uploads.UploadMeta(title="t"), client=mock_client(transport)
+        )
+        assert result.media_id == "vid11"
+        # One session only: a second POST would be a second video.
+        assert [r.method for r in transport.requests] == ["POST", "PUT", "PUT", "PUT"]
+
+    async def test_transport_errors_on_every_attempt_still_fail(
+        self, fake_keyring, attested, linked_youtube, clip_file
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(
+                    200, headers={"Location": "https://upload.session/xyz?token=t1"}
+                )
+            if request.headers.get("Content-Range", "").startswith("bytes */"):
+                return httpx.Response(308)  # probe: nothing stored yet
+            raise httpx.ConnectError("connection reset", request=request)
+
+        with pytest.raises(tk.UploadApiError, match="transport failed"):
+            await uploads.upload_youtube(
+                clip_file,
+                uploads.UploadMeta(title="t"),
+                client=mock_client(RecordingTransport(handler)),
+            )
+
     async def test_non_retriable_rejection_surfaces_the_redacted_error(
         self, fake_keyring, attested, linked_youtube, clip_file
     ) -> None:
