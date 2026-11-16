@@ -4,6 +4,7 @@ import { createBrowserRouter, RouterProvider } from 'react-router-dom'
 
 import { App } from './App'
 import './index.css'
+import { GtaMode } from './pages/GtaMode'
 import { Ingest } from './pages/Ingest'
 import { JobProgress } from './pages/JobProgress'
 import { LiveWatch } from './pages/LiveWatch'
@@ -19,6 +20,7 @@ const router = createBrowserRouter([
       { path: 'jobs/:jobId', element: <JobProgress /> },
       { path: 'jobs/:jobId/clips', element: <Review /> },
       { path: 'live', element: <LiveWatch /> },
+      { path: 'gta', element: <GtaMode /> },
       { path: 'settings', element: <Settings /> },
     ],
   },

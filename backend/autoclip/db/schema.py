@@ -213,12 +213,78 @@ def _migration_v3(conn: sqlite3.Connection) -> None:
     _run_in_transaction(conn, statements)
 
 
+_V4 = """
+-- GTA Mode: queued stream links, the moments judged in them, and the
+-- "what's working" reports. Statuses carry no CHECK constraints for the same
+-- reason as the live tables: the store validates them in Python.
+CREATE TABLE IF NOT EXISTS gta_streams (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL,
+    platform      TEXT NOT NULL DEFAULT '',
+    title         TEXT NOT NULL DEFAULT '',
+    channel       TEXT NOT NULL DEFAULT '',
+    duration_s    REAL NOT NULL DEFAULT 0,
+    range_start_s REAL,
+    range_end_s   REAL,
+    status        TEXT NOT NULL DEFAULT 'queued',
+    stage         TEXT NOT NULL DEFAULT '',
+    progress      REAL NOT NULL DEFAULT 0,
+    detail        TEXT NOT NULL DEFAULT '',
+    error         TEXT,
+    signals       TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gta_streams_status ON gta_streams(status, created_at);
+
+CREATE TABLE IF NOT EXISTS gta_clips (
+    id            TEXT PRIMARY KEY,
+    stream_id     TEXT NOT NULL REFERENCES gta_streams(id) ON DELETE CASCADE,
+    status        TEXT NOT NULL DEFAULT 'candidate',
+    start_s       REAL NOT NULL,
+    end_s         REAL NOT NULL,
+    chunk_index   INTEGER NOT NULL DEFAULT 0,
+    hook_title    TEXT NOT NULL DEFAULT '',
+    hook_quote    TEXT NOT NULL DEFAULT '',
+    moment_type   TEXT NOT NULL DEFAULT '',
+    summary       TEXT NOT NULL DEFAULT '',
+    hype_score    REAL NOT NULL DEFAULT 0,
+    score         INTEGER NOT NULL DEFAULT 0,
+    rank          INTEGER,
+    verdict       TEXT NOT NULL DEFAULT '{}',
+    reject_reason TEXT NOT NULL DEFAULT '',
+    caption       TEXT NOT NULL DEFAULT '',
+    hashtags      TEXT NOT NULL DEFAULT '[]',
+    path          TEXT NOT NULL DEFAULT '',
+    qa            TEXT NOT NULL DEFAULT '{}',
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gta_clips_stream ON gta_clips(stream_id, start_s);
+CREATE INDEX IF NOT EXISTS idx_gta_clips_status ON gta_clips(status);
+
+CREATE TABLE IF NOT EXISTS gta_reports (
+    id          TEXT PRIMARY KEY,
+    channel_url TEXT NOT NULL,
+    report      TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL
+);
+"""
+
+
+def _migration_v4(conn: sqlite3.Connection) -> None:
+    """GTA Mode tables (additive; the other modes never read them)."""
+    _run_in_transaction(conn, _statements(_V4))
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v1,
     _migration_v2,
     _migration_v3,
+    _migration_v4,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
