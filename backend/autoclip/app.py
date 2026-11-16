@@ -70,12 +70,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Live Watch, so switching it on in the settings starts it live.
         await live_manager.start()
 
+    # GTA Mode: its own queue (VODs) and live watches, same worker flag.
+    from .gta.live import live_manager as gta_live
+    from .gta.queue import queue as gta_queue
+
+    if worker_enabled:
+        await asyncio.to_thread(gta_live.recover)
+        await gta_queue.start()
+
     log.info("AutoClip %s ready. Artifacts in %s", __version__, paths.root())
 
     try:
         yield
     finally:
         if worker_enabled:
+            await asyncio.to_thread(gta_live.shutdown)
+            await gta_queue.stop()
             # Idempotent; also covers a manager started later by a settings
             # save, and withdraws the host's permission to start again.
             await live_manager.shutdown()

@@ -31,6 +31,7 @@ export function App() {
               New
             </TopLink>
             <TopLink to="/live">Live Watch</TopLink>
+            <TopLink to="/gta">GTA Mode</TopLink>
             <TopLink to="/settings">Settings</TopLink>
           </nav>
 

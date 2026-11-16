@@ -34,9 +34,9 @@ class TestSchemaAndMigration:
     def test_fresh_init_reaches_the_current_version(self, autoclip_home) -> None:
         version = db.init()
 
-        assert version == db.SCHEMA_VERSION == 3
+        assert version == db.SCHEMA_VERSION == 4
         with db.connection() as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
 
     def test_fresh_init_creates_live_tables(self, autoclip_home) -> None:
         db.init()
@@ -59,9 +59,9 @@ class TestSchemaAndMigration:
 
         version = db.init()
 
-        assert version == 3
+        assert version == 4
         with db.connection() as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
             # v1 data survived the upgrade.
             assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
         assert {"live_streams", "live_clips", "live_uploads"} <= table_names()
@@ -73,7 +73,7 @@ class TestSchemaAndMigration:
         first = db.init()
         second = db.init()
 
-        assert first == second == 3
+        assert first == second == 4
         # Re-running migration must not clobber live data.
         loaded = store.get_stream(stream.id)
         assert loaded is not None
