@@ -88,6 +88,10 @@ export interface GtaClip {
     loudness?: QaCheck
     black_frames?: QaCheck
     facecam?: QaCheck
+    format?: QaCheck
+    own_value?: QaCheck
+    watermark?: QaCheck
+    notes?: string[]
     cut_dead_air_s?: number
     duration_s?: number
     turnaround_s?: number
@@ -100,6 +104,7 @@ export interface GtaSettings {
   chunk_minutes: number
   chunk_tail_s: number
   min_clip_s: number
+  target_clip_s: number
   max_clip_s: number
   max_clips_per_stream: number
   section_pad_s: number
@@ -116,6 +121,14 @@ export interface GtaSettings {
   network_workers: number
   heavy_workers: number
   output_dir: string
+  punch_in: boolean
+  punch_in_zoom: number
+  punch_in_s: number
+  reaction_text: boolean
+  watermark_path: string
+  watermark_corner: 'top_left' | 'top_right'
+  watermark_width_px: number
+  watermark_opacity: number
   live: { listen_interval_s: number; context_s: number; turnaround_s: number }
   bias: {
     moment_types: Record<string, number>

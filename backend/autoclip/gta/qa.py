@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 #: Shorts/Reels/TikTok hard limit is 60 s; the clip must be strictly under.
 MAX_LENGTH_S = 60.0
 MIN_LENGTH_S = 5.0
+#: The delivery format every clip must have.
+OUT_W = 1080
+OUT_H = 1920
+OUT_FPS = 30.0
 #: Frames sampled for the face-cam check.
 FACE_SAMPLES = 12
 
@@ -48,13 +52,29 @@ class QaReport:
     loudness: Check
     black_frames: Check
     facecam: Check
+    #: 1080x1920, 30 fps, H.264 + AAC.
+    format: Check = field(default_factory=lambda: Check(True, "not checked"))
+    #: At least one own-value edit (punch-in, reaction text, ...).
+    own_value: Check = field(default_factory=lambda: Check(True, "not checked"))
+    #: Logo burned in. A warning only: it can't pass until a logo is set.
+    watermark: Check = field(default_factory=lambda: Check(True, "not checked"))
     #: Black spans (output seconds) — used to auto-fix edge blacks.
     black_spans: list[tuple[float, float]] = field(default_factory=list)
     loudness_lufs: float | None = None
+    #: Non-blocking remarks (e.g. longer than the 15-30 s target).
+    notes: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
-        return all(c.ok for c in (self.length, self.loudness, self.black_frames, self.facecam))
+        checks = (
+            self.length,
+            self.loudness,
+            self.black_frames,
+            self.facecam,
+            self.format,
+            self.own_value,
+        )
+        return all(c.ok for c in checks)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +83,10 @@ class QaReport:
             "loudness": asdict(self.loudness),
             "black_frames": asdict(self.black_frames),
             "facecam": asdict(self.facecam),
+            "format": asdict(self.format),
+            "own_value": asdict(self.own_value),
+            "watermark": asdict(self.watermark),
+            "notes": list(self.notes),
         }
 
 
@@ -172,9 +196,42 @@ def run_qa(
     true_peak_db: float,
     face_min_ratio: float,
     face_ratio_fn: Callable[[Path, float, float], float] | None = None,
+    edits: list[str] | None = None,
+    watermarked: bool | None = None,
+    target_s: float | None = None,
 ) -> QaReport:
     info = ffmpeg.probe(output)
     duration = float(info.duration_s or 0.0)
+    notes: list[str] = []
+    if target_s is not None and duration > target_s + 0.5:
+        notes.append(f"{duration:.0f} s is over the {target_s:.0f} s target (under the 60 s cap)")
+
+    problems: list[str] = []
+    if (info.width, info.height) != (OUT_W, OUT_H):
+        problems.append(f"{info.width}x{info.height}")
+    if (info.video_codec or "") != "h264":
+        problems.append(f"video {info.video_codec}")
+    if (info.audio_codec or "") != "aac":
+        problems.append(f"audio {info.audio_codec}")
+    if info.fps is None or abs(info.fps - OUT_FPS) > 0.05:
+        problems.append(f"{info.fps} fps")
+    fmt = (
+        Check(False, "wrong format: " + ", ".join(problems))
+        if problems
+        else Check(True, f"{OUT_W}x{OUT_H}, {OUT_FPS} fps, H.264 + AAC")
+    )
+    if edits is None:
+        own_value = Check(True, "not checked")
+    elif edits:
+        own_value = Check(True, ", ".join(edits), list(edits))
+    else:
+        own_value = Check(False, "no own-value edit (punch-in / reaction text) was applied", [])
+    if watermarked is None:
+        watermark = Check(True, "not checked")
+    elif watermarked:
+        watermark = Check(True, "logo burned in")
+    else:
+        watermark = Check(False, "no logo set — add yours in GTA Mode settings")
     if not info.has_video or not info.has_audio:
         length = Check(False, "the file is missing its video or audio track", duration)
     elif duration >= MAX_LENGTH_S:
@@ -230,8 +287,12 @@ def run_qa(
         loudness=loudness,
         black_frames=black,
         facecam=facecam,
+        format=fmt,
+        own_value=own_value,
+        watermark=watermark,
         black_spans=spans,
         loudness_lufs=lufs,
+        notes=notes,
     )
 
 

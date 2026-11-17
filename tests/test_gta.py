@@ -1194,3 +1194,157 @@ class TestLive:
         assert clip.qa["turnaround_ok"] is True and clip.qa["passed"] is True
         info = ffmpeg.probe(Path(clip.path))
         assert (info.width, info.height) == (1080, 1920)
+
+
+# --------------------------------------------------------------------------
+# Delivery spec: own-value edits, watermark, safe zones, format QA
+# --------------------------------------------------------------------------
+
+
+def _make_logo(path: Path) -> None:
+    _ffmpeg(
+        "-f", "lavfi", "-i", "color=c=0xFF00FF@1.0:s=200x200:d=1,format=rgba",
+        "-frames:v", "1", str(path),
+    )  # fmt: skip
+
+
+class TestDeliverySpec:
+    def test_settings_lengths_and_watermark_validation(self) -> None:
+        s = GtaSettings()
+        assert (s.min_clip_s, s.target_clip_s) == (15.0, 30.0) and s.max_clip_s < 60
+        with pytest.raises(ValueError):
+            GtaSettings(target_clip_s=59)
+        with pytest.raises(ValueError):
+            GtaSettings(watermark_corner="bottom_right")
+        with pytest.raises(ValueError):
+            GtaSettings(punch_in_zoom=3)
+
+    def test_key_moment_maps_through_cuts(self) -> None:
+        hop = 0.05
+        levels = np.full(int(10 / hop), -40.0, dtype=np.float32)
+        levels[int(7.0 / hop) : int(8.0 / hop)] = -5.0  # loud beat at 7-8 s (local)
+        keeps = [render.Keep(0.0, 3.0), render.Keep(5.0, 10.0)]  # 3-5 s cut out
+        moment = render.key_moment(levels, keeps, 0.0, hop_s=hop)
+        assert moment == pytest.approx(3.0 + 2.0, abs=0.06)  # 7 s local -> 5 s output
+        a, b = render.punch_in_window(moment, 8.0, 1.5)
+        assert a == pytest.approx(4.8, abs=0.07) and b == pytest.approx(6.3, abs=0.07)
+        assert render.punch_in_window(7.9, 8.0, 1.5)[1] <= 7.9
+
+    def test_text_respects_safe_zones(self, tmp_path: Path) -> None:
+        import pysubs2
+
+        path = render.write_subtitles(
+            tmp_path / "c.ass",
+            _words("one two three four five six", 0.0),
+            style_key="bold_pop",
+            hook_title="Hook",
+            title_s=3.0,
+            duration_s=10.0,
+            reaction_text="NO WAY",
+            reaction_window=(1.0, 2.0),
+        )
+        subs = pysubs2.load(str(path))
+        from autoclip.pipeline import captions
+
+        caption_style = subs.styles[captions.STYLE_NAME]
+        assert caption_style.marginv >= render.SAFE_BOTTOM_PX
+        assert render.TEXT_CENTRE_Y - 150 > render.SAFE_TOP_PX
+        reaction = next(e for e in subs.events if e.style == "GtaReaction")
+        assert reaction.start >= 3000  # never on top of the hook title
+
+    def test_render_with_punch_in_reaction_and_logo(self, tmp_path: Path) -> None:
+        section = tmp_path / "section.mp4"
+        _make_section(section)
+        logo = tmp_path / "logo.png"
+        _make_logo(logo)
+        destination = tmp_path / "clip.mp4"
+        extras = render.Extras(
+            reaction_text="HE DID NOT SEE THAT",
+            watermark=render.Watermark(path=logo, corner="top_right", width_px=120),
+        )
+        result = render.render(
+            render.RenderJob(
+                section=section,
+                section_offset_s=0.0,
+                start_s=0.5,
+                end_s=20.0,
+                words=_speech_words(),
+                hook_title="Title",
+                destination=destination,
+                work_dir=tmp_path / "work",
+                extras=extras,
+            ),
+            style_key="bold_pop",
+            title_s=3.0,
+            dead_air_min_s=0.6,
+            dead_air_keep_s=0.12,
+            max_duration_s=58.0,
+            loudness_lufs=-14.0,
+            true_peak_db=-1.0,
+            export_settings=ExportSettings(prefer_hardware_encoder=False),
+        )
+        assert result.edits == ["punch-in", "reaction text"] and result.watermarked
+        # The logo's magenta sits top-right, just under the 150 px safe zone.
+        frame = tmp_path / "f.png"
+        _ffmpeg("-ss", "1", "-i", str(destination), "-frames:v", "1", str(frame))
+        import cv2
+
+        img = cv2.imread(str(frame))
+        y = render.LOGO_TOP_PX + 30
+        b, g, r = (int(v) for v in img[y, 1080 - render.LOGO_SIDE_PX - 60])
+        assert r > 180 and b > 180 and g < 120, (b, g, r)
+        assert not np.any(
+            (img[:150, :, 2] > 200) & (img[:150, :, 0] > 200) & (img[:150, :, 1] < 80)
+        )
+
+        report = qa.run_qa(
+            destination,
+            section=section,
+            section_start_s=0.5,
+            section_end_s=20.0,
+            target_lufs=-14.0,
+            tolerance_lu=1.0,
+            true_peak_db=-1.0,
+            face_min_ratio=0.5,
+            face_ratio_fn=lambda *_: 1.0,
+            edits=result.edits,
+            watermarked=result.watermarked,
+            target_s=30.0,
+        )
+        assert report.format.ok, report.format.detail
+        assert report.own_value.ok and report.watermark.ok and report.passed
+
+    def test_qa_flags_wrong_format_and_missing_edits(self, tmp_path: Path) -> None:
+        clip = tmp_path / "small.mp4"
+        _ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=6",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(clip),
+        )  # fmt: skip
+        report = qa.run_qa(
+            clip,
+            section=clip,
+            section_start_s=0,
+            section_end_s=6,
+            target_lufs=-14.0,
+            tolerance_lu=50.0,
+            true_peak_db=10.0,
+            face_min_ratio=0.0,
+            face_ratio_fn=lambda *_: 1.0,
+            edits=[],
+            watermarked=False,
+            target_s=4.0,
+        )
+        assert not report.format.ok and "640x360" in report.format.detail
+        assert not report.own_value.ok and not report.watermark.ok
+        assert report.notes and "target" in report.notes[0]
+        assert not report.passed
+
+    def test_reaction_text_reaches_the_verdict(self) -> None:
+        c = judging.Candidate("x", 0, 0, 1, 0.0, 20.0, "", "other", "", 50)
+        verdict = judging._Verdict.model_validate(
+            {**_yes("x"), "reaction_text": "#wow CHAT WAS RIGHT"}
+        )
+        judging._apply_verdict(c, verdict, GtaSettings(), "Streamer")
+        assert c.status == "approved" and c.verdict["reaction_text"] == "CHAT WAS RIGHT"

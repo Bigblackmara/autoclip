@@ -360,6 +360,7 @@ class GtaLiveWatch:
                 settings=settings,
                 cancelled=lambda: False,
                 live=True,
+                reaction_text=str(clip.verdict.get("reaction_text") or ""),
             )
         except Exception as exc:
             store.update_clip(clip.id, status="failed", error=str(exc)[:2000])

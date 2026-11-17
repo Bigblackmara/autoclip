@@ -588,6 +588,25 @@ def post_text(clip: GtaClip) -> str:
     return f"{clip.caption}\n\n{tags}".strip()
 
 
+def render_extras(settings: GtaSettings, reaction_text: str) -> render.Extras:
+    """Own-value edits + watermark for one clip, from GTA settings."""
+    watermark = None
+    if settings.watermark_path.strip():
+        watermark = render.Watermark(
+            path=Path(settings.watermark_path).expanduser(),
+            corner=settings.watermark_corner,
+            width_px=settings.watermark_width_px,
+            opacity=settings.watermark_opacity,
+        )
+    return render.Extras(
+        punch_in=settings.punch_in,
+        punch_in_zoom=settings.punch_in_zoom,
+        punch_in_s=settings.punch_in_s,
+        reaction_text=reaction_text if settings.reaction_text else "",
+        watermark=watermark,
+    )
+
+
 def render_and_qa(
     *,
     section: Path,
@@ -601,6 +620,7 @@ def render_and_qa(
     settings: GtaSettings,
     cancelled: Callable[[], bool],
     live: bool = False,
+    reaction_text: str = "",
 ) -> dict:
     """Render one clip and run QA, fixing what can be fixed automatically.
 
@@ -625,6 +645,7 @@ def render_and_qa(
                     hook_title=hook_title,
                     destination=destination,
                     work_dir=work_dir,
+                    extras=render_extras(settings, reaction_text),
                 ),
                 style_key=settings.caption_style,
                 title_s=settings.hook_title_s,
@@ -641,9 +662,9 @@ def render_and_qa(
             local_start = start_s - section_start_s + trim_start
             local_end = end_s - section_start_s - trim_end
 
-            def check(face_fn=None, path=result.path, a=local_start, b=local_end):
+            def check(face_fn=None, r=result, a=local_start, b=local_end):
                 return qa.run_qa(
-                    path,
+                    r.path,
                     section=section,
                     section_start_s=a,
                     section_end_s=b,
@@ -652,6 +673,9 @@ def render_and_qa(
                     true_peak_db=settings.true_peak_db,
                     face_min_ratio=settings.face_min_ratio,
                     face_ratio_fn=face_fn,
+                    edits=r.edits,
+                    watermarked=r.watermarked,
+                    target_s=settings.target_clip_s,
                 )
 
             qa_report = check()
@@ -707,6 +731,7 @@ def stage_render(clip: GtaClip, stream: GtaStream, report: Reporter, settings: G
         work_dir=ws.render_dir(clip.id),
         settings=settings,
         cancelled=report.cancelled,
+        reaction_text=str(clip.verdict.get("reaction_text") or ""),
     )
     # The caption file next to the clip: one copy-paste away from posting.
     destination.with_suffix(".txt").write_text(post_text(clip) + "\n", encoding="utf-8")
