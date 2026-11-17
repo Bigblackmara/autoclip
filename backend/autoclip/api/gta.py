@@ -93,10 +93,12 @@ def _upload_out(upload: store.GtaUpload | None) -> dict[str, Any] | None:
     return {
         "id": upload.id,
         "clip_id": upload.clip_id,
+        "platform": upload.platform,
         "status": upload.status,
         "slot_at": upload.slot_at,
         "video_id": upload.video_id,
         "url": upload.url,
+        "media_url": upload.media_url,
         "title": upload.title,
         "error": upload.error,
         "attempts": upload.attempts,
@@ -104,7 +106,9 @@ def _upload_out(upload: store.GtaUpload | None) -> dict[str, Any] | None:
     }
 
 
-def _clip_out(clip: store.GtaClip, upload: store.GtaUpload | None = None) -> dict[str, Any]:
+def _clip_out(
+    clip: store.GtaClip, uploads: dict[str, store.GtaUpload] | None = None
+) -> dict[str, Any]:
     exists = bool(clip.path) and Path(clip.path).exists()
     return {
         "id": clip.id,
@@ -129,12 +133,15 @@ def _clip_out(clip: store.GtaClip, upload: store.GtaUpload | None = None) -> dic
         "has_video": exists,
         "qa": clip.qa,
         "error": clip.error,
-        "upload": _upload_out(upload),
+        "uploads": {p: _upload_out(u) for p, u in (uploads or {}).items()},
     }
 
 
-def _uploads_by_clip() -> dict[str, store.GtaUpload]:
-    return {u.clip_id: u for u in store.list_uploads(limit=100_000)}
+def _uploads_by_clip() -> dict[str, dict[str, store.GtaUpload]]:
+    out: dict[str, dict[str, store.GtaUpload]] = {}
+    for upload in store.list_uploads(limit=100_000):
+        out.setdefault(upload.clip_id, {})[upload.platform] = upload
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -275,13 +282,12 @@ async def delete_stream(stream_id: str) -> None:
         )
     from ..gta.poster import poster
 
-    uploading = poster.state.uploading_clip_id
-    if uploading:
+    for uploading in poster.uploading_clip_ids():
         clip = await asyncio.to_thread(store.get_clip, uploading)
         if clip is not None and clip.stream_id == stream_id:
             raise HTTPException(
                 status_code=409,
-                detail="One of this stream's clips is uploading to YouTube; try again shortly.",
+                detail="One of this stream's clips is uploading right now; try again shortly.",
             )
     await asyncio.to_thread(store.delete_stream, stream_id)
     # Working files only (audio, sections). Finished clips stay where they are.
@@ -450,7 +456,7 @@ async def run_feedback(payload: FeedbackIn) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# YouTube posting schedule
+# Posting schedule (YouTube + Instagram via Zernio)
 # --------------------------------------------------------------------------
 
 
@@ -479,7 +485,8 @@ def _posting_overview() -> dict[str, Any]:
     for entry in plan:
         entry["title"] = title(entry.get("clip_id"))
     return {
-        "state": {**poster.state.as_dict(), "running": poster.running},
+        "states": {p: st.as_dict() for p, st in poster.states.items()},
+        "running": poster.running,
         "posting": settings.posting.model_dump(mode="json"),
         "categories": YOUTUBE_CATEGORIES,
         "plan": plan,
@@ -505,45 +512,137 @@ async def posting_run_now() -> dict[str, Any]:
 
 @router.post("/clips/{clip_id}/posting")
 async def set_clip_posting(clip_id: str, payload: SkipPostingIn) -> dict[str, Any]:
-    """Exclude a clip from auto-posting (skip) or allow it again."""
+    """Exclude a clip from auto-posting on every platform (skip) or allow it again.
 
-    def apply() -> store.GtaUpload | None:
+    Skipping marks each platform the clip isn't already on (or being sent
+    to); rows that are scheduled/posted/checking there are left alone.
+    """
+
+    def apply() -> dict[str, store.GtaUpload]:
         if store.get_clip(clip_id) is None:
             raise HTTPException(status_code=404, detail="Clip not found.")
-        row = store.upload_for_clip(clip_id)
+        rows = store.uploads_for_clip(clip_id)
         if payload.skip:
-            if row is None:
-                return store.create_upload(clip_id, status="skipped")
-            if row.status in {"failed", "skipped"}:
-                store.update_upload(row.id, status="skipped", slot_at=None)
-                return store.get_upload(row.id)
-            raise HTTPException(
-                status_code=409, detail="This clip is already uploading or on YouTube."
-            )
-        if row is not None and row.status == "skipped":
-            store.delete_upload(row.id)
-            return None
-        return row
+            if any(r.status == "uploading" for r in rows.values()):
+                raise HTTPException(
+                    status_code=409, detail="This clip is uploading right now; try again shortly."
+                )
+            changed = False
+            for platform in store.PLATFORMS:
+                row = rows.get(platform)
+                if row is None:
+                    store.create_upload(clip_id, status="skipped", platform=platform)
+                    changed = True
+                elif row.status in {"failed", "skipped"}:
+                    store.update_upload(row.id, status="skipped", slot_at=None)
+                    changed = True
+            if not changed:
+                raise HTTPException(
+                    status_code=409, detail="This clip is already posted or scheduled everywhere."
+                )
+        else:
+            for row in rows.values():
+                if row.status == "skipped":
+                    store.delete_upload(row.id)
+        return store.uploads_for_clip(clip_id)
 
-    upload = await asyncio.to_thread(apply)
-    return {"upload": _upload_out(upload)}
+    uploads = await asyncio.to_thread(apply)
+    from ..gta.poster import poster
+
+    poster.notify()
+    return {"uploads": {p: _upload_out(u) for p, u in uploads.items()}}
 
 
 @router.post("/uploads/{upload_id}/retry")
 async def retry_upload(upload_id: str) -> dict[str, Any]:
-    """Put a failed or interrupted clip back in line (fresh attempts)."""
+    """Put a failed, interrupted or checking clip back in line (fresh attempts).
+
+    For ``checking`` (Instagram) the UI asks the user to confirm the reel is
+    really not at Zernio/Instagram first: AutoClip never re-sends on its own.
+    """
     from ..gta.poster import poster
 
     def apply() -> None:
         row = store.get_upload(upload_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Upload not found.")
-        if row.status not in {"failed", "interrupted"}:
+        if row.status not in {"failed", "interrupted", "checking"}:
             raise HTTPException(
-                status_code=409, detail="Only failed or interrupted uploads can be retried."
+                status_code=409,
+                detail="Only failed, interrupted or checking uploads can be retried.",
             )
         store.delete_upload(row.id)
 
     await asyncio.to_thread(apply)
     poster.notify()
     return {"retried": True}
+
+
+# --------------------------------------------------------------------------
+# Instagram via Zernio (API key + connection test)
+# --------------------------------------------------------------------------
+
+
+class ZernioKeyIn(BaseModel):
+    api_key: str = ""
+
+
+class ZernioTestIn(BaseModel):
+    account: str = ""
+
+
+def _instagram_status() -> dict[str, Any]:
+    from ..gta import zernio
+
+    try:
+        saved = bool(zernio.load_api_key())
+    except Exception:
+        saved = False
+    return {"key_saved": saved, "reelrepost_key_available": bool(zernio.reelrepost_api_key())}
+
+
+@router.get("/instagram")
+async def instagram_status() -> dict[str, Any]:
+    return await asyncio.to_thread(_instagram_status)
+
+
+@router.put("/instagram/key")
+async def put_instagram_key(payload: ZernioKeyIn) -> dict[str, Any]:
+    from ..gta import zernio
+    from ..gta.poster import poster
+
+    try:
+        await asyncio.to_thread(zernio.save_api_key, payload.api_key.strip())
+    except zernio.ZernioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    poster.notify()
+    return await asyncio.to_thread(_instagram_status)
+
+
+@router.post("/instagram/import-reelrepost")
+async def import_reelrepost_key() -> dict[str, Any]:
+    """Copy the Zernio key ReelRepost saved (it never leaves this PC)."""
+    from ..gta import zernio
+    from ..gta.poster import poster
+
+    key = await asyncio.to_thread(zernio.reelrepost_api_key)
+    if not key:
+        raise HTTPException(status_code=404, detail="ReelRepost has no Zernio API key saved.")
+    try:
+        await asyncio.to_thread(zernio.save_api_key, key)
+    except zernio.ZernioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    poster.notify()
+    return await asyncio.to_thread(_instagram_status)
+
+
+@router.post("/instagram/test")
+async def test_instagram(payload: ZernioTestIn) -> dict[str, Any]:
+    from ..gta import zernio
+
+    key = await asyncio.to_thread(zernio.load_api_key)
+    if not key:
+        return {"ok": False, "message": "Save your Zernio API key first.", "username": ""}
+    account = payload.account.strip().lstrip("@")
+    ok, message, username = await asyncio.to_thread(zernio.test_connection, key, account)
+    return {"ok": ok, "message": message, "username": username}

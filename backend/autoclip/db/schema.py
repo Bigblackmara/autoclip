@@ -305,6 +305,29 @@ def _migration_v5(conn: sqlite3.Connection) -> None:
     _run_in_transaction(conn, _statements(_V5))
 
 
+def _migration_v6(conn: sqlite3.Connection) -> None:
+    """GTA Mode posting to Instagram (via Zernio) next to YouTube.
+
+    One upload row per clip PER PLATFORM. ``media_url`` = the uploaded file's
+    public URL at Zernio, recorded before the post is created so an unclear
+    outcome can be looked up. Idempotent: columns are only added when missing.
+    """
+    columns = _column_names(conn, "gta_uploads")
+    statements: list[str] = []
+    if "platform" not in columns:
+        statements.append(
+            "ALTER TABLE gta_uploads ADD COLUMN platform TEXT NOT NULL DEFAULT 'youtube'"
+        )
+    if "media_url" not in columns:
+        statements.append("ALTER TABLE gta_uploads ADD COLUMN media_url TEXT NOT NULL DEFAULT ''")
+    statements += [
+        "DROP INDEX IF EXISTS idx_gta_uploads_clip",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_gta_uploads_clip_platform "
+        "ON gta_uploads(clip_id, platform)",
+    ]
+    _run_in_transaction(conn, statements)
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
@@ -313,6 +336,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v3,
     _migration_v4,
     _migration_v5,
+    _migration_v6,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
