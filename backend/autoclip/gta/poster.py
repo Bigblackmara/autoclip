@@ -1,20 +1,29 @@
-"""GTA Mode posting schedule: the best finished clip goes to YouTube per slot.
+"""GTA Mode posting schedule: the best finished clip goes out per slot.
 
-Every daily slot ("12:00", "17:00", ...) gets one Short. ``lead_minutes``
-before a slot, the best-scored clip that passed QA and isn't posted yet is
-uploaded as PRIVATE with ``publishAt`` = the slot, so YouTube itself makes it
+Platforms: YouTube (scheduled ``publishAt`` upload) and Instagram Reels
+through Zernio (zernio.com, a post scheduled at Zernio for the slot). Each
+enabled platform runs its own pass: per slot it takes the best clip not yet
+posted THERE, so normally the same clip goes to both at the same time.
+
+Every daily slot ("12:00", "17:00", ...) gets one post per platform.
+``lead_minutes`` before a slot, the best-scored clip that passed QA and isn't
+posted yet is uploaded: to YouTube as PRIVATE with ``publishAt`` = the slot,
+to Zernio as a post scheduled for the slot, so the platform itself makes it
 public exactly on time, whether or not AutoClip is still running then.
 
 Safety rules, because a duplicate or a wrong post is worse than a missed one:
 
-* One upload at a time, one row per clip (unique index), one clip per slot.
+* One upload at a time, one row per clip per platform (unique index), one
+  clip per slot per platform.
 * A slot whose time has (nearly) passed is never back-filled: no burst of
   posts after the PC was off.
-* An upload cut short by AutoClip stopping is marked ``interrupted`` and is
-  never retried on its own (YouTube may have it already); the user decides.
+* A YouTube upload cut short by AutoClip stopping is marked ``interrupted``
+  and is never retried on its own (YouTube may have it already).
 * Failed uploads retry after ``RETRY_AFTER_S``, at most ``MAX_ATTEMPTS``
-  times; quota/limit errors pause posting for an hour without using up a
-  clip's attempts.
+  times; quota/limit errors pause posting without using up a clip's attempts.
+* Instagram: Zernio has no idempotency key, so a create whose answer was
+  unclear is ``checking``: AutoClip keeps asking Zernio (by post id or the
+  uploaded media URL) and never sends it again on its own.
 """
 
 from __future__ import annotations
@@ -30,7 +39,7 @@ from typing import Any
 
 from ..live.uploads import tokens as tk
 from ..live.uploads.tokens import UploadMeta, UploadResult
-from . import store
+from . import store, zernio
 from .settings import GtaSettings
 from .settings import load as load_settings
 from .store import GtaClip, GtaUpload
@@ -50,6 +59,26 @@ INTERRUPTED_NOTE = (
     "AutoClip stopped during this upload. Check YouTube Studio: "
     "if the video is there, leave it; if not, press Retry."
 )
+
+#: Instagram follow-ups: re-ask Zernio about an unclear post this often, and
+#: confirm a scheduled reel went live from 5 min after its slot, every 10 min,
+#: for a day.
+IG_CHECK_EVERY_S = 300.0
+IG_CONFIRM_AFTER_S = 300.0
+IG_CONFIRM_EVERY_S = 600.0
+IG_CONFIRM_FOR_S = 86_400.0
+#: Account trouble / rate limit / outage at Zernio: pause Instagram this long.
+IG_PAUSE_S = 900.0
+IG_CAPTION_MAX = 2200
+IG_HASHTAGS_MAX = 30
+IG_INTERRUPTED_NOTE = (
+    "AutoClip stopped while sending this reel to Zernio. It is being checked "
+    "with Zernio and will not be sent twice."
+)
+IG_NOT_SENT_NOTE = "AutoClip stopped before this reel was sent; it will be tried again."
+IG_NOT_LISTED_NOTE = "Zernio doesn't list this reel. If it isn't on Instagram either, press Retry."
+
+PLATFORM_LABEL = {"youtube": "YouTube", "instagram": "Instagram"}
 
 Uploader = Callable[[Path, UploadMeta], Awaitable[UploadResult]]
 
@@ -133,12 +162,17 @@ def is_postable(clip: GtaClip) -> bool:
     )
 
 
-def eligible_clips(now: datetime) -> list[tuple[GtaClip, GtaUpload | None]]:
-    """Postable clips in posting order (best first) with their failed row, if any."""
-    uploads = {u.clip_id: u for u in store.list_uploads(limit=100_000)}
+def eligible_clips(
+    now: datetime, platform: str = "youtube"
+) -> list[tuple[GtaClip, GtaUpload | None]]:
+    """Postable clips for ``platform`` in posting order (best first), each
+    with its failed row there, if any. A clip skipped anywhere is skipped."""
+    rows = store.list_uploads(limit=100_000)
+    skipped = {u.clip_id for u in rows if u.status == "skipped"}
+    uploads = {u.clip_id: u for u in rows if u.platform == platform}
     out: list[tuple[GtaClip, GtaUpload | None]] = []
     for clip in store.list_clips(statuses=frozenset({"ready"}), limit=100_000):
-        if not is_postable(clip):
+        if clip.id in skipped or not is_postable(clip):
             continue
         row = uploads.get(clip.id)
         if row is not None and not (
@@ -194,17 +228,49 @@ def build_meta(clip: GtaClip, settings: GtaSettings, publish_at: datetime) -> Up
     )
 
 
+def instagram_caption(clip: GtaClip) -> str:
+    """Caption + hashtags for a Reel, within Instagram's 2200 chars / 30 tags."""
+    tags: list[str] = []
+    seen: set[str] = set()
+    for tag in clip.hashtags:
+        word = tag.strip().lstrip("#")
+        if not word or " " in word or word.lower() in seen:
+            continue
+        tags.append(f"#{word}")
+        seen.add(word.lower())
+        if len(tags) == IG_HASHTAGS_MAX:
+            break
+    tail = " ".join(tags)
+    room = IG_CAPTION_MAX - (len(tail) + 2 if tail else 0)
+    text = clip.caption.strip()
+    if len(text) > room:
+        text = text[: max(0, room - 1)].rstrip() + "…"
+    return f"{text}\n\n{tail}".strip()[:IG_CAPTION_MAX]
+
+
 def readiness() -> str:
-    """Why uploads can't run right now ('' = ready). Reads the OS keyring."""
+    """Why YouTube uploads can't run right now ('' = ready). Reads the OS keyring."""
     try:
         if not tk.has_rights_attestation():
-            return "Accept the rights notice in the YouTube tab to unlock uploads."
+            return "Accept the rights notice in the Posting tab to unlock uploads."
         if tk.load_client_credentials(tk.PLATFORM_YOUTUBE) is None:
-            return "Add your Google OAuth client ID and secret in the YouTube tab."
+            return "Add your Google OAuth client ID and secret in the Posting tab."
         if tk.load_tokens(tk.PLATFORM_YOUTUBE) is None:
-            return "Connect your YouTube channel in the YouTube tab."
+            return "Connect your YouTube channel in the Posting tab."
     except tk.UploadError as exc:
         return f"YouTube connection problem: {exc}"
+    return ""
+
+
+def instagram_readiness() -> str:
+    """Why Instagram posts can't run right now ('' = ready)."""
+    try:
+        if not tk.has_rights_attestation():
+            return "Accept the rights notice in the Posting tab to unlock uploads."
+        if not zernio.load_api_key():
+            return "Add your Zernio API key in the Posting tab."
+    except Exception as exc:  # keyring trouble
+        return f"Instagram connection problem: {exc}"
     return ""
 
 
@@ -241,17 +307,29 @@ class GtaPoster:
         uploader: Uploader | None = None,
         clock: Callable[[], datetime] | None = None,
         ready_check: Callable[[], str] = readiness,
+        instagram_ready_check: Callable[[], str] = instagram_readiness,
+        instagram: Any = None,
         tz: Any = None,
     ) -> None:
         self._uploader = uploader or _default_uploader
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._ready_check = ready_check
+        self._ready_checks = {"youtube": ready_check, "instagram": instagram_ready_check}
+        #: Zernio client (``schedule_reel`` / ``check_post``); tests pass a fake.
+        self._ig = instagram or zernio
         self._tz = tz
         self._task: asyncio.Task | None = None
         self._wakeup: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
-        self.state = PosterState()
+        self.states = {platform: PosterState() for platform in store.PLATFORMS}
+
+    @property
+    def state(self) -> PosterState:
+        """YouTube's state (kept for older callers)."""
+        return self.states["youtube"]
+
+    def uploading_clip_ids(self) -> set[str]:
+        return {s.uploading_clip_id for s in self.states.values() if s.uploading_clip_id}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -285,11 +363,28 @@ class GtaPoster:
 
     @staticmethod
     def recover() -> int:
-        """Rows left "uploading" by a crash: unknown outcome -> interrupted."""
-        rows = store.list_uploads(statuses=frozenset({"uploading"}))
-        for row in rows:
-            store.update_upload(row.id, status="interrupted", error=INTERRUPTED_NOTE)
-        return len(rows)
+        """Rows a crash left unfinished.
+
+        YouTube "uploading" -> interrupted (the user checks Studio). Instagram
+        "uploading" -> checking once its media URL was recorded (the create may
+        have gone out; it's looked up, never re-sent), else failed (nothing
+        was sent). Instagram "checking" with nothing to look up by -> failed.
+        """
+        count = 0
+        for row in store.list_uploads(statuses=frozenset({"uploading", "checking"})):
+            if row.platform == "youtube":
+                if row.status == "uploading":
+                    store.update_upload(row.id, status="interrupted", error=INTERRUPTED_NOTE)
+                    count += 1
+                continue
+            if row.media_url or row.video_id:
+                if row.status == "uploading":
+                    store.update_upload(row.id, status="checking", error=IG_INTERRUPTED_NOTE)
+                    count += 1
+            else:
+                store.update_upload(row.id, status="failed", error=IG_NOT_SENT_NOTE)
+                count += 1
+        return count
 
     async def _run(self) -> None:
         assert self._wakeup is not None
@@ -306,56 +401,88 @@ class GtaPoster:
 
     # -- read side -------------------------------------------------------
 
+    @staticmethod
+    def platforms_shown(settings: GtaSettings) -> list[str]:
+        posting = settings.posting
+        chosen = [p for p in store.PLATFORMS if getattr(posting, p)]
+        return chosen or ["youtube"]
+
     def plan(self, settings: GtaSettings, now: datetime | None = None) -> list[dict[str, Any]]:
-        """Upcoming slots: what holds each, or which clip would go next."""
+        """Upcoming slots per platform: what holds each, or which clip goes next."""
         now = now or self._clock()
-        holders = {
-            u.slot_at: u
-            for u in store.list_uploads(statuses=store.SLOT_HOLDING_STATUSES, limit=100_000)
-            if u.slot_at
-        }
-        queue = [clip for clip, _ in eligible_clips(now)]
+        moments = slot_datetimes(settings.posting.slots, now, tz=self._tz)
         out: list[dict[str, Any]] = []
-        for moment in slot_datetimes(settings.posting.slots, now, tz=self._tz):
-            key = slot_key(moment)
-            row = holders.get(key)
-            entry: dict[str, Any] = {"slot_at": key, "status": "open", "clip_id": None}
-            if row is not None:
-                entry.update(status=row.status, clip_id=row.clip_id, upload_id=row.id)
-            elif (moment - now).total_seconds() < MIN_LEAD_S:
-                entry["status"] = "missed"
-            elif queue:
-                entry.update(status="planned", clip_id=queue.pop(0).id)
-            out.append(entry)
+        for platform in self.platforms_shown(settings):
+            holders = {
+                u.slot_at: u
+                for u in store.list_uploads(
+                    statuses=store.SLOT_HOLDING_STATUSES, platform=platform, limit=100_000
+                )
+                if u.slot_at
+            }
+            queue = [clip for clip, _ in eligible_clips(now, platform)]
+            for moment in moments:
+                key = slot_key(moment)
+                row = holders.get(key)
+                entry: dict[str, Any] = {
+                    "slot_at": key,
+                    "platform": platform,
+                    "status": "open",
+                    "clip_id": None,
+                }
+                if row is not None:
+                    entry.update(status=row.status, clip_id=row.clip_id, upload_id=row.id)
+                elif (moment - now).total_seconds() < MIN_LEAD_S:
+                    entry["status"] = "missed"
+                elif queue:
+                    entry.update(status="planned", clip_id=queue.pop(0).id)
+                out.append(entry)
+        order = {p: i for i, p in enumerate(store.PLATFORMS)}
+        out.sort(key=lambda e: (e["slot_at"], order[e["platform"]]))
         return out
 
     # -- one pass --------------------------------------------------------
 
-    async def run_once(self) -> str:
-        """One scheduling pass; returns what happened (for tests and the UI)."""
+    async def run_once(self) -> dict[str, str]:
+        """One scheduling pass per platform; what happened on each."""
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            return await self._run_once()
+            settings = await asyncio.to_thread(load_settings)
+            results: dict[str, str] = {}
+            for platform in store.PLATFORMS:
+                results[platform] = await self._run_platform(platform, settings)
+            return results
 
-    async def _run_once(self) -> str:
+    async def _run_platform(self, platform: str, settings: GtaSettings) -> str:
+        state = self.states[platform]
+        label = PLATFORM_LABEL[platform]
         now = self._clock()
-        self.state.last_run = now
-        settings = await asyncio.to_thread(load_settings)
+        state.last_run = now
         posting = settings.posting
         if not posting.enabled:
-            self.state.message = "Posting schedule is off."
+            state.message = "Posting schedule is off."
             return "off"
-        if self.state.paused_until is not None and now < self.state.paused_until:
+        if not getattr(posting, platform):
+            state.message = f"Posting to {label} is off."
+            return "off"
+        if state.paused_until is not None and now < state.paused_until:
             return "paused"
-        self.state.paused_until = None
-        problem = await asyncio.to_thread(self._ready_check)
+        state.paused_until = None
+        problem = await asyncio.to_thread(self._ready_checks[platform])
         if problem:
-            self.state.message = problem
+            state.message = problem
             return "not_ready"
+        if platform == "instagram":
+            stopped = await self._instagram_followups(now)
+            if stopped:
+                return stopped
 
         holding = await asyncio.to_thread(
-            store.list_uploads, statuses=store.SLOT_HOLDING_STATUSES, limit=100_000
+            store.list_uploads,
+            statuses=store.SLOT_HOLDING_STATUSES,
+            platform=platform,
+            limit=100_000,
         )
         taken = {u.slot_at for u in holding if u.slot_at}
         slot = due_slot(posting.slots, posting.lead_minutes, now, taken, tz=self._tz)
@@ -365,42 +492,59 @@ class GtaPoster:
                 for m in slot_datetimes(posting.slots, now, tz=self._tz)
                 if slot_key(m) not in taken and (m - now).total_seconds() >= MIN_LEAD_S
             ]
-            self.state.message = (
+            state.message = (
                 f"Waiting for the next free slot ({slot_key(upcoming[0])})."
                 if upcoming
                 else "Every listed slot already has a clip."
             )
             return "waiting"
 
-        candidates = await asyncio.to_thread(eligible_clips, now)
+        candidates = await asyncio.to_thread(eligible_clips, now, platform)
         if not candidates:
-            self.state.message = (
+            state.message = (
                 f"No finished clip that passed QA is waiting for the {slot_key(slot)} slot."
             )
             return "no_clip"
         clip, row = candidates[0]
+        if platform == "instagram":
+            return await self._upload_instagram(clip, row, slot, settings)
         return await self._upload(clip, row, slot, settings)
+
+    async def _claim(
+        self, platform: str, clip: GtaClip, row: GtaUpload | None, key: str, title: str
+    ) -> GtaUpload:
+        """Mark the clip's row for ``platform`` as uploading for slot ``key``."""
+        if row is None:
+            return await asyncio.to_thread(
+                store.create_upload,
+                clip.id,
+                status="uploading",
+                platform=platform,
+                slot_at=key,
+                title=title,
+            )
+        await asyncio.to_thread(
+            store.update_upload,
+            row.id,
+            status="uploading",
+            slot_at=key,
+            title=title,
+            error=None,
+            video_id="",
+            url="",
+            media_url="",
+        )
+        return row
 
     async def _upload(
         self, clip: GtaClip, row: GtaUpload | None, slot: datetime, settings: GtaSettings
     ) -> str:
+        state = self.states["youtube"]
         key = slot_key(slot)
         title = post_title(clip)
-        if row is None:
-            row = await asyncio.to_thread(
-                store.create_upload, clip.id, status="uploading", slot_at=key, title=title
-            )
-        else:
-            await asyncio.to_thread(
-                store.update_upload,
-                row.id,
-                status="uploading",
-                slot_at=key,
-                title=title,
-                error=None,
-            )
-        self.state.uploading_clip_id = clip.id
-        self.state.message = f"Uploading “{title}” for the {key} slot…"
+        row = await self._claim("youtube", clip, row, key, title)
+        state.uploading_clip_id = clip.id
+        state.message = f"Uploading “{title}” for the {key} slot…"
         try:
             meta = build_meta(clip, settings, slot)
             result = await self._uploader(Path(clip.path), meta)
@@ -419,7 +563,7 @@ class GtaPoster:
             await asyncio.to_thread(
                 store.update_upload, row.id, status="failed", error=f"YouTube connection: {exc}"
             )
-            self.state.message = f"YouTube connection problem: {exc}"
+            state.message = f"YouTube connection problem: {exc}"
             return "failed"
         except Exception as exc:  # UploadApiError, OSError, ...
             message = str(exc) or type(exc).__name__
@@ -427,8 +571,8 @@ class GtaPoster:
                 await asyncio.to_thread(
                     store.update_upload, row.id, status="failed", error=f"Quota: {message[:400]}"
                 )
-                self.state.paused_until = self._clock() + timedelta(seconds=QUOTA_PAUSE_S)
-                self.state.message = "YouTube's upload limit was hit; posting paused for an hour."
+                state.paused_until = self._clock() + timedelta(seconds=QUOTA_PAUSE_S)
+                state.message = "YouTube's upload limit was hit; posting paused for an hour."
                 return "paused"
             await asyncio.to_thread(
                 store.update_upload,
@@ -438,10 +582,10 @@ class GtaPoster:
                 attempts=row.attempts + 1,
             )
             log.warning("GTA upload of %s failed: %s", clip.id, message)
-            self.state.message = f"Upload of “{title}” failed: {message[:200]}"
+            state.message = f"Upload of “{title}” failed: {message[:200]}"
             return "failed"
         finally:
-            self.state.uploading_clip_id = None
+            state.uploading_clip_id = None
 
         await asyncio.to_thread(
             store.update_upload,
@@ -452,9 +596,207 @@ class GtaPoster:
             error=None,
             attempts=row.attempts + 1,
         )
-        self.state.message = f"Scheduled “{title}” to go public at {key}."
+        state.message = f"Scheduled “{title}” to go public at {key}."
         log.info("GTA clip %s uploaded as %s, public at %s", clip.id, result.media_id, key)
         return "scheduled"
+
+    # -- Instagram (Zernio) ----------------------------------------------
+
+    def _pause_instagram(self, seconds: float, message: str) -> str:
+        state = self.states["instagram"]
+        state.paused_until = self._clock() + timedelta(seconds=max(seconds, 60.0))
+        state.message = message
+        return "paused"
+
+    async def _upload_instagram(
+        self, clip: GtaClip, row: GtaUpload | None, slot: datetime, settings: GtaSettings
+    ) -> str:
+        state = self.states["instagram"]
+        key = slot_key(slot)
+        title = post_title(clip)
+        api_key = await asyncio.to_thread(zernio.load_api_key) or ""
+        row = await self._claim("instagram", clip, row, key, title)
+        row_id, attempts = row.id, row.attempts
+
+        def remember_media(url: str) -> None:
+            store.update_upload(row_id, media_url=url)
+
+        def remember_post(post_id: str) -> None:
+            store.update_upload(row_id, video_id=post_id)
+
+        state.uploading_clip_id = clip.id
+        state.message = f"Sending “{title}” to Zernio for the {key} slot…"
+        try:
+            result = await asyncio.to_thread(
+                self._ig.schedule_reel,
+                api_key,
+                settings.posting.instagram_account,
+                clip.path,
+                instagram_caption(clip),
+                slot,
+                on_media_url=remember_media,
+                on_post_id=remember_post,
+            )
+        except asyncio.CancelledError:
+            # The worker thread may still create the post: look it up later.
+            await asyncio.to_thread(
+                store.update_upload, row_id, status="checking", error=IG_INTERRUPTED_NOTE
+            )
+            raise
+        except Exception as exc:  # a bug or local I/O error; nothing confirmed sent
+            message = str(exc) or type(exc).__name__
+            fresh = await asyncio.to_thread(store.get_upload, row_id)
+            sent = fresh is not None and bool(fresh.media_url or fresh.video_id)
+            await asyncio.to_thread(
+                store.update_upload,
+                row_id,
+                status="checking" if sent else "failed",
+                error=message[:500],
+                attempts=attempts + 1,
+            )
+            log.warning("GTA Instagram post of %s failed: %s", clip.id, message)
+            state.message = f"Instagram post of “{title}” failed: {message[:200]}"
+            return "checking" if sent else "failed"
+        finally:
+            state.uploading_clip_id = None
+
+        fields: dict[str, Any] = {"error": (result.message or "")[:500] or None}
+        if result.post_id:
+            fields["video_id"] = result.post_id
+        if result.media_url:
+            fields["media_url"] = result.media_url
+        kind = result.kind
+        if kind in {"scheduled", "posted"}:
+            fields["error"] = None
+            await asyncio.to_thread(
+                store.update_upload,
+                row_id,
+                status=kind,
+                url=result.post_url,
+                attempts=attempts + 1,
+                **fields,
+            )
+            state.message = (
+                f"Scheduled “{title}” on Instagram for {key}."
+                if kind == "scheduled"
+                else f"“{title}” is live on Instagram."
+            )
+            log.info("GTA clip %s sent to Zernio (%s) for %s", clip.id, result.post_id, key)
+            return kind
+        if kind == "unconfirmed":
+            await asyncio.to_thread(
+                store.update_upload, row_id, status="checking", attempts=attempts + 1, **fields
+            )
+            state.message = f"Zernio's answer for “{title}” was unclear; checking with Zernio."
+            return "checking"
+        if kind == "blocked":
+            await asyncio.to_thread(store.update_upload, row_id, status="failed", **fields)
+            return self._pause_instagram(
+                result.retry_after or IG_PAUSE_S, f"Instagram paused: {result.message[:200]}"
+            )
+        if kind == "invalid":
+            await asyncio.to_thread(
+                store.update_upload, row_id, status="failed", attempts=MAX_ATTEMPTS, **fields
+            )
+            state.message = f"Instagram can't take “{title}”: {result.message[:200]}"
+            return "failed"
+        # failed: nothing was published, safe to retry later
+        await asyncio.to_thread(
+            store.update_upload,
+            row_id,
+            status="failed",
+            attempts=attempts + (0 if result.transient else 1),
+            **fields,
+        )
+        if result.transient:
+            return self._pause_instagram(
+                IG_PAUSE_S, f"Zernio is unreachable; Instagram paused. ({result.message[:150]})"
+            )
+        state.message = f"Instagram post of “{title}” failed: {result.message[:200]}"
+        return "failed"
+
+    async def _instagram_followups(self, now: datetime) -> str:
+        """Ask Zernio about unclear posts and confirm scheduled reels went live.
+
+        Returns "paused" if Zernio blocked us, else "".
+        """
+        rows = await asyncio.to_thread(
+            store.list_uploads,
+            statuses=frozenset({"checking", "scheduled"}),
+            platform="instagram",
+            limit=500,
+        )
+        due: list[GtaUpload] = []
+        for row in rows:
+            if row.status == "checking":
+                if _age_s(row.updated_at, now) >= IG_CHECK_EVERY_S:
+                    due.append(row)
+                continue
+            if not row.slot_at or not (row.video_id or row.media_url):
+                continue
+            since = (now - parse_slot_key(row.slot_at)).total_seconds()
+            if IG_CONFIRM_AFTER_S <= since <= IG_CONFIRM_FOR_S and (
+                _age_s(row.updated_at, now) >= IG_CONFIRM_EVERY_S
+            ):
+                due.append(row)
+        if not due:
+            return ""
+        api_key = await asyncio.to_thread(zernio.load_api_key) or ""
+        for row in due:
+            if not (row.video_id or row.media_url):
+                await asyncio.to_thread(
+                    store.update_upload, row.id, status="failed", error=IG_NOT_SENT_NOTE
+                )
+                continue
+            # A lower bound for when it was sent (uploads start <= 1 day ahead).
+            sent_after = parse_slot_key(row.slot_at) - timedelta(days=1) if row.slot_at else None
+            try:
+                result = await asyncio.to_thread(
+                    self._ig.check_post, api_key, row.video_id, row.media_url, sent_after
+                )
+            except Exception as exc:
+                log.warning("Zernio check of %s failed: %s", row.id, exc)
+                await asyncio.to_thread(store.update_upload, row.id, error=row.error)
+                continue
+            fields: dict[str, Any] = {}
+            if result.post_id:
+                fields["video_id"] = result.post_id
+            if result.kind == "posted":
+                await asyncio.to_thread(
+                    store.update_upload,
+                    row.id,
+                    status="posted",
+                    url=result.post_url,
+                    error=None,
+                    **fields,
+                )
+            elif result.kind == "scheduled":
+                await asyncio.to_thread(
+                    store.update_upload, row.id, status="scheduled", error=None, **fields
+                )
+            elif result.kind == "failed":
+                await asyncio.to_thread(
+                    store.update_upload,
+                    row.id,
+                    status="failed",
+                    error=(result.message or "Instagram did not accept the reel.")[:500],
+                    **fields,
+                )
+            elif result.kind == "blocked":
+                return self._pause_instagram(
+                    result.retry_after or IG_PAUSE_S, f"Instagram paused: {result.message[:200]}"
+                )
+            else:  # unconfirmed: ask again later (the write touches updated_at)
+                if row.status == "checking":
+                    note = (
+                        IG_NOT_LISTED_NOTE
+                        if result.not_listed
+                        else result.message or "Still waiting for Zernio's answer."
+                    )
+                else:
+                    note = row.error
+                await asyncio.to_thread(store.update_upload, row.id, error=note, **fields)
+        return ""
 
 
 #: The app-wide poster (started by the app lifespan when the worker runs).

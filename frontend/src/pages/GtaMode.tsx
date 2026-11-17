@@ -25,7 +25,11 @@ import {
   type GtaSettings,
   type GtaStream,
   MAX_UPLOAD_ATTEMPTS,
+  PLATFORMS,
+  PLATFORM_NAME,
+  PLATFORM_SHORT,
   slotLabel,
+  type UploadStatus,
 } from '../gta/api'
 import { YouTubeTab } from '../gta/YouTubeTab'
 
@@ -34,7 +38,7 @@ type Tab = 'queue' | 'live' | 'youtube' | 'working' | 'settings'
 const TABS: readonly { key: Tab; label: string }[] = [
   { key: 'queue', label: 'Streams & clips' },
   { key: 'live', label: 'GTA Live' },
-  { key: 'youtube', label: 'YouTube' },
+  { key: 'youtube', label: 'Posting' },
   { key: 'working', label: "What's working" },
   { key: 'settings', label: 'Settings' },
 ]
@@ -445,11 +449,34 @@ function ClipWall({ title, clips, streams }: { title: string; clips: GtaClip[]; 
   )
 }
 
-/** Where this clip stands in the YouTube posting schedule, with Don't post / Allow. */
+const POSTING_WORD: Record<UploadStatus, string> = {
+  uploading: 'uploading…',
+  scheduled: 'scheduled',
+  checking: 'checking',
+  posted: 'live',
+  failed: 'failed',
+  interrupted: 'interrupted',
+  skipped: 'excluded',
+}
+
+const POSTING_TONE: Record<UploadStatus, string> = {
+  uploading: 'text-sodium-400',
+  scheduled: 'text-signal-good',
+  checking: 'text-sodium-400',
+  posted: 'text-signal-good',
+  failed: 'text-signal-bad',
+  interrupted: 'text-signal-bad',
+  skipped: 'text-ink-500',
+}
+
+/** Where this clip stands in the posting schedule (per platform), with Don't post / Allow. */
 function PostingRow({ clip }: { clip: GtaClip }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const upload = clip.upload
+  const rows = PLATFORMS.flatMap((p) => {
+    const upload = clip.uploads?.[p]
+    return upload ? [{ platform: p, upload }] : []
+  })
   const toggle = async (skip: boolean) => {
     setBusy(true)
     setError('')
@@ -461,55 +488,73 @@ function PostingRow({ clip }: { clip: GtaClip }) {
       setBusy(false)
     }
   }
+  const skipped = rows.length > 0 && rows.every((r) => r.upload.status === 'skipped')
+  const anyUploading = rows.some((r) => r.upload.status === 'uploading')
+  // Nothing left that "Don't post" could still stop (every platform already sent or excluded).
+  const allSettled =
+    rows.length === PLATFORMS.length &&
+    rows.every((r) => ['scheduled', 'posted', 'skipped', 'checking'].includes(r.upload.status))
+
   let text: React.ReactNode
+  if (rows.length === 0) {
+    text = clip.qa.passed ? 'Waiting for a posting slot' : 'Not posted (QA failed)'
+  } else if (skipped) {
+    text = 'Excluded from posting'
+  } else {
+    text = rows.map(({ platform, upload }, i) => (
+      <span key={platform}>
+        {i > 0 && ' · '}
+        <span title={upload.error ?? undefined}>
+          {PLATFORM_SHORT[platform]}:{' '}
+          <span className={POSTING_TONE[upload.status]}>
+            {POSTING_WORD[upload.status]}
+            {upload.status === 'failed' && ` (${upload.attempts}/${MAX_UPLOAD_ATTEMPTS})`}
+          </span>
+          {(upload.status === 'scheduled' || upload.status === 'posted') && upload.slot_at && (
+            <> {slotLabel(upload.slot_at)}</>
+          )}
+          {upload.url && (
+            <>
+              {' '}
+              <a href={upload.url} target="_blank" rel="noreferrer" className="text-sodium-400 underline">
+                open ↗
+              </a>
+            </>
+          )}
+        </span>
+      </span>
+    ))
+  }
+
   let action: React.ReactNode = null
-  if (!upload) {
-    text = clip.qa.passed ? 'YouTube: waiting for a posting slot' : 'YouTube: not posted (QA failed)'
-    if (clip.qa.passed) {
-      action = (
-        <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(true)}>
-          Don't post
-        </button>
-      )
-    }
-  } else if (upload.status === 'skipped') {
-    text = 'YouTube: excluded from posting'
+  if (skipped) {
     action = (
       <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(false)}>
         Allow posting
       </button>
     )
-  } else if (upload.status === 'scheduled') {
-    text = (
-      <>
-        <span className="text-signal-good">On YouTube</span> · public {slotLabel(upload.slot_at)}{' '}
-        {upload.url && (
-          <a href={upload.url} target="_blank" rel="noreferrer" className="text-sodium-400 underline">
-            open ↗
-          </a>
-        )}
-      </>
-    )
-  } else if (upload.status === 'uploading') {
-    text = <span className="text-sodium-400">Uploading to YouTube…</span>
-  } else if (upload.status === 'interrupted') {
-    text = <span className="text-signal-bad">Upload interrupted: check YouTube Studio (YouTube tab)</span>
-  } else {
-    text = (
-      <span className="text-signal-bad">
-        Upload failed ({upload.attempts}/{MAX_UPLOAD_ATTEMPTS}){upload.error ? `: ${upload.error}` : ''}
-      </span>
-    )
+  } else if (clip.qa.passed && !allSettled) {
     action = (
-      <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(true)}>
+      <button
+        className="btn btn-quiet"
+        disabled={busy || anyUploading}
+        title={anyUploading ? 'Uploading right now — wait for it to finish' : undefined}
+        onClick={() => toggle(true)}
+      >
         Don't post
       </button>
     )
   }
+  const failure = rows.find((r) => r.upload.status === 'failed' && r.upload.error)
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-400">
       <span className="min-w-0">{text}</span>
       {action}
+      {failure && (
+        <span className="w-full text-signal-bad">
+          {PLATFORM_NAME[failure.platform]}: {failure.upload.error}
+        </span>
+      )}
       {error && <span className="w-full text-signal-bad">{error}</span>}
     </div>
   )

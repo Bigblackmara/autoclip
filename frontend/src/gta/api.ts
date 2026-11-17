@@ -98,19 +98,41 @@ export interface GtaClip {
     turnaround_ok?: boolean
   }
   error: string | null
-  upload: GtaUpload | null
+  uploads: Partial<Record<Platform, GtaUpload>>
 }
 
-export type UploadStatus = 'uploading' | 'scheduled' | 'failed' | 'interrupted' | 'skipped'
+export type Platform = 'youtube' | 'instagram'
+
+export const PLATFORMS: readonly Platform[] = ['youtube', 'instagram']
+
+export const PLATFORM_NAME: Record<Platform, string> = { youtube: 'YouTube', instagram: 'Instagram' }
+
+export const PLATFORM_SHORT: Record<Platform, string> = { youtube: 'YT', instagram: 'IG' }
+
+/**
+ * checking: sent to Zernio, outcome not confirmed yet (AutoClip keeps asking
+ * and never posts it twice). posted: confirmed live on Instagram. Instagram
+ * "scheduled" = scheduled at Zernio, goes live at slot_at.
+ */
+export type UploadStatus =
+  | 'uploading'
+  | 'scheduled'
+  | 'checking'
+  | 'posted'
+  | 'failed'
+  | 'interrupted'
+  | 'skipped'
 
 export interface GtaUpload {
   id: string
   clip_id: string
+  platform: Platform
   status: UploadStatus
-  /** UTC ISO time the Short goes public. */
+  /** UTC ISO time the post goes public. */
   slot_at: string | null
   video_id: string
   url: string
+  media_url: string
   title: string
   error: string | null
   attempts: number
@@ -119,6 +141,10 @@ export interface GtaUpload {
 
 export interface GtaPosting {
   enabled: boolean
+  youtube: boolean
+  instagram: boolean
+  /** Optional Instagram username to post as (when several are connected at Zernio). */
+  instagram_account: string
   slots: string[]
   lead_minutes: number
   category_id: string
@@ -127,20 +153,28 @@ export interface GtaPosting {
 
 export interface PlanEntry {
   slot_at: string
+  platform: Platform
   status: 'open' | 'missed' | 'planned' | UploadStatus
   clip_id: string | null
   upload_id?: string
   title: string
 }
 
+export interface PlatformState {
+  message: string
+  paused_until: string | null
+  uploading_clip_id: string | null
+  last_run: string | null
+}
+
+export interface InstagramStatus {
+  key_saved: boolean
+  reelrepost_key_available: boolean
+}
+
 export interface PostingOverview {
-  state: {
-    message: string
-    paused_until: string | null
-    uploading_clip_id: string | null
-    last_run: string | null
-    running: boolean
-  }
+  states: Record<Platform, PlatformState>
+  running: boolean
   posting: GtaPosting
   categories: Record<string, string>
   plan: PlanEntry[]
@@ -249,12 +283,27 @@ export const gtaApi = {
   posting: () => request<PostingOverview>('/api/gta/posting'),
   runPosting: () => request<{ running: boolean }>('/api/gta/posting/run', { method: 'POST' }),
   setClipPosting: (clipId: string, skip: boolean) =>
-    request<{ upload: GtaUpload | null }>(`/api/gta/clips/${clipId}/posting`, {
+    request<{ uploads: Partial<Record<Platform, GtaUpload>> }>(`/api/gta/clips/${clipId}/posting`, {
       method: 'POST',
       body: JSON.stringify({ skip }),
     }),
   retryUpload: (uploadId: string) =>
     request<{ retried: boolean }>(`/api/gta/uploads/${uploadId}/retry`, { method: 'POST' }),
+  /** Instagram posting through Zernio: is an API key saved (or importable from ReelRepost)? */
+  instagram: () => request<InstagramStatus>('/api/gta/instagram'),
+  /** Save the Zernio API key to the OS keyring; an empty string removes it. */
+  saveInstagramKey: (api_key: string) =>
+    request<InstagramStatus>('/api/gta/instagram/key', {
+      method: 'PUT',
+      body: JSON.stringify({ api_key }),
+    }),
+  importReelRepostKey: () =>
+    request<InstagramStatus>('/api/gta/instagram/import-reelrepost', { method: 'POST' }),
+  testInstagram: (account: string) =>
+    request<{ ok: boolean; message: string; username: string }>('/api/gta/instagram/test', {
+      method: 'POST',
+      body: JSON.stringify({ account }),
+    }),
   /** Google consent for the shared YouTube connection, returning to GTA Mode. */
   connectYoutube: () =>
     request<{ redirect_url: string }>('/api/live/uploads/youtube/start?return_to=/gta', {

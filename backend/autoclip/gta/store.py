@@ -425,17 +425,24 @@ def latest_report() -> dict[str, Any] | None:
 
 
 # --------------------------------------------------------------------------
-# YouTube uploads (posting schedule, schema migration v5)
+# Uploads (posting schedule: YouTube since v5, per platform since v6)
 # --------------------------------------------------------------------------
 
-#: ``uploading`` -> ``scheduled`` (on YouTube, private until its slot, then
-#: public). ``failed`` rows are retried (bounded by ``attempts``);
-#: ``interrupted`` = AutoClip stopped mid-upload, so whether YouTube got the
-#: video is unknown and nothing retries it on its own; ``skipped`` = the user
-#: excluded the clip from auto-posting.
-UPLOAD_STATUSES = frozenset({"uploading", "scheduled", "failed", "interrupted", "skipped"})
+#: Platforms a clip can be posted to; one row per clip per platform.
+PLATFORMS = ("youtube", "instagram")
+
+#: ``uploading`` -> ``scheduled`` (YouTube: private until its slot, then
+#: public; Instagram: queued at Zernio for the slot) -> ``posted`` (Instagram:
+#: confirmed live). ``failed`` rows are retried (bounded by ``attempts``);
+#: ``interrupted`` = AutoClip stopped mid-upload to YouTube, outcome unknown,
+#: nothing retries it on its own; ``checking`` = sent to Zernio but the answer
+#: was unclear, so AutoClip keeps asking Zernio and never re-sends it;
+#: ``skipped`` = the user excluded the clip from auto-posting.
+UPLOAD_STATUSES = frozenset(
+    {"uploading", "scheduled", "posted", "failed", "interrupted", "checking", "skipped"}
+)
 #: Rows that own their publish slot (no other clip may take it).
-SLOT_HOLDING_STATUSES = frozenset({"uploading", "scheduled", "interrupted"})
+SLOT_HOLDING_STATUSES = frozenset({"uploading", "scheduled", "posted", "interrupted", "checking"})
 
 
 @dataclass
@@ -443,9 +450,11 @@ class GtaUpload:
     id: str
     clip_id: str
     status: str
+    platform: str = "youtube"
     slot_at: str | None = None
     video_id: str = ""
     url: str = ""
+    media_url: str = ""
     title: str = ""
     error: str | None = None
     attempts: int = 0
@@ -458,9 +467,11 @@ class GtaUpload:
             id=row["id"],
             clip_id=row["clip_id"],
             status=row["status"],
+            platform=row["platform"],
             slot_at=row["slot_at"],
             video_id=row["video_id"],
             url=row["url"],
+            media_url=row["media_url"],
             title=row["title"],
             error=row["error"],
             attempts=row["attempts"],
@@ -469,7 +480,9 @@ class GtaUpload:
         )
 
 
-_UPLOAD_COLUMNS = frozenset({"status", "slot_at", "video_id", "url", "title", "error", "attempts"})
+_UPLOAD_COLUMNS = frozenset(
+    {"status", "slot_at", "video_id", "url", "media_url", "title", "error", "attempts"}
+)
 
 
 def _check_upload_status(status: str) -> None:
@@ -477,20 +490,47 @@ def _check_upload_status(status: str) -> None:
         raise ValueError(f"Unknown upload status {status!r}")
 
 
+def _check_platform(platform: str) -> None:
+    if platform not in PLATFORMS:
+        raise ValueError(f"Unknown platform {platform!r}")
+
+
 def create_upload(
-    clip_id: str, *, status: str, slot_at: str | None = None, title: str = ""
+    clip_id: str,
+    *,
+    status: str,
+    platform: str = "youtube",
+    slot_at: str | None = None,
+    title: str = "",
 ) -> GtaUpload:
-    """Insert the clip's upload row (raises sqlite3.IntegrityError if it has one)."""
+    """Insert the clip's row for ``platform`` (sqlite3.IntegrityError if it has one)."""
     _check_upload_status(status)
-    upload = GtaUpload(id=new_id(), clip_id=clip_id, status=status, slot_at=slot_at, title=title)
+    _check_platform(platform)
+    upload = GtaUpload(
+        id=new_id(),
+        clip_id=clip_id,
+        status=status,
+        platform=platform,
+        slot_at=slot_at,
+        title=title,
+    )
     with connection() as conn:
         conn.execute(
             """
-            INSERT INTO gta_uploads (id, clip_id, status, slot_at, title, attempts,
+            INSERT INTO gta_uploads (id, clip_id, platform, status, slot_at, title, attempts,
                                      created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
-            (upload.id, clip_id, status, slot_at, title, upload.created_at, upload.updated_at),
+            (
+                upload.id,
+                clip_id,
+                platform,
+                status,
+                slot_at,
+                title,
+                upload.created_at,
+                upload.updated_at,
+            ),
         )
     return upload
 
@@ -501,18 +541,35 @@ def get_upload(upload_id: str) -> GtaUpload | None:
     return GtaUpload.from_row(row) if row else None
 
 
-def upload_for_clip(clip_id: str) -> GtaUpload | None:
+def upload_for_clip(clip_id: str, platform: str = "youtube") -> GtaUpload | None:
     with connection() as conn:
-        row = conn.execute("SELECT * FROM gta_uploads WHERE clip_id = ?", (clip_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM gta_uploads WHERE clip_id = ? AND platform = ?", (clip_id, platform)
+        ).fetchone()
     return GtaUpload.from_row(row) if row else None
 
 
-def list_uploads(*, statuses: frozenset[str] | None = None, limit: int = 1000) -> list[GtaUpload]:
+def uploads_for_clip(clip_id: str) -> dict[str, GtaUpload]:
+    """The clip's rows keyed by platform."""
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM gta_uploads WHERE clip_id = ?", (clip_id,)).fetchall()
+    return {row["platform"]: GtaUpload.from_row(row) for row in rows}
+
+
+def list_uploads(
+    *,
+    statuses: frozenset[str] | None = None,
+    platform: str | None = None,
+    limit: int = 1000,
+) -> list[GtaUpload]:
     clauses: list[str] = []
     params: list[Any] = []
     if statuses:
         clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
         params.extend(sorted(statuses))
+    if platform is not None:
+        clauses.append("platform = ?")
+        params.append(platform)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connection() as conn:
         rows = conn.execute(

@@ -1,10 +1,11 @@
 /**
- * GTA Mode → YouTube: connect the channel (shared with Live Watch), set the
- * posting schedule, and watch what goes out when.
+ * GTA Mode → Posting: connect YouTube (shared with Live Watch) and Instagram
+ * (through Zernio), set the posting schedule, and watch what goes out when.
  *
- * Each slot gets the best-scored clip that passed QA. It is uploaded as
- * private shortly before the slot with a scheduled publish time, so YouTube
- * makes it public exactly at the slot.
+ * Each slot gets, per enabled platform, the best-scored QA-passed clip not yet
+ * posted there (normally the same clip on both). YouTube: uploaded as private
+ * shortly before the slot with a scheduled publish time, so YouTube makes it
+ * public exactly at the slot. Instagram: scheduled at Zernio for the same time.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -14,15 +15,21 @@ import { ApiError } from '../api'
 import { liveApi, type LiveAttestation, type LivePlatformStatus } from '../live/api'
 import {
   MAX_UPLOAD_ATTEMPTS,
+  PLATFORMS,
+  PLATFORM_NAME,
+  PLATFORM_SHORT,
   gtaApi,
   slotLabel,
   type GtaPosting,
+  type InstagramStatus,
   type PlanEntry,
+  type Platform,
   type PostingOverview,
 } from './api'
 
 const POLL_MS = 4000
 const CONSOLE_URL = 'https://console.cloud.google.com/apis/credentials'
+const ZERNIO_URL = 'https://zernio.com'
 
 function errorText(err: unknown): string {
   if (err instanceof ApiError) return err.hint ? `${err.message}\n${err.hint}` : err.message
@@ -34,9 +41,11 @@ const STATUS_TEXT: Record<PlanEntry['status'], string> = {
   missed: 'Missed',
   planned: 'Next in line',
   uploading: 'Uploading…',
-  scheduled: 'On YouTube (goes public at this time)',
+  scheduled: 'Scheduled (goes public at this time)',
+  checking: 'Checking with Zernio…',
+  posted: 'Live on Instagram',
   failed: 'Failed',
-  interrupted: 'Interrupted — check YouTube Studio',
+  interrupted: 'Interrupted',
   skipped: 'Skipped',
 }
 
@@ -46,15 +55,42 @@ const STATUS_TONE: Record<PlanEntry['status'], string> = {
   planned: 'text-ink-300',
   uploading: 'text-sodium-400',
   scheduled: 'text-signal-good',
+  checking: 'text-sodium-400',
+  posted: 'text-signal-good',
   failed: 'text-signal-bad',
   interrupted: 'text-signal-bad',
   skipped: 'text-ink-500',
+}
+
+/** Status wording for one platform (YouTube and Instagram/Zernio differ). */
+function statusText(platform: Platform, status: PlanEntry['status']): string {
+  if (platform === 'youtube') {
+    if (status === 'scheduled') return 'On YouTube (goes public at this time)'
+    if (status === 'interrupted') return 'Interrupted — check YouTube Studio'
+  } else {
+    if (status === 'scheduled') return 'Scheduled at Zernio (goes live at this time)'
+    if (status === 'uploading') return 'Sending to Zernio…'
+    if (status === 'interrupted') return 'Interrupted — check Zernio / Instagram'
+  }
+  return STATUS_TEXT[status]
+}
+
+function PlatformTag({ platform }: { platform: Platform }) {
+  return (
+    <span
+      title={PLATFORM_NAME[platform]}
+      className="border border-ink-700 px-1 py-px font-mono text-[10px] tracking-wide text-ink-300"
+    >
+      {PLATFORM_SHORT[platform]}
+    </span>
+  )
 }
 
 export function YouTubeTab() {
   const [params, setParams] = useSearchParams()
   const [status, setStatus] = useState<LivePlatformStatus | null>(null)
   const [attestation, setAttestation] = useState<LiveAttestation | null>(null)
+  const [instagram, setInstagram] = useState<InstagramStatus | null>(null)
   const [overview, setOverview] = useState<PostingOverview | null>(null)
   const [error, setError] = useState('')
   const [note, setNote] = useState('')
@@ -67,6 +103,10 @@ export function YouTubeTab() {
     liveApi
       .getAttestation()
       .then(setAttestation)
+      .catch((err) => setError(errorText(err)))
+    gtaApi
+      .instagram()
+      .then(setInstagram)
       .catch((err) => setError(errorText(err)))
   }, [])
 
@@ -114,6 +154,13 @@ export function YouTubeTab() {
       {error && <p className="whitespace-pre-line text-sm text-signal-bad">{error}</p>}
       {note && <p className="text-sm text-signal-good">{note}</p>}
       <ConnectSection status={status} attestation={attestation} onChange={refreshAll} />
+      <InstagramSection
+        info={instagram}
+        attestation={attestation}
+        account={overview?.posting.instagram_account ?? ''}
+        onInfo={setInstagram}
+        onChange={refreshAll}
+      />
       {overview && <ScheduleSection overview={overview} onChange={refreshAll} />}
       {overview && <PlanSection overview={overview} />}
       {overview && <HistorySection overview={overview} onChange={loadOverview} />}
@@ -146,6 +193,44 @@ function Step({
   )
 }
 
+/** Step 1 of both connections: the shared Live Watch rights notice. */
+function RightsStep({
+  accepted,
+  busy,
+  platform,
+  onAccept,
+}: {
+  accepted: boolean
+  busy: boolean
+  platform: string
+  onAccept: () => void
+}) {
+  const [agreed, setAgreed] = useState(false)
+  return (
+    <Step n={1} done={accepted} title="Rights notice">
+      {accepted ? (
+        <p className="text-xs text-ink-500">Accepted.</p>
+      ) : (
+        <>
+          <label className="flex items-start gap-3 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+              className="mt-0.5 size-4 accent-sodium-500"
+            />
+            I have the rights or permission to clip and repost the streams I add, and I follow {platform}'s
+            terms.
+          </label>
+          <button className="btn btn-primary mt-3" disabled={!agreed || busy} onClick={onAccept}>
+            Accept and unlock uploads
+          </button>
+        </>
+      )}
+    </Step>
+  )
+}
+
 function ConnectSection({
   status,
   attestation,
@@ -155,7 +240,6 @@ function ConnectSection({
   attestation: LiveAttestation | null
   onChange: () => void
 }) {
-  const [agreed, setAgreed] = useState(false)
   const [clientId, setClientId] = useState('')
   const [secret, setSecret] = useState('')
   const [busy, setBusy] = useState(false)
@@ -216,31 +300,12 @@ function ConnectSection({
         can't read or change anything else on it.
       </p>
       <ol className="mt-5 grid gap-6">
-        <Step n={1} done={accepted} title="Rights notice">
-          {accepted ? (
-            <p className="text-xs text-ink-500">Accepted.</p>
-          ) : (
-            <>
-              <label className="flex items-start gap-3 text-sm text-ink-200">
-                <input
-                  type="checkbox"
-                  checked={agreed}
-                  onChange={(e) => setAgreed(e.target.checked)}
-                  className="mt-0.5 size-4 accent-sodium-500"
-                />
-                I have the rights or permission to clip and repost the streams I add, and I follow
-                YouTube's terms.
-              </label>
-              <button
-                className="btn btn-primary mt-3"
-                disabled={!agreed || busy}
-                onClick={() => act(() => liveApi.acceptAttestation())}
-              >
-                Accept and unlock uploads
-              </button>
-            </>
-          )}
-        </Step>
+        <RightsStep
+          accepted={accepted}
+          busy={busy}
+          platform="YouTube"
+          onAccept={() => void act(() => liveApi.acceptAttestation())}
+        />
 
         <Step n={2} done={hasCredentials} title="Your Google OAuth app">
           {hasCredentials ? (
@@ -320,6 +385,178 @@ function ConnectSection({
 }
 
 // --------------------------------------------------------------------------
+// Instagram via Zernio (rights notice → API key → test)
+// --------------------------------------------------------------------------
+
+function InstagramSection({
+  info,
+  attestation,
+  account,
+  onInfo,
+  onChange,
+}: {
+  info: InstagramStatus | null
+  attestation: LiveAttestation | null
+  /** Saved schedule's Instagram account (may be empty). */
+  account: string
+  onInfo: (value: InstagramStatus) => void
+  onChange: () => void
+}) {
+  const [key, setKey] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<{ tone: 'good' | 'bad'; text: string } | null>(null)
+
+  const act = async (fn: () => Promise<InstagramStatus | void>, done?: string) => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const value = await fn()
+      if (value) onInfo(value)
+      if (done) setMessage({ tone: 'good', text: done })
+      onChange()
+    } catch (err) {
+      setMessage({ tone: 'bad', text: errorText(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const result = await gtaApi.testInstagram(account)
+      setMessage({ tone: result.ok ? 'good' : 'bad', text: result.message })
+    } catch (err) {
+      setMessage({ tone: 'bad', text: errorText(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const accepted = attestation?.accepted === true
+  const keySaved = info?.key_saved === true
+
+  return (
+    <section>
+      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-ink-800 pb-2">
+        <h2 className="eyebrow">Instagram (via Zernio)</h2>
+        <span className={`text-xs ${keySaved ? 'text-signal-good' : 'text-ink-500'}`}>
+          {info === null ? 'checking…' : keySaved ? 'API key saved' : 'no API key'}
+        </span>
+      </div>
+      <p className="mt-2 max-w-prose text-xs text-ink-500">
+        AutoClip hands each reel to{' '}
+        <a href={ZERNIO_URL} target="_blank" rel="noreferrer" className="text-ink-300 underline">
+          Zernio ↗
+        </a>
+        , a posting service, which publishes it on your Instagram at the slot time.
+      </p>
+      <ol className="mt-5 grid gap-6">
+        <RightsStep
+          accepted={accepted}
+          busy={busy}
+          platform="Instagram"
+          onAccept={() => void act(async () => void (await liveApi.acceptAttestation()))}
+        />
+
+        <Step n={2} done={keySaved} title="Zernio API key">
+          <p className="max-w-prose text-xs leading-relaxed text-ink-400">
+            Make a free account at{' '}
+            <a href={ZERNIO_URL} target="_blank" rel="noreferrer" className="text-ink-200 underline">
+              zernio.com ↗
+            </a>
+            , connect your Instagram (Business or Creator account) there, then copy an API key from{' '}
+            <strong>Dashboard → API Keys</strong>.
+          </p>
+          {keySaved ? (
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <p className="text-xs text-ink-500">The key is saved in your OS keyring.</p>
+              <button
+                className="btn btn-quiet"
+                disabled={busy}
+                onClick={() => {
+                  if (!window.confirm('Remove the Zernio API key? Instagram posting stops until you add one.')) return
+                  void act(() => gtaApi.saveInstagramKey(''), 'Key removed.')
+                }}
+              >
+                Remove key
+              </button>
+            </div>
+          ) : (
+            <form
+              className="mt-3 grid gap-3"
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (!key.trim()) return
+                void act(async () => {
+                  const value = await gtaApi.saveInstagramKey(key.trim())
+                  setKey('')
+                  return value
+                }, 'Key saved.')
+              }}
+            >
+              <label className="text-xs text-ink-400">
+                API key
+                <input
+                  className="field"
+                  type="password"
+                  autoComplete="off"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                />
+              </label>
+              <div className="flex flex-wrap items-center gap-3">
+                <button className="btn btn-primary" disabled={busy || !key.trim()}>
+                  Save to keyring
+                </button>
+                {info?.reelrepost_key_available && (
+                  <button
+                    type="button"
+                    className="btn btn-quiet"
+                    disabled={busy}
+                    onClick={() => void act(() => gtaApi.importReelRepostKey(), 'Copied the key from ReelRepost.')}
+                  >
+                    Use ReelRepost's key
+                  </button>
+                )}
+              </div>
+            </form>
+          )}
+        </Step>
+
+        <Step n={3} done={false} title="Test the connection">
+          <p className="mb-3 text-xs text-ink-500">
+            Checks the key and finds the Instagram account
+            {account ? (
+              <>
+                {' '}
+                <span className="font-mono text-ink-300">@{account.replace(/^@/, '')}</span> (from the schedule)
+              </>
+            ) : (
+              ' (the first one connected at Zernio, or set one in the schedule below)'
+            )}
+            .
+          </p>
+          <button className="btn btn-ghost" disabled={busy || !keySaved} onClick={test}>
+            Test connection
+          </button>
+        </Step>
+      </ol>
+      {message && (
+        <p
+          className={`mt-4 whitespace-pre-line text-sm ${
+            message.tone === 'good' ? 'text-signal-good' : 'text-signal-bad'
+          }`}
+        >
+          {message.text}
+        </p>
+      )}
+    </section>
+  )
+}
+
+// --------------------------------------------------------------------------
 // Schedule
 // --------------------------------------------------------------------------
 
@@ -350,8 +587,9 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
       .split(/[,\s]+/)
       .map((s) => s.trim())
       .filter(Boolean)
+    const instagram_account = draft.instagram_account.trim().replace(/^@/, '')
     try {
-      await gtaApi.saveSettings({ posting: { ...draft, slots } })
+      await gtaApi.saveSettings({ posting: { ...draft, slots, instagram_account } })
       setDirty(false)
       setMessage({ tone: 'good', text: draft.enabled ? 'Saved — posting is on.' : 'Saved.' })
       onChange()
@@ -360,7 +598,7 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
     }
   }
 
-  const state = overview.state
+  const enabledPlatforms = PLATFORMS.filter((p) => saved[p])
   return (
     <section>
       <h2 className="eyebrow border-b border-ink-800 pb-2">Posting schedule</h2>
@@ -374,6 +612,26 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
           />
           Post finished clips automatically
         </label>
+        <div className="flex flex-wrap gap-x-8 gap-y-3 sm:col-span-2">
+          <label className="flex items-center gap-3 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              className="size-4 accent-sodium-500"
+              checked={draft.youtube}
+              onChange={(e) => edit({ youtube: e.target.checked })}
+            />
+            Post to YouTube
+          </label>
+          <label className="flex items-center gap-3 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              className="size-4 accent-sodium-500"
+              checked={draft.instagram}
+              onChange={(e) => edit({ instagram: e.target.checked })}
+            />
+            Post to Instagram
+          </label>
+        </div>
         <label className="text-xs text-ink-400 sm:col-span-2">
           Go-public times, your local time (24 h, comma separated)
           <input
@@ -387,7 +645,7 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
           />
         </label>
         <label className="text-xs text-ink-400">
-          Upload this long before each time (minutes)
+          Send this long before each time (minutes)
           <input
             className="field"
             type="number"
@@ -396,6 +654,16 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
             step={15}
             value={draft.lead_minutes}
             onChange={(e) => edit({ lead_minutes: Number(e.target.value) })}
+          />
+        </label>
+        <label className="text-xs text-ink-400">
+          Instagram account (optional, @username)
+          <input
+            className="field"
+            value={draft.instagram_account}
+            placeholder="@yourname"
+            autoComplete="off"
+            onChange={(e) => edit({ instagram_account: e.target.value })}
           />
         </label>
         <label className="text-xs text-ink-400">
@@ -412,14 +680,14 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
             ))}
           </select>
         </label>
-        <label className="flex items-center gap-3 text-sm text-ink-200 sm:col-span-2">
+        <label className="flex items-center gap-3 self-end text-sm text-ink-200">
           <input
             type="checkbox"
             className="size-4 accent-sodium-500"
             checked={draft.shorts_tag}
             onChange={(e) => edit({ shorts_tag: e.target.checked })}
           />
-          Add #Shorts to the description
+          YouTube: add #Shorts to the description
         </label>
       </div>
       <div className="mt-5 flex flex-wrap items-center gap-4">
@@ -432,15 +700,38 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
           </span>
         )}
       </div>
-      <p className="mt-4 text-sm text-ink-300">
-        <span className="text-ink-500">Status: </span>
-        {state.running ? state.message : 'AutoClip’s background worker is off, so nothing posts.'}
-        {state.paused_until && <span className="text-ink-500"> (until {slotLabel(state.paused_until)})</span>}
-      </p>
+      <div className="mt-4 grid gap-1 text-sm text-ink-300">
+        {!overview.running ? (
+          <p>
+            <span className="text-ink-500">Status: </span>
+            AutoClip’s background worker is off, so nothing posts.
+          </p>
+        ) : enabledPlatforms.length === 0 ? (
+          <p>
+            <span className="text-ink-500">Status: </span>
+            No platform selected.
+          </p>
+        ) : (
+          enabledPlatforms.map((p) => {
+            const state = overview.states[p]
+            return (
+              <p key={p}>
+                <span className="text-ink-500">{PLATFORM_NAME[p]}: </span>
+                {state?.message ?? ''}
+                {state?.paused_until && (
+                  <span className="text-ink-500"> (until {slotLabel(state.paused_until)})</span>
+                )}
+              </p>
+            )
+          })
+        )}
+      </div>
       <p className="mt-2 max-w-prose text-xs text-ink-500">
-        Each time gets the best-scored clip that passed QA. It's uploaded as private and YouTube makes it
-        public exactly at that time, even if AutoClip is closed by then. A time that passes while AutoClip is
-        off is skipped, never posted late. Exclude a clip with “Don't post” on its card.
+        Each time gets, per platform, the best-scored clip that passed QA and isn't posted there yet (normally
+        the same clip on both). YouTube: it's uploaded as private and YouTube makes it public exactly at that
+        time. Instagram: the reel is scheduled at Zernio for the same time. Both go out even if AutoClip is
+        closed by then. A time that passes while AutoClip is off is skipped, never posted late. Exclude a clip
+        with “Don't post” on its card.
       </p>
     </section>
   )
@@ -451,18 +742,34 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
 // --------------------------------------------------------------------------
 
 function PlanSection({ overview }: { overview: PostingOverview }) {
+  // One row per slot (entries arrive sorted by slot, then platform).
+  const slots: { slot_at: string; entries: PlanEntry[] }[] = []
+  for (const entry of overview.plan) {
+    const last = slots[slots.length - 1]
+    if (last && last.slot_at === entry.slot_at) last.entries.push(entry)
+    else slots.push({ slot_at: entry.slot_at, entries: [entry] })
+  }
   return (
     <section>
       <h2 className="eyebrow border-b border-ink-800 pb-2">Coming up</h2>
-      {overview.plan.length === 0 ? (
-        <p className="mt-3 text-sm text-ink-500">No posting times set.</p>
+      {slots.length === 0 ? (
+        <p className="mt-3 text-sm text-ink-500">No posting times set, or no platform selected.</p>
       ) : (
         <ul className="mt-3 divide-y divide-ink-800">
-          {overview.plan.map((entry) => (
-            <li key={entry.slot_at} className="flex flex-wrap items-baseline gap-x-4 gap-y-1 py-2 text-sm">
-              <span className="w-40 font-mono text-xs text-ink-300">{slotLabel(entry.slot_at)}</span>
-              <span className={`w-64 text-xs ${STATUS_TONE[entry.status]}`}>{STATUS_TEXT[entry.status]}</span>
-              <span className="min-w-0 flex-1 truncate text-ink-100">{entry.title}</span>
+          {slots.map((slot) => (
+            <li key={slot.slot_at} className="flex flex-wrap items-baseline gap-x-4 gap-y-1 py-2 text-sm">
+              <span className="w-40 font-mono text-xs text-ink-300">{slotLabel(slot.slot_at)}</span>
+              <div className="grid min-w-0 flex-1 gap-1">
+                {slot.entries.map((entry) => (
+                  <div key={entry.platform} className="flex min-w-0 flex-wrap items-baseline gap-x-3">
+                    <PlatformTag platform={entry.platform} />
+                    <span className={`w-64 text-xs ${STATUS_TONE[entry.status]}`}>
+                      {statusText(entry.platform, entry.status)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-ink-100">{entry.title}</span>
+                  </div>
+                ))}
+              </div>
             </li>
           ))}
         </ul>
@@ -471,10 +778,17 @@ function PlanSection({ overview }: { overview: PostingOverview }) {
   )
 }
 
+const RETRYABLE: ReadonlySet<PlanEntry['status']> = new Set(['failed', 'interrupted', 'checking'])
+
 function HistorySection({ overview, onChange }: { overview: PostingOverview; onChange: () => void }) {
   const [error, setError] = useState('')
   const uploads = overview.uploads.filter((u) => u.status !== 'skipped')
-  const retry = async (id: string) => {
+  const retry = async (id: string, status: PlanEntry['status']) => {
+    if (
+      status === 'checking' &&
+      !window.confirm('Only retry if the reel is NOT on Instagram/Zernio already. Retry?')
+    )
+      return
     setError('')
     try {
       await gtaApi.retryUpload(id)
@@ -495,18 +809,19 @@ function HistorySection({ overview, onChange }: { overview: PostingOverview; onC
             <li key={u.id} className="grid gap-1 py-3 text-sm">
               <div className="flex flex-wrap items-baseline gap-x-4">
                 <span className="w-40 font-mono text-xs text-ink-300">{slotLabel(u.slot_at)}</span>
+                <PlatformTag platform={u.platform} />
                 <span className={`text-xs ${STATUS_TONE[u.status]}`}>
-                  {STATUS_TEXT[u.status]}
+                  {statusText(u.platform, u.status)}
                   {u.status === 'failed' && ` (${u.attempts}/${MAX_UPLOAD_ATTEMPTS})`}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-ink-100">{u.clip_title}</span>
                 {u.url && (
                   <a href={u.url} target="_blank" rel="noreferrer" className="text-xs text-sodium-400 underline">
-                    Open on YouTube ↗
+                    Open on {PLATFORM_NAME[u.platform]} ↗
                   </a>
                 )}
-                {(u.status === 'failed' || u.status === 'interrupted') && (
-                  <button className="btn btn-quiet" onClick={() => retry(u.id)}>
+                {RETRYABLE.has(u.status) && (
+                  <button className="btn btn-quiet" onClick={() => retry(u.id, u.status)}>
                     Retry
                   </button>
                 )}

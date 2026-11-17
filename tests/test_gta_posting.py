@@ -183,10 +183,10 @@ class TestPoster:
         _clip(tmp_path)
         now = _now()
         uploader = FakeUploader()
-        assert asyncio.run(_poster(uploader, lambda: now).run_once()) == "off"
+        assert asyncio.run(_poster(uploader, lambda: now).run_once())["youtube"] == "off"
         _enable([_hhmm(now + timedelta(minutes=90))])
         p = _poster(uploader, lambda: now, ready="Connect your YouTube channel.")
-        assert asyncio.run(p.run_once()) == "not_ready"
+        assert asyncio.run(p.run_once())["youtube"] == "not_ready"
         assert p.state.message == "Connect your YouTube channel."
         assert uploader.calls == [] and store.list_uploads() == []
 
@@ -198,14 +198,14 @@ class TestPoster:
         _enable([_hhmm(slot)])
         uploader = FakeUploader()
         p = _poster(uploader, lambda: now)
-        assert asyncio.run(p.run_once()) == "scheduled"
+        assert asyncio.run(p.run_once())["youtube"] == "scheduled"
         ((path, meta),) = uploader.calls
         assert path == Path(best.path) and meta.publish_at == slot
         row = store.upload_for_clip(best.id)
         assert row is not None and row.status == "scheduled" and row.video_id == "vid1"
         assert row.slot_at == poster_mod.slot_key(slot) and row.url.endswith("vid1")
         # Same slot again: taken, nothing more is uploaded.
-        assert asyncio.run(p.run_once()) == "waiting"
+        assert asyncio.run(p.run_once())["youtube"] == "waiting"
         assert len(uploader.calls) == 1
         # The plan shows the scheduled clip, then the next one queued for tomorrow.
         plan = p.plan(gta_settings.load(), now)
@@ -219,17 +219,17 @@ class TestPoster:
         clock = {"t": now}
         uploader = FakeUploader(error=UploadApiError("HTTP 500: backend error"))
         p = _poster(uploader, lambda: clock["t"])
-        assert asyncio.run(p.run_once()) == "failed"
+        assert asyncio.run(p.run_once())["youtube"] == "failed"
         row = store.upload_for_clip(clip.id)
         assert row is not None and row.status == "failed" and row.attempts == 1
         # Within the back-off the clip isn't retried.
-        assert asyncio.run(p.run_once()) == "no_clip"
+        assert asyncio.run(p.run_once())["youtube"] == "no_clip"
         for attempt in (2, 3):
             clock["t"] += timedelta(minutes=6)
-            assert asyncio.run(p.run_once()) == "failed"
+            assert asyncio.run(p.run_once())["youtube"] == "failed"
             assert store.upload_for_clip(clip.id).attempts == attempt
         clock["t"] += timedelta(minutes=6)
-        assert asyncio.run(p.run_once()) == "no_clip"  # out of attempts
+        assert asyncio.run(p.run_once())["youtube"] == "no_clip"  # out of attempts
         assert len(uploader.calls) == 3
 
     def test_retry_succeeds_and_reuses_the_row(self, tmp_path: Path) -> None:
@@ -242,7 +242,7 @@ class TestPoster:
         asyncio.run(p.run_once())
         uploader.error = None
         clock["t"] += timedelta(minutes=6)
-        assert asyncio.run(p.run_once()) == "scheduled"
+        assert asyncio.run(p.run_once())["youtube"] == "scheduled"
         rows = store.list_uploads()
         assert len(rows) == 1 and rows[0].clip_id == clip.id and rows[0].status == "scheduled"
         assert rows[0].attempts == 2 and rows[0].error is None
@@ -255,10 +255,10 @@ class TestPoster:
         error = UploadApiError('HTTP 403: {"error": {"errors": [{"reason": "quotaExceeded"}]}}')
         uploader = FakeUploader(error=error)
         p = _poster(uploader, lambda: clock["t"])
-        assert asyncio.run(p.run_once()) == "paused"
+        assert asyncio.run(p.run_once())["youtube"] == "paused"
         assert store.upload_for_clip(clip.id).attempts == 0
         clock["t"] += timedelta(minutes=30)
-        assert asyncio.run(p.run_once()) == "paused"
+        assert asyncio.run(p.run_once())["youtube"] == "paused"
         assert len(uploader.calls) == 1
 
     def test_connection_errors_keep_attempts(self, tmp_path: Path) -> None:
@@ -266,7 +266,7 @@ class TestPoster:
         now = _now()
         _enable([_hhmm(now + timedelta(minutes=110))])
         uploader = FakeUploader(error=tk.NotLinkedError("not linked"))
-        assert asyncio.run(_poster(uploader, lambda: now).run_once()) == "failed"
+        assert asyncio.run(_poster(uploader, lambda: now).run_once())["youtube"] == "failed"
         row = store.upload_for_clip(clip.id)
         assert row.status == "failed" and row.attempts == 0 and "connection" in row.error
 
@@ -298,7 +298,7 @@ class TestPoster:
         assert row.status == "interrupted" and "YouTube Studio" in row.error
         # Interrupted holds its slot and its clip: nothing else happens on its own.
         uploader = FakeUploader()
-        assert asyncio.run(_poster(uploader, lambda: now).run_once()) == "waiting"
+        assert asyncio.run(_poster(uploader, lambda: now).run_once())["youtube"] == "waiting"
         assert uploader.calls == []
 
     def test_recover_turns_crashed_uploads_into_interrupted(self, tmp_path: Path) -> None:
@@ -354,14 +354,15 @@ class TestPostingApi:
         assert [e["title"] for e in _planned(client)[:2]] == ["FIRST", "SECOND"]
 
         skip = client.post(f"/api/gta/clips/{first.id}/posting", json={"skip": True})
-        assert skip.json()["upload"]["status"] == "skipped"
+        assert skip.json()["uploads"]["youtube"]["status"] == "skipped"
+        assert skip.json()["uploads"]["instagram"]["status"] == "skipped"
         assert _planned(client)[0]["title"] == "SECOND"
         clips = {c["id"]: c for c in client.get("/api/gta/clips").json()}
-        assert clips[first.id]["upload"]["status"] == "skipped"
-        assert clips[second.id]["upload"] is None
+        assert clips[first.id]["uploads"]["youtube"]["status"] == "skipped"
+        assert clips[second.id]["uploads"] == {}
 
         allow = client.post(f"/api/gta/clips/{first.id}/posting", json={"skip": False})
-        assert allow.json()["upload"] is None
+        assert allow.json()["uploads"] == {}
         assert client.post("/api/gta/clips/nope/posting", json={"skip": True}).status_code == 404
 
     def test_skip_refused_once_on_youtube_and_retry_rules(
@@ -370,7 +371,16 @@ class TestPostingApi:
         clip = _clip(tmp_path)
         row = store.create_upload(clip.id, status="scheduled", slot_at="2026-11-17T12:00:00Z")
         skip = client.post(f"/api/gta/clips/{clip.id}/posting", json={"skip": True})
-        assert skip.status_code == 409
+        # On YouTube already: only Instagram (not sent yet) is skipped.
+        assert skip.status_code == 200
+        assert skip.json()["uploads"]["youtube"]["status"] == "scheduled"
+        assert skip.json()["uploads"]["instagram"]["status"] == "skipped"
+        again = client.post(f"/api/gta/clips/{clip.id}/posting", json={"skip": True})
+        assert again.status_code == 200
+        ig = store.upload_for_clip(clip.id, "instagram")
+        store.update_upload(ig.id, status="posted")
+        done = client.post(f"/api/gta/clips/{clip.id}/posting", json={"skip": True})
+        assert done.status_code == 409
         assert client.post(f"/api/gta/uploads/{row.id}/retry").status_code == 409
         store.update_upload(row.id, status="interrupted")
         assert client.post(f"/api/gta/uploads/{row.id}/retry").status_code == 200

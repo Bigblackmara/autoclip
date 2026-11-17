@@ -55,7 +55,7 @@ YOUTUBE_CATEGORIES = {"20": "Gaming", "22": "People & Blogs", "23": "Comedy", "2
 
 
 class GtaPosting(BaseModel):
-    """YouTube posting schedule for finished GTA clips.
+    """Posting schedule (YouTube, Instagram via Zernio) for finished GTA clips.
 
     Shortly before each daily slot (``lead_minutes``) the best-scored clip
     that passed QA is uploaded as private with ``publishAt`` set to the slot,
@@ -71,6 +71,20 @@ class GtaPosting(BaseModel):
     category_id: str = "24"
     #: Append #Shorts to the description when the clip's hashtags lack it.
     shorts_tag: bool = True
+    #: Which platforms the schedule posts to (``enabled`` is the master switch).
+    youtube: bool = True
+    #: Instagram Reels through Zernio (zernio.com), scheduled for the same slot.
+    instagram: bool = False
+    #: Instagram username to post as when several are connected at Zernio.
+    instagram_account: str = ""
+
+    @field_validator("instagram_account")
+    @classmethod
+    def _account(cls, value: str) -> str:
+        text = str(value).strip().lstrip("@").strip()
+        if len(text) > 64 or any(ch.isspace() for ch in text):
+            raise ValueError("Instagram account must be a username like clipgod (no spaces)")
+        return text
 
     @field_validator("slots")
     @classmethod
