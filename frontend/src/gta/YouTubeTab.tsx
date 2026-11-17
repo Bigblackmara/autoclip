@@ -245,6 +245,8 @@ function ConnectSection({
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [copied, setCopied] = useState(false)
+  const [changing, setChanging] = useState(false)
+  const [notice, setNotice] = useState('')
   const redirectRef = useRef<HTMLElement>(null)
 
   const act = async (fn: () => Promise<unknown>) => {
@@ -308,8 +310,22 @@ function ConnectSection({
         />
 
         <Step n={2} done={hasCredentials} title="Your Google OAuth app">
-          {hasCredentials ? (
-            <p className="text-xs text-ink-500">Client ID and secret are saved in your OS keyring.</p>
+          {notice && <p className="mb-2 text-xs text-sodium-400">{notice}</p>}
+          {hasCredentials && !changing ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-xs text-ink-500">Client ID and secret are saved in your OS keyring.</p>
+              <button
+                type="button"
+                className="btn btn-quiet"
+                disabled={busy}
+                onClick={() => {
+                  setNotice('')
+                  setChanging(true)
+                }}
+              >
+                Change
+              </button>
+            </div>
           ) : (
             <form
               className="grid gap-3"
@@ -317,9 +333,15 @@ function ConnectSection({
                 e.preventDefault()
                 if (!clientId.trim() || !secret.trim()) return
                 void act(async () => {
-                  await liveApi.saveCredentials('youtube', clientId.trim(), secret.trim())
+                  const saved = await liveApi.saveCredentials('youtube', clientId.trim(), secret.trim())
                   setClientId('')
                   setSecret('')
+                  setChanging(false)
+                  setNotice(
+                    saved.disconnected
+                      ? 'New OAuth app saved. The old connection was removed — press Connect YouTube below.'
+                      : 'Saved.',
+                  )
                 })
               }}
             >
@@ -356,12 +378,27 @@ function ConnectSection({
                   onChange={(e) => setSecret(e.target.value)}
                 />
               </label>
-              <button
-                className="btn btn-primary justify-self-start"
-                disabled={busy || !clientId.trim() || !secret.trim()}
-              >
-                Save to keyring
-              </button>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || !clientId.trim() || !secret.trim()}
+                >
+                  {hasCredentials ? 'Replace in keyring' : 'Save to keyring'}
+                </button>
+                {changing && (
+                  <button
+                    type="button"
+                    className="btn btn-quiet"
+                    onClick={() => {
+                      setChanging(false)
+                      setClientId('')
+                      setSecret('')
+                    }}
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
             </form>
           )}
         </Step>

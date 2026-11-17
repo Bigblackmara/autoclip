@@ -775,18 +775,29 @@ async def upload_platform_status(platform: str, request: Request) -> dict:
 
 @router.post("/uploads/{platform}/credentials")
 async def save_credentials(platform: str, payload: LiveCredentialsIn) -> dict:
-    """Store the user's own OAuth app credentials; never echoed back."""
+    """Store (or replace) the user's own OAuth app credentials; never echoed back.
+
+    Replacing them with a DIFFERENT app's client id also drops the stored
+    connection: tokens issued to the old app can't be refreshed with the new
+    one, so the user reconnects (consents) with the new app.
+    """
     _check_platform(platform)
     uploads = _uploads_pkg()
-    if not payload.client_id.strip() or not payload.client_secret.strip():
+    client_id = payload.client_id.strip()
+    if not client_id or not payload.client_secret.strip():
         raise HTTPException(status_code=400, detail="Both client id and secret are required.")
     try:
-        uploads.save_client_credentials(
-            platform, payload.client_id.strip(), payload.client_secret.strip()
-        )
+        previous = uploads.load_client_credentials(platform)
+    except Exception:
+        previous = None
+    app_changed = previous is not None and previous[0] != client_id
+    try:
+        uploads.save_client_credentials(platform, client_id, payload.client_secret.strip())
+        if app_changed:
+            uploads.clear_tokens(platform)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"saved": True}
+    return {"saved": True, "disconnected": app_changed}
 
 
 @router.get("/uploads/attestation")

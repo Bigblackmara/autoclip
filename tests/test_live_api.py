@@ -740,9 +740,30 @@ class TestCredentialsAndAttestation:
             json={"client_id": "my-id", "client_secret": "my-secret"},
         )
         assert response.status_code == 200
-        assert response.json() == {"saved": True}
+        assert response.json() == {"saved": True, "disconnected": False}
         assert saved["client_secret"] == "my-secret"
         assert "my-secret" not in response.text  # never echoed
+
+    def test_replacing_the_app_drops_its_old_connection(
+        self,
+        started_client: tuple[TestClient, FakeManager],
+        fake_keyring,
+    ):
+        from autoclip.live.uploads import tokens as tk
+
+        client, _ = started_client
+        url = "/api/live/uploads/youtube/credentials"
+        tk.save_client_credentials("youtube", "wrong-app", "s1")
+        tk.save_tokens("youtube", tk.TokenBundle(access_token="a", refresh_token="r"))
+        # Same app, new secret: the connection stays.
+        same = client.post(url, json={"client_id": "wrong-app", "client_secret": "s2"})
+        assert same.json() == {"saved": True, "disconnected": False}
+        assert tk.load_tokens("youtube") is not None
+        # Another app: credentials replaced, old tokens dropped.
+        other = client.post(url, json={"client_id": "right-app", "client_secret": "s3"})
+        assert other.json() == {"saved": True, "disconnected": True}
+        assert tk.load_client_credentials("youtube") == ("right-app", "s3")
+        assert tk.load_tokens("youtube") is None
 
     def test_platform_status_maps_to_a7(
         self,
