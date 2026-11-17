@@ -110,10 +110,15 @@ class GtaSettings(BaseModel):
     reaction_text: bool = True
 
     #: Your logo (PNG, ideally with transparency) burned into a top corner.
-    #: Empty = no watermark (QA then warns that it is missing).
+    #: When set it wins over the text logo below.
     watermark_path: str = ""
+    #: Text logo used when no PNG is set: drawn in ``watermark_font`` (empty =
+    #: bundled Lemon Milk Bold), first word yellow, rest white, black outline.
+    #: Both empty = no watermark (QA then warns that it is missing).
+    watermark_text: str = "GTA Clipgod"
+    watermark_font: str = ""
     watermark_corner: str = "top_right"
-    watermark_width_px: int = 140
+    watermark_width_px: int = 240
     watermark_opacity: float = 0.85
 
     live: GtaLiveSettings = Field(default_factory=GtaLiveSettings)
@@ -161,6 +166,14 @@ class GtaSettings(BaseModel):
     def _opacity(cls, value: float) -> float:
         if not 0.1 <= value <= 1.0:
             raise ValueError("watermark_opacity must be between 0.1 and 1.0")
+        return value
+
+    @field_validator("watermark_text")
+    @classmethod
+    def _logo_text(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if len(value) > 40:
+            raise ValueError("watermark_text must be at most 40 characters")
         return value
 
     @field_validator("watermark_width_px")
