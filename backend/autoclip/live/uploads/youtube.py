@@ -14,8 +14,8 @@ and gives byte-range resumption with plain ``httpx``:
    empty-PUT status probe (``Content-Range: bytes */TOTAL``), read the
    server's ``Range`` header, and the retry streams only the missing tail.
 
-Scope is exactly ``youtube.upload`` — it grants upload and none of the read
-scopes, which keeps the consent screen minimal. google-api-python-client is
+Scopes: ``youtube.upload`` plus ``youtube`` (manage), the latter only so
+:func:`reschedule_youtube` can move a scheduled video's publish time. google-api-python-client is
 forbidden by the work order and would hide this ~40-line protocol behind a
 client abstraction (plus its own dependency tree).
 """
@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 UPLOAD_SESSION_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 CHANNEL_INFO_URL = "https://www.googleapis.com/youtube/v3/channels"
+VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_VIDEO_URL = "https://www.youtube.com/video/{id}"
 
 #: HTTP statuses Google documents as retriable for resumable uploads.
@@ -311,6 +312,72 @@ async def upload_youtube(
         url=YOUTUBE_VIDEO_URL.format(id=media_id),
         account=account,
     )
+
+
+#: ``status`` fields videos.update may write; anything not sent is RESET by
+#: YouTube, so the current values are read first and sent back unchanged.
+_WRITABLE_STATUS = (
+    "privacyStatus",
+    "embeddable",
+    "license",
+    "publicStatsViewable",
+    "selfDeclaredMadeForKids",
+    "containsSyntheticMedia",
+)
+
+
+def can_edit(bundle: TokenBundle | None) -> bool:
+    """Whether the stored grant includes the manage scope (edits allowed)."""
+    return bundle is not None and tk.YOUTUBE_MANAGE_SCOPE in bundle.scope.split()
+
+
+async def reschedule_youtube(
+    video_id: str, publish_at, *, client: httpx.AsyncClient | None = None
+) -> str:
+    """Move a scheduled (private) video's publish time; returns the new ``publishAt``.
+
+    Needs the manage scope: a grant from before it existed raises
+    UploadApiError asking the user to reconnect.
+    """
+    if publish_at.tzinfo is None:
+        raise ValueError("publish_at must be timezone-aware")
+    bundle = await ensure_fresh(tk.PLATFORM_YOUTUBE, client=client)
+    if not can_edit(bundle):
+        raise UploadApiError(
+            "This YouTube connection only allows uploads. Press Reconnect in the "
+            "Posting tab and allow managing your YouTube account."
+        )
+    async with tk.api_client(client) as http:
+        listed = await api_request(
+            http,
+            "GET",
+            VIDEOS_URL,
+            params={"part": "status", "id": video_id},
+            headers=_auth_header(bundle),
+            redact=(bundle.access_token,),
+        )
+        items = listed.json().get("items") or []
+        if not items:
+            raise UploadApiError(f"Video {video_id} was not found on the channel.")
+        current = items[0].get("status") or {}
+        if current.get("privacyStatus") != "private":
+            raise UploadApiError(
+                f"Video {video_id} is already {current.get('privacyStatus')}; "
+                "only scheduled (private) videos can be moved."
+            )
+        status = {k: current[k] for k in _WRITABLE_STATUS if k in current}
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        response = await api_request(
+            http,
+            "PUT",
+            VIDEOS_URL,
+            params={"part": "status"},
+            json={"id": video_id, "status": status},
+            headers=_auth_header(bundle),
+            redact=(bundle.access_token,),
+        )
+    return str((response.json().get("status") or {}).get("publishAt") or "")
 
 
 async def youtube_status(*, client: httpx.AsyncClient | None = None) -> dict:

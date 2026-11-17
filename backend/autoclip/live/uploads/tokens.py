@@ -72,7 +72,12 @@ _ATTESTATION_PREFIX = "accepted:"
 # OAuth endpoints / scopes
 # --------------------------------------------------------------------------
 
-YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+#: Upload, plus "manage" so a scheduled Short's publish time can be changed
+#: after upload (videos.update). Grants made before this keep upload only;
+#: reconnecting asks for the wider one.
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_MANAGE_SCOPE = "https://www.googleapis.com/auth/youtube"
+YOUTUBE_SCOPE = f"{YOUTUBE_UPLOAD_SCOPE} {YOUTUBE_MANAGE_SCOPE}"
 #: Facebook-Login permission set for IG content publishing; the resumable
 #: rupload host requires the Facebook Login product, not Instagram Login.
 INSTAGRAM_SCOPES = "instagram_content_publish,pages_show_list"
