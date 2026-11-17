@@ -228,11 +228,12 @@ class _Verdict(BaseModel):
     payoff: _Answer = _Answer()
     score: int = 0
     hook_title: str = ""
+    reaction_text: str = ""
     caption: str = ""
     hashtags: list[str] = []
     moment_type: str = "other"
 
-    @field_validator("id", "hook_title", "caption", "moment_type", mode="before")
+    @field_validator("id", "hook_title", "reaction_text", "caption", "moment_type", mode="before")
     @classmethod
     def _text(cls, value: Any) -> str:
         return "" if value is None else str(value)
@@ -370,8 +371,10 @@ async def find_candidates(
     caller persist each chunk as soon as it is judged.
     """
     system = load_prompt(CHUNK_PROMPT)
-    system = system.replace("{min_s}", f"{settings.min_clip_s:.0f}").replace(
-        "{max_s}", f"{settings.max_clip_s:.0f}"
+    system = (
+        system.replace("{min_s}", f"{settings.min_clip_s:.0f}")
+        .replace("{target_s}", f"{settings.target_clip_s:.0f}")
+        .replace("{max_s}", f"{settings.max_clip_s:.0f}")
     )
     config = DetectionConfig(prompt_version=CHUNK_PROMPT, temperature=0.3)
     breaks = SentenceBreaks(transcript)
@@ -611,6 +614,9 @@ def _apply_verdict(c: Candidate, verdict: _Verdict, settings: GtaSettings, strea
         "scroll_stop": verdict.scroll_stop.model_dump(),
         "context_free": verdict.context_free.model_dump(),
         "payoff": verdict.payoff.model_dump(),
+        # Kept in the verdict JSON (no schema change): the renderer shows it
+        # at the clip's key moment.
+        "reaction_text": _clean_title(verdict.reaction_text, max_words=6),
     }
     c.score = verdict.score
     c.hook_title = _clean_title(verdict.hook_title)
@@ -659,11 +665,11 @@ def _overlap(a: Candidate, b: Candidate) -> float:
     return max(0.0, min(a.end_s, b.end_s) - max(a.start_s, b.start_s))
 
 
-def _clean_title(title: str) -> str:
+def _clean_title(title: str, *, max_words: int = 9) -> str:
     title = re.sub(r"#\w+", "", title).strip().strip("\"'“”")
     title = re.sub(r"\s+", " ", title)
     words = title.split()
-    return " ".join(words[:9])
+    return " ".join(words[:max_words])
 
 
 def clean_hashtags(tags: list[str]) -> list[str]:

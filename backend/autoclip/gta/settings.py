@@ -57,9 +57,11 @@ class GtaSettings(BaseModel):
     #: the seam can still be judged. Clips must START inside their chunk.
     chunk_tail_s: float = 60.0
 
-    #: Final clip length bounds AFTER dead air is cut, seconds. The upper
-    #: bound stays under 60 s (Shorts/Reels/TikTok).
-    min_clip_s: float = 12.0
+    #: Final clip length AFTER dead air is cut, seconds: aim for
+    #: ``min_clip_s``-``target_clip_s`` (15-30 s); ``max_clip_s`` is the hard
+    #: cap, used only when a payoff needs it, and stays under 60 s.
+    min_clip_s: float = 15.0
+    target_clip_s: float = 30.0
     max_clip_s: float = 58.0
     #: Most clips kept per stream after the final judging round.
     max_clips_per_stream: int = 12
@@ -100,6 +102,20 @@ class GtaSettings(BaseModel):
     #: Where finished clips go. Empty = ``<AutoClip home>/exports/gta``.
     output_dir: str = ""
 
+    #: Own-value editing: a punch-in zoom on the clip's key moment (its
+    #: loudest beat), with the judge's short reaction text in the top band.
+    punch_in: bool = True
+    punch_in_zoom: float = 1.3
+    punch_in_s: float = 1.5
+    reaction_text: bool = True
+
+    #: Your logo (PNG, ideally with transparency) burned into a top corner.
+    #: Empty = no watermark (QA then warns that it is missing).
+    watermark_path: str = ""
+    watermark_corner: str = "top_right"
+    watermark_width_px: int = 140
+    watermark_opacity: float = 0.85
+
     live: GtaLiveSettings = Field(default_factory=GtaLiveSettings)
     bias: GtaBias = Field(default_factory=GtaBias)
 
@@ -124,10 +140,42 @@ class GtaSettings(BaseModel):
             raise ValueError("must be at least 1")
         return value
 
+    @field_validator("watermark_corner")
+    @classmethod
+    def _corner(cls, value: str) -> str:
+        # Only the top corners: the bottom band holds the captions, and the
+        # bottom ~300 px are covered by the app UI.
+        if value not in {"top_left", "top_right"}:
+            raise ValueError("watermark_corner must be top_left or top_right")
+        return value
+
+    @field_validator("punch_in_zoom")
+    @classmethod
+    def _zoom(cls, value: float) -> float:
+        if not 1.05 <= value <= 2.0:
+            raise ValueError("punch_in_zoom must be between 1.05 and 2.0")
+        return value
+
+    @field_validator("watermark_opacity")
+    @classmethod
+    def _opacity(cls, value: float) -> float:
+        if not 0.1 <= value <= 1.0:
+            raise ValueError("watermark_opacity must be between 0.1 and 1.0")
+        return value
+
+    @field_validator("watermark_width_px")
+    @classmethod
+    def _logo_width(cls, value: int) -> int:
+        if not 40 <= value <= 400:
+            raise ValueError("watermark_width_px must be between 40 and 400")
+        return value
+
     @model_validator(mode="after")
     def _ordered_lengths(self) -> GtaSettings:
         if self.min_clip_s >= self.max_clip_s:
             raise ValueError("min_clip_s must be shorter than max_clip_s")
+        if not self.min_clip_s <= self.target_clip_s <= self.max_clip_s:
+            raise ValueError("target_clip_s must lie between min_clip_s and max_clip_s")
         return self
 
 

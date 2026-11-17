@@ -485,7 +485,11 @@ function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
         <QaChip label="loudness" ok={qa.loudness?.ok} />
         <QaChip label="no black" ok={qa.black_frames?.ok} />
         <QaChip label="face-cam" ok={qa.facecam?.ok} />
+        <QaChip label="1080x1920 30fps" ok={qa.format?.ok} />
+        <QaChip label="own edit" ok={qa.own_value?.ok} />
+        <QaChip label="logo" ok={qa.watermark?.ok} />
       </div>
+      {qa.notes && qa.notes.length > 0 && <p className="text-xs text-ink-500">{qa.notes.join('; ')}</p>}
       <textarea
         readOnly
         className="field min-h-24 text-xs"
@@ -711,6 +715,7 @@ function WorkingTab() {
 type NumberKey =
   | 'chunk_minutes'
   | 'min_clip_s'
+  | 'target_clip_s'
   | 'max_clip_s'
   | 'max_clips_per_stream'
   | 'hook_title_s'
@@ -718,10 +723,14 @@ type NumberKey =
   | 'loudness_lufs'
   | 'face_min_ratio'
   | 'network_workers'
+  | 'punch_in_zoom'
+  | 'watermark_width_px'
+  | 'watermark_opacity'
 
 const NUMBER_FIELDS: { key: NumberKey; label: string; step: number }[] = [
   { key: 'chunk_minutes', label: 'Transcript chunk (minutes)', step: 1 },
   { key: 'min_clip_s', label: 'Shortest clip (s)', step: 1 },
+  { key: 'target_clip_s', label: 'Target length (s)', step: 1 },
   { key: 'max_clip_s', label: 'Longest clip (s, under 60)', step: 1 },
   { key: 'max_clips_per_stream', label: 'Most clips per stream', step: 1 },
   { key: 'hook_title_s', label: 'Hook title on screen (s)', step: 0.5 },
@@ -729,6 +738,9 @@ const NUMBER_FIELDS: { key: NumberKey; label: string; step: number }[] = [
   { key: 'loudness_lufs', label: 'Loudness target (LUFS)', step: 0.5 },
   { key: 'face_min_ratio', label: 'Face visible in at least (0–1)', step: 0.05 },
   { key: 'network_workers', label: 'Parallel downloads / judges', step: 1 },
+  { key: 'punch_in_zoom', label: 'Punch-in zoom (×)', step: 0.05 },
+  { key: 'watermark_width_px', label: 'Logo width (px)', step: 10 },
+  { key: 'watermark_opacity', label: 'Logo opacity (0.1–1)', step: 0.05 },
 ]
 
 function SettingsTab() {
@@ -743,7 +755,14 @@ function SettingsTab() {
       .settings()
       .then((s) => {
         setSettings(s)
-        const next: Record<string, string> = { output_dir: s.output_dir, caption_style: s.caption_style }
+        const next: Record<string, string> = {
+          output_dir: s.output_dir,
+          caption_style: s.caption_style,
+          watermark_path: s.watermark_path,
+          watermark_corner: s.watermark_corner,
+          punch_in: String(s.punch_in),
+          reaction_text: String(s.reaction_text),
+        }
         for (const f of NUMBER_FIELDS) next[f.key] = String(s[f.key])
         next.listen_interval_s = String(s.live.listen_interval_s)
         next.context_s = String(s.live.context_s)
@@ -767,6 +786,10 @@ function SettingsTab() {
     }
     const patch: Record<string, unknown> = {
       output_dir: draft.output_dir ?? '',
+      watermark_path: (draft.watermark_path ?? '').trim().replace(/^"|"$/g, ''),
+      watermark_corner: draft.watermark_corner || 'top_right',
+      punch_in: draft.punch_in === 'true',
+      reaction_text: draft.reaction_text === 'true',
       caption_style: draft.caption_style || settings.caption_style,
       live,
     }
@@ -833,6 +856,38 @@ function SettingsTab() {
         </label>
         <div className="sm:col-span-2">
           {field('output_dir', 'Save finished clips to (empty = AutoClip exports/gta)')}
+        </div>
+        <div className="sm:col-span-2">
+          {field('watermark_path', 'Your logo — full path to a PNG (transparent background works best)', {
+            placeholder: 'C:\\Users\\you\\Pictures\\logo.png',
+          })}
+          {!settings.watermark_path && (
+            <p className="mt-1 text-xs text-signal-bad">No logo set yet — clips are flagged until you add one.</p>
+          )}
+        </div>
+        <label className="text-xs text-ink-400">
+          Logo corner
+          <select
+            className="field"
+            value={draft.watermark_corner ?? 'top_right'}
+            onChange={(e) => setDraft((d) => ({ ...d, watermark_corner: e.target.value }))}
+          >
+            <option value="top_right">Top right</option>
+            <option value="top_left">Top left</option>
+          </select>
+        </label>
+        <div className="flex flex-col gap-2 text-xs text-ink-400">
+          Own-value edits
+          {(['punch_in', 'reaction_text'] as const).map((key) => (
+            <label key={key} className="flex items-center gap-2 text-sm text-ink-200">
+              <input
+                type="checkbox"
+                checked={draft[key] === 'true'}
+                onChange={(e) => setDraft((d) => ({ ...d, [key]: String(e.target.checked) }))}
+              />
+              {key === 'punch_in' ? 'Punch-in zoom on the key moment' : 'Reaction text at the key moment'}
+            </label>
+          ))}
         </div>
       </section>
       <div className="flex items-center gap-4">
