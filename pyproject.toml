@@ -50,6 +50,8 @@ dependencies = [
   "numpy>=1.26",
   # Captions
   "pysubs2>=1.7",
+  # GTA Mode text logo (draws the watermark text in Lemon Milk)
+  "pillow>=10",
   # Providers
   "anthropic>=0.40",
   "openai>=1.55",

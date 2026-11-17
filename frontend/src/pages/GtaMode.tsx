@@ -749,16 +749,20 @@ function SettingsTab() {
   const [message, setMessage] = useState<{ tone: 'good' | 'bad'; text: string } | null>(null)
   const [clientId, setClientId] = useState('')
   const [secret, setSecret] = useState('')
+  const [logoVersion, setLogoVersion] = useState('0')
 
   const load = useCallback(() => {
     gtaApi
       .settings()
       .then((s) => {
         setSettings(s)
+        setLogoVersion(String(Date.now()))
         const next: Record<string, string> = {
           output_dir: s.output_dir,
           caption_style: s.caption_style,
           watermark_path: s.watermark_path,
+          watermark_text: s.watermark_text,
+          watermark_font: s.watermark_font,
           watermark_corner: s.watermark_corner,
           punch_in: String(s.punch_in),
           reaction_text: String(s.reaction_text),
@@ -787,6 +791,8 @@ function SettingsTab() {
     const patch: Record<string, unknown> = {
       output_dir: draft.output_dir ?? '',
       watermark_path: (draft.watermark_path ?? '').trim().replace(/^"|"$/g, ''),
+      watermark_text: (draft.watermark_text ?? '').trim(),
+      watermark_font: (draft.watermark_font ?? '').trim().replace(/^"|"$/g, ''),
       watermark_corner: draft.watermark_corner || 'top_right',
       punch_in: draft.punch_in === 'true',
       reaction_text: draft.reaction_text === 'true',
@@ -857,12 +863,25 @@ function SettingsTab() {
         <div className="sm:col-span-2">
           {field('output_dir', 'Save finished clips to (empty = AutoClip exports/gta)')}
         </div>
+        {field('watermark_text', 'Logo text (drawn when no PNG is set)', { maxLength: 40 })}
+        {field('watermark_font', 'Logo font file (empty = Lemon Milk Bold)', {
+          placeholder: 'C:\\Windows\\Fonts\\your-font.otf',
+        })}
         <div className="sm:col-span-2">
-          {field('watermark_path', 'Your logo — full path to a PNG (transparent background works best)', {
+          {field('watermark_path', 'Or use a logo image — full path to a PNG (wins over the text)', {
             placeholder: 'C:\\Users\\you\\Pictures\\logo.png',
           })}
-          {!settings.watermark_path && (
+          {!settings.watermark_path && !settings.watermark_text ? (
             <p className="mt-1 text-xs text-signal-bad">No logo set yet — clips are flagged until you add one.</p>
+          ) : (
+            <div className="mt-3 inline-block rounded-md bg-ink-800 p-3">
+              <img
+                key={logoVersion}
+                src={gtaApi.logoUrl(logoVersion)}
+                alt="Current logo"
+                className="h-8 w-auto"
+              />
+            </div>
           )}
         </div>
         <label className="text-xs text-ink-400">

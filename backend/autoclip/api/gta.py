@@ -326,8 +326,39 @@ async def put_settings(payload: dict[str, Any]) -> dict[str, Any]:
         validated = GtaSettings.model_validate(merged)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    problem = await asyncio.to_thread(_logo_problem, validated)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     await asyncio.to_thread(save_settings, validated)
     return await get_settings()
+
+
+def _logo_problem(settings: GtaSettings) -> str:
+    """Why the configured logo can't be used ('' = fine), checked before saving."""
+    from ..gta import logo
+
+    raw = settings.watermark_path.strip().strip('"')
+    if raw:
+        return "" if Path(raw).expanduser().is_file() else f"Logo file not found: {raw}"
+    if not settings.watermark_text.strip():
+        return ""
+    try:
+        logo.text_logo(settings.watermark_text, settings.watermark_font)
+    except (logo.LogoError, OSError) as exc:
+        return str(exc)
+    return ""
+
+
+@router.get("/logo")
+async def current_logo() -> FileResponse:
+    """The logo PNG clips are watermarked with (for the settings preview)."""
+    from ..gta.pipeline import logo_path
+
+    settings = await asyncio.to_thread(load_settings)
+    path = await asyncio.to_thread(logo_path, settings)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="No logo set.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @router.put("/twitch-credentials")

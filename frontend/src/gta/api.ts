@@ -126,6 +126,8 @@ export interface GtaSettings {
   punch_in_s: number
   reaction_text: boolean
   watermark_path: string
+  watermark_text: string
+  watermark_font: string
   watermark_corner: 'top_left' | 'top_right'
   watermark_width_px: number
   watermark_opacity: number
@@ -172,6 +174,7 @@ export const gtaApi = {
   remove: (id: string) => request<void>(`/api/gta/streams/${id}`, { method: 'DELETE' }),
   clips: () => request<GtaClip[]>('/api/gta/clips'),
   videoUrl: (clipId: string) => `/api/gta/clips/${clipId}/video`,
+  logoUrl: (version: string) => `/api/gta/logo?v=${encodeURIComponent(version)}`,
   startLive: (url: string) =>
     request<GtaStream>('/api/gta/live', { method: 'POST', body: JSON.stringify({ url }) }),
   stopLive: (id: string) => request<GtaStream>(`/api/gta/live/${id}/stop`, { method: 'POST' }),

@@ -1348,3 +1348,135 @@ class TestDeliverySpec:
         )
         judging._apply_verdict(c, verdict, GtaSettings(), "Streamer")
         assert c.status == "approved" and c.verdict["reaction_text"] == "CHAT WAS RIGHT"
+
+
+# --------------------------------------------------------------------------
+# Text logo ("GTA Clipgod" in Lemon Milk)
+# --------------------------------------------------------------------------
+
+
+class TestTextLogo:
+    def test_default_is_gta_clipgod_in_bundled_lemon_milk(self) -> None:
+        from autoclip.gta import logo
+
+        s = GtaSettings()
+        assert s.watermark_text == "GTA Clipgod" and s.watermark_font == ""
+        assert logo.font_path("") == logo.BUNDLED_FONT and logo.BUNDLED_FONT.is_file()
+        with pytest.raises(ValueError):
+            GtaSettings(watermark_text="x" * 41)
+        assert GtaSettings(watermark_text="  GTA   Clipgod ").watermark_text == "GTA Clipgod"
+
+    def test_draws_transparent_two_tone_png_and_caches_it(self, tmp_path: Path) -> None:
+        from autoclip.gta import logo
+        from PIL import Image
+
+        first = logo.text_logo("GTA Clipgod", cache_dir=tmp_path)
+        again = logo.text_logo("GTA  Clipgod", cache_dir=tmp_path)
+        assert first == again and first.stat().st_size > 0
+        assert not list(tmp_path.glob("*.partial.png"))
+        image = Image.open(first).convert("RGBA")
+        assert image.width > 4 * image.height  # one wide line of text
+        pixels = np.asarray(image)
+        alpha = pixels[..., 3]
+        assert alpha[0, 0] == 0 and (alpha == 255).mean() > 0.2  # see-through background
+        opaque = pixels[alpha == 255][:, :3].astype(int)
+        yellow = (opaque[:, 0] > 230) & (opaque[:, 1] > 200) & (opaque[:, 2] < 40)
+        white = (opaque > 235).all(axis=1)
+        black = (opaque < 25).all(axis=1)
+        assert yellow.any() and white.any() and black.any()
+        # Yellow only in the first word (left part), white only after it.
+        cols = np.nonzero(alpha == 255)[1]
+        assert cols[yellow].max() < cols[white].min()
+        assert logo.text_logo("Other", cache_dir=tmp_path) != first
+
+    def test_bad_font_or_empty_text_raises_logo_error(self, tmp_path: Path) -> None:
+        from autoclip.gta import logo
+
+        with pytest.raises(logo.LogoError):
+            logo.text_logo("GTA", font=str(tmp_path / "missing.otf"), cache_dir=tmp_path)
+        not_a_font = tmp_path / "fake.otf"
+        not_a_font.write_bytes(b"nope")
+        with pytest.raises(logo.LogoError):
+            logo.text_logo("GTA", font=str(not_a_font), cache_dir=tmp_path)
+        with pytest.raises(logo.LogoError):
+            logo.text_logo("   ", cache_dir=tmp_path)
+
+    def test_render_extras_picks_png_then_text_then_nothing(
+        self, autoclip_home, tmp_path: Path
+    ) -> None:
+        from autoclip.gta import pipeline
+
+        text = pipeline.render_extras(GtaSettings(), "")
+        assert text.watermark is not None and text.watermark.path.is_file()
+        assert text.watermark.path.parent == gta_settings.work_root() / "logo"
+        assert text.watermark.width_px == 240
+
+        png = tmp_path / "mine.png"
+        _make_logo(png)
+        own = pipeline.render_extras(GtaSettings(watermark_path=f'"{png}"'), "")
+        assert own.watermark is not None and own.watermark.path == png
+
+        none = pipeline.render_extras(GtaSettings(watermark_text=""), "")
+        assert none.watermark is None
+        broken = GtaSettings(watermark_font=str(tmp_path / "gone.otf"))
+        assert pipeline.render_extras(broken, "").watermark is None  # logged, not fatal
+
+    def test_api_logo_preview_and_save_validation(self, client: TestClient, tmp_path: Path) -> None:
+        response = client.get("/api/gta/logo")
+        assert response.status_code == 200 and response.headers["content-type"] == "image/png"
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+        bad_font = client.put("/api/gta/settings", json={"watermark_font": str(tmp_path / "x.otf")})
+        assert bad_font.status_code == 400 and "font not found" in bad_font.json()["detail"]
+        bad_png = client.put("/api/gta/settings", json={"watermark_path": str(tmp_path / "x.png")})
+        assert bad_png.status_code == 400 and "not found" in bad_png.json()["detail"]
+        assert client.get("/api/gta/settings").json()["watermark_font"] == ""
+
+        saved = client.put("/api/gta/settings", json={"watermark_text": ""}).json()
+        assert saved["watermark_text"] == ""
+        assert client.get("/api/gta/logo").status_code == 404
+
+    def test_text_logo_burns_into_a_real_render(self, tmp_path: Path) -> None:
+        from autoclip.gta import logo
+
+        section = tmp_path / "section.mp4"
+        _make_section(section)
+        png = logo.text_logo("GTA Clipgod", cache_dir=tmp_path / "logo")
+        destination = tmp_path / "clip.mp4"
+        result = render.render(
+            render.RenderJob(
+                section=section,
+                section_offset_s=0.0,
+                start_s=0.5,
+                end_s=20.0,
+                words=_speech_words(),
+                hook_title="Title",
+                destination=destination,
+                work_dir=tmp_path / "work",
+                extras=render.Extras(
+                    punch_in=False,
+                    watermark=render.Watermark(path=png, width_px=240, opacity=1.0),
+                ),
+            ),
+            style_key="bold_pop",
+            title_s=3.0,
+            dead_air_min_s=0.6,
+            dead_air_keep_s=0.12,
+            max_duration_s=58.0,
+            loudness_lufs=-14.0,
+            true_peak_db=-1.0,
+            export_settings=ExportSettings(prefer_hardware_encoder=False),
+        )
+        assert result.watermarked
+        frame = tmp_path / "f.png"
+        _ffmpeg("-ss", "1", "-i", str(destination), "-frames:v", "1", str(frame))
+        import cv2
+
+        img = cv2.imread(str(frame)).astype(int)
+        # The logo box: 240 px wide, top-right, starting just under the safe zone.
+        x1 = 1080 - render.LOGO_SIDE_PX
+        box = img[render.LOGO_TOP_PX : render.LOGO_TOP_PX + 40, x1 - 240 : x1]
+        b, g, r = box[..., 0], box[..., 1], box[..., 2]
+        assert ((r > 200) & (g > 180) & (b < 90)).sum() > 20  # yellow "GTA"
+        assert ((r > 225) & (g > 225) & (b > 225)).sum() > 40  # white "CLIPGOD"
+        assert ((r < 40) & (g < 40) & (b < 40)).sum() > 40  # black outline

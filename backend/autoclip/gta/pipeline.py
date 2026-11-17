@@ -31,7 +31,7 @@ from ..db.models import new_id
 from ..pipeline import prepare, transcribe
 from ..pipeline.transcribe import WhisperModelCache
 from ..pipeline.transcript import Transcript, Word
-from . import align, fetch, hype, judging, qa, render, signals, store
+from . import align, fetch, hype, judging, logo, qa, render, signals, store
 from .gate import gate
 from .settings import GtaSettings, output_root, work_root
 from .store import GtaClip, GtaStream
@@ -588,12 +588,30 @@ def post_text(clip: GtaClip) -> str:
     return f"{clip.caption}\n\n{tags}".strip()
 
 
+def logo_path(settings: GtaSettings) -> Path | None:
+    """The logo PNG to burn in: the user's PNG, else the drawn text logo.
+
+    A text logo that can't be drawn (font missing...) is logged and skipped,
+    never fatal: the clip still renders and QA flags the missing logo.
+    """
+    if settings.watermark_path.strip():
+        return Path(settings.watermark_path.strip().strip('"')).expanduser()
+    if not settings.watermark_text.strip():
+        return None
+    try:
+        return logo.text_logo(settings.watermark_text, settings.watermark_font)
+    except (logo.LogoError, OSError) as exc:
+        log.warning("Text logo unavailable, rendering without it: %s", exc)
+        return None
+
+
 def render_extras(settings: GtaSettings, reaction_text: str) -> render.Extras:
     """Own-value edits + watermark for one clip, from GTA settings."""
     watermark = None
-    if settings.watermark_path.strip():
+    logo_file = logo_path(settings)
+    if logo_file is not None:
         watermark = render.Watermark(
-            path=Path(settings.watermark_path).expanduser(),
+            path=logo_file,
             corner=settings.watermark_corner,
             width_px=settings.watermark_width_px,
             opacity=settings.watermark_opacity,
