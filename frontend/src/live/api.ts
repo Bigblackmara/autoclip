@@ -258,7 +258,7 @@ export const liveApi = {
     request<LivePlatformStatus>(`/api/live/uploads/${platform}/status`),
   /** Write-only: the server stores both in the OS keyring and never echoes them. */
   saveCredentials: (platform: LivePlatform, clientId: string, clientSecret: string) =>
-    request<{ saved: boolean }>(`/api/live/uploads/${platform}/credentials`, {
+    request<{ saved: boolean; disconnected?: boolean }>(`/api/live/uploads/${platform}/credentials`, {
       method: 'POST',
       body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
     }),
