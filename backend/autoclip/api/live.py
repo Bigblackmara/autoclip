@@ -632,6 +632,10 @@ async def upload_clip(clip_id: str, payload: LiveUploadIn) -> LiveUploadOut:
 #: the identical value). In-memory: a restart invalidates pending consents,
 #: which is correct — state binds one consent round-trip.
 _pending_states: dict[str, tuple[str, str]] = {}
+#: Which AutoClip page the consent tab returns to, per platform. Only known
+#: in-app paths are accepted (never an arbitrary URL: open-redirect).
+_return_pages: dict[str, str] = {}
+RETURN_PAGES = frozenset({"/live", "/gta"})
 
 
 def _redirect_uri(request: Request, platform: str) -> str:
@@ -647,13 +651,14 @@ def _redirect_uri(request: Request, platform: str) -> str:
 
 
 @router.post("/uploads/{platform}/start")
-async def start_upload_auth(platform: str, request: Request) -> dict:
+async def start_upload_auth(platform: str, request: Request, return_to: str = "/live") -> dict:
     """Build the consent URL; CSRF state is minted and held here."""
     _check_platform(platform)
     uploads = _uploads_pkg()
     state = _secrets.token_urlsafe(16)
     redirect_uri = _redirect_uri(request, platform)
     _pending_states[platform] = (state, redirect_uri)
+    _return_pages[platform] = return_to if return_to in RETURN_PAGES else "/live"
     try:
         redirect = uploads.authorization_url(platform, redirect_uri=redirect_uri, state=state)
     except Exception as exc:
@@ -669,8 +674,10 @@ CALLBACK_CSP = (
 )
 
 
-def _callback_response(status: str, message: str | None, status_code: int = 200) -> Response:
-    response = HTMLResponse(_callback_page(status, message), status_code=status_code)
+def _callback_response(
+    status: str, message: str | None, status_code: int = 200, *, page: str = "/live"
+) -> Response:
+    response = HTMLResponse(_callback_page(status, message, page), status_code=status_code)
     response.headers["Content-Security-Policy"] = CALLBACK_CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -692,35 +699,42 @@ async def upload_auth_callback(
     """
     _check_platform(platform)
     uploads = _uploads_pkg()
+    page = _return_pages.get(platform, "/live")
 
     if error:
         return _callback_response(
-            "not connected", f"The platform refused the consent: {error}.", 400
+            "not connected", f"The platform refused the consent: {error}.", 400, page=page
         )
     if not code:
-        return _callback_response("not connected", "No authorization code was provided.", 400)
+        return _callback_response(
+            "not connected", "No authorization code was provided.", 400, page=page
+        )
     pending = _pending_states.get(platform)
     if pending is None or not state or not _secrets.compare_digest(state, pending[0]):
         return _callback_response(
-            "not connected", "This authorization link has expired — start again.", 400
+            "not connected", "This authorization link has expired — start again.", 400, page=page
         )
     _pending_states.pop(platform, None)
+    _return_pages.pop(platform, None)
 
     try:
         await uploads.exchange_code(platform, code, redirect_uri=pending[1])
     except Exception as exc:
         log.warning("OAuth code exchange failed for %s: %s", platform, exc)
-        return _callback_response("not connected", f"Connecting failed: {type(exc).__name__}.", 502)
-    return _callback_response("connected", None)
+        return _callback_response(
+            "not connected", f"Connecting failed: {type(exc).__name__}.", 502, page=page
+        )
+    return _callback_response("connected", None, page=page)
 
 
-def _callback_page(status: str, message: str | None) -> str:
-    """Minimal page that bounces the consent tab back to the Live page.
+def _callback_page(status: str, message: str | None, page: str = "/live") -> str:
+    """Minimal page that bounces the consent tab back to the page it came from.
 
     Every interpolated value is HTML-escaped (``message`` carries query
     parameters verbatim).
     """
-    target = "/live?connected=1" if status == "connected" else "/live"
+    page = page if page in RETURN_PAGES else "/live"
+    target = f"{page}?connected=1" if status == "connected" else page
     safe_target = html.escape(target, quote=True)
     safe_status = html.escape(status, quote=True)
     note = f"\n  <p>{html.escape(message, quote=True)}</p>" if message else ""

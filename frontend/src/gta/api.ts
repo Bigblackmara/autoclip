@@ -98,7 +98,57 @@ export interface GtaClip {
     turnaround_ok?: boolean
   }
   error: string | null
+  upload: GtaUpload | null
 }
+
+export type UploadStatus = 'uploading' | 'scheduled' | 'failed' | 'interrupted' | 'skipped'
+
+export interface GtaUpload {
+  id: string
+  clip_id: string
+  status: UploadStatus
+  /** UTC ISO time the Short goes public. */
+  slot_at: string | null
+  video_id: string
+  url: string
+  title: string
+  error: string | null
+  attempts: number
+  updated_at: string
+}
+
+export interface GtaPosting {
+  enabled: boolean
+  slots: string[]
+  lead_minutes: number
+  category_id: string
+  shorts_tag: boolean
+}
+
+export interface PlanEntry {
+  slot_at: string
+  status: 'open' | 'missed' | 'planned' | UploadStatus
+  clip_id: string | null
+  upload_id?: string
+  title: string
+}
+
+export interface PostingOverview {
+  state: {
+    message: string
+    paused_until: string | null
+    uploading_clip_id: string | null
+    last_run: string | null
+    running: boolean
+  }
+  posting: GtaPosting
+  categories: Record<string, string>
+  plan: PlanEntry[]
+  uploads: (GtaUpload & { clip_title: string })[]
+}
+
+/** Max upload attempts per clip (backend gta/poster.py MAX_ATTEMPTS). */
+export const MAX_UPLOAD_ATTEMPTS = 3
 
 export interface GtaSettings {
   chunk_minutes: number
@@ -132,6 +182,7 @@ export interface GtaSettings {
   watermark_width_px: number
   watermark_opacity: number
   live: { listen_interval_s: number; context_s: number; turnaround_s: number }
+  posting: GtaPosting
   bias: {
     moment_types: Record<string, number>
     streamers: Record<string, number>
@@ -195,6 +246,28 @@ export const gtaApi = {
       method: 'POST',
       body: JSON.stringify({ channel_url }),
     }),
+  posting: () => request<PostingOverview>('/api/gta/posting'),
+  runPosting: () => request<{ running: boolean }>('/api/gta/posting/run', { method: 'POST' }),
+  setClipPosting: (clipId: string, skip: boolean) =>
+    request<{ upload: GtaUpload | null }>(`/api/gta/clips/${clipId}/posting`, {
+      method: 'POST',
+      body: JSON.stringify({ skip }),
+    }),
+  retryUpload: (uploadId: string) =>
+    request<{ retried: boolean }>(`/api/gta/uploads/${uploadId}/retry`, { method: 'POST' }),
+  /** Google consent for the shared YouTube connection, returning to GTA Mode. */
+  connectYoutube: () =>
+    request<{ redirect_url: string }>('/api/live/uploads/youtube/start?return_to=/gta', {
+      method: 'POST',
+    }),
+}
+
+/** "Tue 17:00" in this PC's local time. */
+export function slotLabel(iso: string | null): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  return date.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 }
 
 export const STATUS_LABEL: Record<StreamStatus, string> = {

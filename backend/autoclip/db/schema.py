@@ -278,6 +278,33 @@ def _migration_v4(conn: sqlite3.Connection) -> None:
     _run_in_transaction(conn, _statements(_V4))
 
 
+_V5 = """
+-- GTA Mode posting schedule: at most one YouTube upload row per clip. A row
+-- holds its publish slot while uploading/scheduled/interrupted; skipped rows
+-- are clips the user excluded from auto-posting.
+CREATE TABLE IF NOT EXISTS gta_uploads (
+    id         TEXT PRIMARY KEY,
+    clip_id    TEXT NOT NULL REFERENCES gta_clips(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL,
+    slot_at    TEXT,
+    video_id   TEXT NOT NULL DEFAULT '',
+    url        TEXT NOT NULL DEFAULT '',
+    title      TEXT NOT NULL DEFAULT '',
+    error      TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gta_uploads_clip ON gta_uploads(clip_id);
+CREATE INDEX IF NOT EXISTS idx_gta_uploads_slot ON gta_uploads(slot_at);
+"""
+
+
+def _migration_v5(conn: sqlite3.Connection) -> None:
+    """GTA Mode YouTube posting queue (additive)."""
+    _run_in_transaction(conn, _statements(_V5))
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
@@ -285,6 +312,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v2,
     _migration_v3,
     _migration_v4,
+    _migration_v5,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

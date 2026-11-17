@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 
 import httpx
@@ -80,6 +81,16 @@ def _metadata_payload(meta: UploadMeta) -> dict:
         "status": {
             "privacyStatus": meta.privacy,
             "selfDeclaredMadeForKids": meta.made_for_kids,
+            # Scheduled publishing requires private (YouTube's rule): the
+            # video stays private until publishAt, then goes public.
+            **(
+                {
+                    "privacyStatus": "private",
+                    "publishAt": meta.publish_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                if meta.publish_at is not None
+                else {}
+            ),
         },
     }
 

@@ -422,3 +422,120 @@ def latest_report() -> dict[str, Any] | None:
         "created_at": row["created_at"],
         "report": _loads(row["report"], {}),
     }
+
+
+# --------------------------------------------------------------------------
+# YouTube uploads (posting schedule, schema migration v5)
+# --------------------------------------------------------------------------
+
+#: ``uploading`` -> ``scheduled`` (on YouTube, private until its slot, then
+#: public). ``failed`` rows are retried (bounded by ``attempts``);
+#: ``interrupted`` = AutoClip stopped mid-upload, so whether YouTube got the
+#: video is unknown and nothing retries it on its own; ``skipped`` = the user
+#: excluded the clip from auto-posting.
+UPLOAD_STATUSES = frozenset({"uploading", "scheduled", "failed", "interrupted", "skipped"})
+#: Rows that own their publish slot (no other clip may take it).
+SLOT_HOLDING_STATUSES = frozenset({"uploading", "scheduled", "interrupted"})
+
+
+@dataclass
+class GtaUpload:
+    id: str
+    clip_id: str
+    status: str
+    slot_at: str | None = None
+    video_id: str = ""
+    url: str = ""
+    title: str = ""
+    error: str | None = None
+    attempts: int = 0
+    created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> GtaUpload:
+        return cls(
+            id=row["id"],
+            clip_id=row["clip_id"],
+            status=row["status"],
+            slot_at=row["slot_at"],
+            video_id=row["video_id"],
+            url=row["url"],
+            title=row["title"],
+            error=row["error"],
+            attempts=row["attempts"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+_UPLOAD_COLUMNS = frozenset({"status", "slot_at", "video_id", "url", "title", "error", "attempts"})
+
+
+def _check_upload_status(status: str) -> None:
+    if status not in UPLOAD_STATUSES:
+        raise ValueError(f"Unknown upload status {status!r}")
+
+
+def create_upload(
+    clip_id: str, *, status: str, slot_at: str | None = None, title: str = ""
+) -> GtaUpload:
+    """Insert the clip's upload row (raises sqlite3.IntegrityError if it has one)."""
+    _check_upload_status(status)
+    upload = GtaUpload(id=new_id(), clip_id=clip_id, status=status, slot_at=slot_at, title=title)
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO gta_uploads (id, clip_id, status, slot_at, title, attempts,
+                                     created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (upload.id, clip_id, status, slot_at, title, upload.created_at, upload.updated_at),
+        )
+    return upload
+
+
+def get_upload(upload_id: str) -> GtaUpload | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM gta_uploads WHERE id = ?", (upload_id,)).fetchone()
+    return GtaUpload.from_row(row) if row else None
+
+
+def upload_for_clip(clip_id: str) -> GtaUpload | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM gta_uploads WHERE clip_id = ?", (clip_id,)).fetchone()
+    return GtaUpload.from_row(row) if row else None
+
+
+def list_uploads(*, statuses: frozenset[str] | None = None, limit: int = 1000) -> list[GtaUpload]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if statuses:
+        clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+        params.extend(sorted(statuses))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM gta_uploads {where} "
+            "ORDER BY COALESCE(slot_at, created_at) DESC, rowid DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    return [GtaUpload.from_row(row) for row in rows]
+
+
+def update_upload(upload_id: str, **fields: Any) -> None:
+    if "status" in fields:
+        _check_upload_status(fields["status"])
+    if not fields:
+        return
+    sql, values = _assignments(fields, _UPLOAD_COLUMNS)
+    with connection() as conn:
+        conn.execute(
+            f"UPDATE gta_uploads SET {sql}, updated_at = ? WHERE id = ?",
+            (*values, utcnow(), upload_id),
+        )
+
+
+def delete_upload(upload_id: str) -> None:
+    with connection() as conn:
+        conn.execute("DELETE FROM gta_uploads WHERE id = ?", (upload_id,))

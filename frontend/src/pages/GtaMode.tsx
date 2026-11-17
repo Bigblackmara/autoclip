@@ -24,13 +24,17 @@ import {
   type GtaClip,
   type GtaSettings,
   type GtaStream,
+  MAX_UPLOAD_ATTEMPTS,
+  slotLabel,
 } from '../gta/api'
+import { YouTubeTab } from '../gta/YouTubeTab'
 
-type Tab = 'queue' | 'live' | 'working' | 'settings'
+type Tab = 'queue' | 'live' | 'youtube' | 'working' | 'settings'
 
 const TABS: readonly { key: Tab; label: string }[] = [
   { key: 'queue', label: 'Streams & clips' },
   { key: 'live', label: 'GTA Live' },
+  { key: 'youtube', label: 'YouTube' },
   { key: 'working', label: "What's working" },
   { key: 'settings', label: 'Settings' },
 ]
@@ -113,7 +117,11 @@ function useAction(onDone: () => void) {
 
 export function GtaMode() {
   const [params, setParams] = useSearchParams()
-  const tab: Tab = TABS.find((t) => t.key === params.get('tab'))?.key ?? 'queue'
+  // Back from Google's consent page (/gta?connected=1) -> the YouTube tab.
+  const tab: Tab =
+    params.get('connected') === '1'
+      ? 'youtube'
+      : (TABS.find((t) => t.key === params.get('tab'))?.key ?? 'queue')
   const [streams, streamsError, refreshStreams] = usePoll(gtaApi.streams)
   const [clips, clipsError, refreshClips] = usePoll(gtaApi.clips)
   const refresh = useCallback(() => {
@@ -180,6 +188,7 @@ export function GtaMode() {
         />
       )}
       {tab === 'live' && <LiveTab streams={liveStreams} clips={clips ?? []} onChange={refresh} />}
+      {tab === 'youtube' && <YouTubeTab />}
       {tab === 'working' && <WorkingTab />}
       {tab === 'settings' && <SettingsTab />}
     </div>
@@ -436,6 +445,76 @@ function ClipWall({ title, clips, streams }: { title: string; clips: GtaClip[]; 
   )
 }
 
+/** Where this clip stands in the YouTube posting schedule, with Don't post / Allow. */
+function PostingRow({ clip }: { clip: GtaClip }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const upload = clip.upload
+  const toggle = async (skip: boolean) => {
+    setBusy(true)
+    setError('')
+    try {
+      await gtaApi.setClipPosting(clip.id, skip)
+    } catch (err) {
+      setError(errorText(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+  let text: React.ReactNode
+  let action: React.ReactNode = null
+  if (!upload) {
+    text = clip.qa.passed ? 'YouTube: waiting for a posting slot' : 'YouTube: not posted (QA failed)'
+    if (clip.qa.passed) {
+      action = (
+        <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(true)}>
+          Don't post
+        </button>
+      )
+    }
+  } else if (upload.status === 'skipped') {
+    text = 'YouTube: excluded from posting'
+    action = (
+      <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(false)}>
+        Allow posting
+      </button>
+    )
+  } else if (upload.status === 'scheduled') {
+    text = (
+      <>
+        <span className="text-signal-good">On YouTube</span> · public {slotLabel(upload.slot_at)}{' '}
+        {upload.url && (
+          <a href={upload.url} target="_blank" rel="noreferrer" className="text-sodium-400 underline">
+            open ↗
+          </a>
+        )}
+      </>
+    )
+  } else if (upload.status === 'uploading') {
+    text = <span className="text-sodium-400">Uploading to YouTube…</span>
+  } else if (upload.status === 'interrupted') {
+    text = <span className="text-signal-bad">Upload interrupted: check YouTube Studio (YouTube tab)</span>
+  } else {
+    text = (
+      <span className="text-signal-bad">
+        Upload failed ({upload.attempts}/{MAX_UPLOAD_ATTEMPTS}){upload.error ? `: ${upload.error}` : ''}
+      </span>
+    )
+    action = (
+      <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(true)}>
+        Don't post
+      </button>
+    )
+  }
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-400">
+      <span className="min-w-0">{text}</span>
+      {action}
+      {error && <span className="w-full text-signal-bad">{error}</span>}
+    </div>
+  )
+}
+
 function QaChip({ label, ok }: { label: string; ok: boolean | undefined }) {
   if (ok === undefined) return null
   return (
@@ -500,6 +579,7 @@ function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
       <button className="btn btn-primary" onClick={copy}>
         {copied ? 'Copied ✓' : 'Copy caption + hashtags'}
       </button>
+      {clip.status === 'ready' && <PostingRow clip={clip} />}
       <p className="truncate font-mono text-[10px] text-ink-500" title={clip.path}>
         {clip.path}
       </p>
