@@ -205,10 +205,16 @@ class UploadMeta:
     #: YouTube category "20" = Gaming, the natural home for stream clips.
     category_id: str = "20"
     made_for_kids: bool = False
+    #: YouTube scheduled publishing: the video uploads private and YouTube
+    #: makes it public at this (timezone-aware) moment. None = publish per
+    #: ``privacy`` right away.
+    publish_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.privacy not in ("private", "unlisted", "public"):
             raise ValueError(f"privacy must be private/unlisted/public, got {self.privacy!r}")
+        if self.publish_at is not None and self.publish_at.tzinfo is None:
+            raise ValueError("publish_at must be timezone-aware")
         self.title = self.title[:100]  # YouTube's hard title limit
         self.description = self.description[:5000]  # YouTube's description limit
 

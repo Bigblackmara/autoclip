@@ -72,11 +72,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # GTA Mode: its own queue (VODs) and live watches, same worker flag.
     from .gta.live import live_manager as gta_live
+    from .gta.poster import poster as gta_poster
     from .gta.queue import queue as gta_queue
 
     if worker_enabled:
         await asyncio.to_thread(gta_live.recover)
         await gta_queue.start()
+        # YouTube posting schedule; idle until switched on in GTA settings.
+        await gta_poster.start()
 
     log.info("AutoClip %s ready. Artifacts in %s", __version__, paths.root())
 
@@ -84,6 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         if worker_enabled:
+            await gta_poster.stop()
             await asyncio.to_thread(gta_live.shutdown)
             await gta_queue.stop()
             # Idempotent; also covers a manager started later by a settings

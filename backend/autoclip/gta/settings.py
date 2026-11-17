@@ -50,6 +50,60 @@ class GtaLiveSettings(BaseModel):
     turnaround_s: float = 180.0
 
 
+#: YouTube video categories offered for GTA clips (id -> name).
+YOUTUBE_CATEGORIES = {"20": "Gaming", "22": "People & Blogs", "23": "Comedy", "24": "Entertainment"}
+
+
+class GtaPosting(BaseModel):
+    """YouTube posting schedule for finished GTA clips.
+
+    Shortly before each daily slot (``lead_minutes``) the best-scored clip
+    that passed QA is uploaded as private with ``publishAt`` set to the slot,
+    so YouTube itself makes it public exactly then, even if AutoClip is
+    closed by that time. Off until the user switches it on.
+    """
+
+    enabled: bool = False
+    #: Local times of day ("HH:MM", 24 h) a Short goes public.
+    slots: list[str] = Field(default_factory=lambda: ["12:00", "17:00", "21:00"])
+    #: How long before its slot a clip is uploaded, minutes.
+    lead_minutes: int = 120
+    category_id: str = "24"
+    #: Append #Shorts to the description when the clip's hashtags lack it.
+    shorts_tag: bool = True
+
+    @field_validator("slots")
+    @classmethod
+    def _slots(cls, value: list[str]) -> list[str]:
+        cleaned: set[str] = set()
+        for raw in value:
+            text = str(raw).strip()
+            parts = text.split(":")
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                raise ValueError(f"Slot {text!r} is not a time like 17:00")
+            hour, minute = int(parts[0]), int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"Slot {text!r} is not a valid time of day")
+            cleaned.add(f"{hour:02d}:{minute:02d}")
+        if not 1 <= len(cleaned) <= 24:
+            raise ValueError("Give between 1 and 24 posting times")
+        return sorted(cleaned)
+
+    @field_validator("lead_minutes")
+    @classmethod
+    def _lead(cls, value: int) -> int:
+        if not 15 <= value <= 1440:
+            raise ValueError("lead_minutes must be between 15 and 1440")
+        return value
+
+    @field_validator("category_id")
+    @classmethod
+    def _category(cls, value: str) -> str:
+        if value not in YOUTUBE_CATEGORIES:
+            raise ValueError(f"category_id must be one of {', '.join(YOUTUBE_CATEGORIES)}")
+        return value
+
+
 class GtaSettings(BaseModel):
     #: Transcript chunk the judge reads at once, minutes ("exactly 12").
     chunk_minutes: float = 12.0
@@ -122,6 +176,7 @@ class GtaSettings(BaseModel):
     watermark_opacity: float = 0.85
 
     live: GtaLiveSettings = Field(default_factory=GtaLiveSettings)
+    posting: GtaPosting = Field(default_factory=GtaPosting)
     bias: GtaBias = Field(default_factory=GtaBias)
 
     @field_validator("chunk_minutes")

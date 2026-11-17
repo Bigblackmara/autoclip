@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from ..gta import store
 from ..gta.fetch import detect_platform, is_supported_url
@@ -87,7 +87,24 @@ def _stream_out(
     }
 
 
-def _clip_out(clip: store.GtaClip) -> dict[str, Any]:
+def _upload_out(upload: store.GtaUpload | None) -> dict[str, Any] | None:
+    if upload is None:
+        return None
+    return {
+        "id": upload.id,
+        "clip_id": upload.clip_id,
+        "status": upload.status,
+        "slot_at": upload.slot_at,
+        "video_id": upload.video_id,
+        "url": upload.url,
+        "title": upload.title,
+        "error": upload.error,
+        "attempts": upload.attempts,
+        "updated_at": upload.updated_at,
+    }
+
+
+def _clip_out(clip: store.GtaClip, upload: store.GtaUpload | None = None) -> dict[str, Any]:
     exists = bool(clip.path) and Path(clip.path).exists()
     return {
         "id": clip.id,
@@ -112,7 +129,12 @@ def _clip_out(clip: store.GtaClip) -> dict[str, Any]:
         "has_video": exists,
         "qa": clip.qa,
         "error": clip.error,
+        "upload": _upload_out(upload),
     }
+
+
+def _uploads_by_clip() -> dict[str, store.GtaUpload]:
+    return {u.clip_id: u for u in store.list_uploads(limit=100_000)}
 
 
 # --------------------------------------------------------------------------
@@ -182,7 +204,11 @@ def _get_stream(stream_id: str) -> store.GtaStream:
 async def get_stream(stream_id: str) -> dict[str, Any]:
     stream = await asyncio.to_thread(_get_stream, stream_id)
     clips = await asyncio.to_thread(store.list_clips, stream_id)
-    return {**_stream_out(stream, clips), "clips": [_clip_out(c) for c in clips]}
+    uploads = await asyncio.to_thread(_uploads_by_clip)
+    return {
+        **_stream_out(stream, clips),
+        "clips": [_clip_out(c, uploads.get(c.id)) for c in clips],
+    }
 
 
 @router.post("/streams/{stream_id}/cancel")
@@ -247,6 +273,16 @@ async def delete_stream(stream_id: str) -> None:
         raise HTTPException(
             status_code=409, detail="The stream is still stopping; try again shortly."
         )
+    from ..gta.poster import poster
+
+    uploading = poster.state.uploading_clip_id
+    if uploading:
+        clip = await asyncio.to_thread(store.get_clip, uploading)
+        if clip is not None and clip.stream_id == stream_id:
+            raise HTTPException(
+                status_code=409,
+                detail="One of this stream's clips is uploading to YouTube; try again shortly.",
+            )
     await asyncio.to_thread(store.delete_stream, stream_id)
     # Working files only (audio, sections). Finished clips stay where they are.
     await asyncio.to_thread(cleanup_stream_files, stream_id)
@@ -261,7 +297,8 @@ async def delete_stream(stream_id: str) -> None:
 async def list_clips(status: str | None = None) -> list[dict[str, Any]]:
     statuses = frozenset({status}) if status else None
     clips = await asyncio.to_thread(store.list_clips, None, statuses=statuses, limit=100_000)
-    return [_clip_out(c) for c in clips]
+    uploads = await asyncio.to_thread(_uploads_by_clip)
+    return [_clip_out(c, uploads.get(c.id)) for c in clips]
 
 
 @router.get("/clips/{clip_id}/video")
@@ -324,12 +361,21 @@ async def put_settings(payload: dict[str, Any]) -> dict[str, Any]:
     merged["bias"] = current.bias.model_dump(mode="json")
     try:
         validated = GtaSettings.model_validate(merged)
+    except ValidationError as exc:
+        # "Slot '25:00' is not a valid time of day", not pydantic's dump.
+        detail = "; ".join(
+            str(err.get("msg", "")).removeprefix("Value error, ") for err in exc.errors()
+        )
+        raise HTTPException(status_code=400, detail=detail or "Invalid settings.") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     problem = await asyncio.to_thread(_logo_problem, validated)
     if problem:
         raise HTTPException(status_code=400, detail=problem)
     await asyncio.to_thread(save_settings, validated)
+    from ..gta.poster import poster
+
+    poster.notify()  # a changed schedule takes effect now, not at the next tick
     return await get_settings()
 
 
@@ -401,3 +447,103 @@ async def run_feedback(payload: FeedbackIn) -> dict[str, Any]:
         hint = getattr(exc, "hint", "")
         raise HTTPException(status_code=400, detail=f"{exc}\n{hint}".strip()) from exc
     return report
+
+
+# --------------------------------------------------------------------------
+# YouTube posting schedule
+# --------------------------------------------------------------------------
+
+
+class SkipPostingIn(BaseModel):
+    skip: bool
+
+
+def _posting_overview() -> dict[str, Any]:
+    from ..gta.poster import poster
+    from ..gta.settings import YOUTUBE_CATEGORIES
+
+    settings = load_settings()
+    clips = {c.id: c for c in store.list_clips(statuses=frozenset({"ready"}), limit=100_000)}
+    uploads = store.list_uploads(limit=200)
+    for upload in uploads:  # titles of rows whose clip is no longer "ready"
+        if upload.clip_id not in clips:
+            clip = store.get_clip(upload.clip_id)
+            if clip is not None:
+                clips[clip.id] = clip
+
+    def title(clip_id: str | None) -> str:
+        clip = clips.get(clip_id or "")
+        return clip.hook_title if clip else ""
+
+    plan = poster.plan(settings)
+    for entry in plan:
+        entry["title"] = title(entry.get("clip_id"))
+    return {
+        "state": {**poster.state.as_dict(), "running": poster.running},
+        "posting": settings.posting.model_dump(mode="json"),
+        "categories": YOUTUBE_CATEGORIES,
+        "plan": plan,
+        "uploads": [
+            {**(_upload_out(u) or {}), "clip_title": title(u.clip_id) or u.title} for u in uploads
+        ],
+    }
+
+
+@router.get("/posting")
+async def posting_overview() -> dict[str, Any]:
+    return await asyncio.to_thread(_posting_overview)
+
+
+@router.post("/posting/run")
+async def posting_run_now() -> dict[str, Any]:
+    """Wake the poster now (e.g. right after connecting or saving the schedule)."""
+    from ..gta.poster import poster
+
+    poster.notify()
+    return {"running": poster.running}
+
+
+@router.post("/clips/{clip_id}/posting")
+async def set_clip_posting(clip_id: str, payload: SkipPostingIn) -> dict[str, Any]:
+    """Exclude a clip from auto-posting (skip) or allow it again."""
+
+    def apply() -> store.GtaUpload | None:
+        if store.get_clip(clip_id) is None:
+            raise HTTPException(status_code=404, detail="Clip not found.")
+        row = store.upload_for_clip(clip_id)
+        if payload.skip:
+            if row is None:
+                return store.create_upload(clip_id, status="skipped")
+            if row.status in {"failed", "skipped"}:
+                store.update_upload(row.id, status="skipped", slot_at=None)
+                return store.get_upload(row.id)
+            raise HTTPException(
+                status_code=409, detail="This clip is already uploading or on YouTube."
+            )
+        if row is not None and row.status == "skipped":
+            store.delete_upload(row.id)
+            return None
+        return row
+
+    upload = await asyncio.to_thread(apply)
+    return {"upload": _upload_out(upload)}
+
+
+@router.post("/uploads/{upload_id}/retry")
+async def retry_upload(upload_id: str) -> dict[str, Any]:
+    """Put a failed or interrupted clip back in line (fresh attempts)."""
+    from ..gta.poster import poster
+
+    def apply() -> None:
+        row = store.get_upload(upload_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Upload not found.")
+        if row.status not in {"failed", "interrupted"}:
+            raise HTTPException(
+                status_code=409, detail="Only failed or interrupted uploads can be retried."
+            )
+        store.delete_upload(row.id)
+
+    await asyncio.to_thread(apply)
+    poster.notify()
+    return {"retried": True}
