@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from ..db.models import Clip, new_id
 from ..providers import ClipCandidate, DetectionConfig, LLMProvider, TranscriptWindow
 from . import boundaries
 from .prepare import Loudness, Silence
+from .signals import AudienceCurve, clock
 from .transcript import Transcript
 
 log = logging.getLogger(__name__)
@@ -51,6 +53,28 @@ class HighlightError(RuntimeError):
 
 class DetectionCancelled(RuntimeError):
     """The job was cancelled while windows were still being scored."""
+
+
+#: A judge pass: candidates (best first) in, survivors out. See
+#: :class:`autoclip.pipeline.judge.ClipJudge`.
+Judge = Callable[[list[Clip], Transcript], Awaitable[list[Clip]]]
+
+
+@dataclass
+class AudienceOptions:
+    """How the audience curve steers detection (see ``config.DetectionSettings``)."""
+
+    curve: AudienceCurve
+    #: Final-score share of the curve when it holds viewer data.
+    audience_weight: float = 0.4
+    #: Final-score share when the curve is audio energy alone.
+    energy_weight: float = 0.12
+    #: Hotspots listed per window in the prompt; 0 disables hints.
+    hints_per_window: int = 4
+
+    @property
+    def weight(self) -> float:
+        return self.audience_weight if self.curve.kind == "audience" else self.energy_weight
 
 
 def build_windows(
@@ -142,16 +166,27 @@ async def detect(
     loudness: Loudness | None = None,
     on_progress: Callable[[float], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    audience: AudienceOptions | None = None,
+    judge: Judge | None = None,
 ) -> list[Clip]:
     """Run detection across the whole transcript and return ranked clips.
 
     ``cancelled`` is polled while windows are in flight; once it returns True
     the outstanding provider calls are cancelled and DetectionCancelled is
     raised.
+
+    ``audience`` adds each window's hotspots to its prompt and blends the
+    curve into every clip's score. ``judge`` runs on the refined clips
+    before the count is capped, so a dropped clip makes room for the next.
     """
     windows = build_windows(transcript)
     if not windows:
         raise HighlightError("The transcript is empty, so there is nothing to clip.")
+    if audience is not None and audience.curve.has_data and audience.hints_per_window > 0:
+        for window in windows:
+            window.hints = audience_hints(
+                audience.curve, transcript, window, limit=audience.hints_per_window
+            )
 
     log.info("Detecting highlights across %d window(s) with %s.", len(windows), provider.name)
 
@@ -205,9 +240,22 @@ async def detect(
         )
 
     log.info("Providers proposed %d raw candidates.", len(candidates))
-    return build_clips(
-        transcript, candidates, config, job_id=job_id, silences=silences or [], loudness=loudness
+    clips = build_clips(
+        transcript,
+        candidates,
+        config,
+        job_id=job_id,
+        silences=silences or [],
+        loudness=loudness,
+        audience=audience,
+        truncate=judge is None,
     )
+    if judge is None:
+        return clips
+
+    judged = asyncio.ensure_future(judge(clips, transcript))
+    clips = await (judged if cancelled is None else _unless_cancelled(judged, cancelled))
+    return rank_clips(clips, config.max_clips)
 
 
 async def _unless_cancelled(
@@ -241,8 +289,16 @@ def build_clips(
     job_id: str,
     silences: list[Silence] | None = None,
     loudness: Loudness | None = None,
+    audience: AudienceOptions | None = None,
+    truncate: bool = True,
 ) -> list[Clip]:
-    """Deduplicate, refine, rank, and truncate raw candidates into clips."""
+    """Deduplicate, refine, rank, and truncate raw candidates into clips.
+
+    With ``audience``, each clip's score becomes the AI score blended with
+    the curve over the clip's final span (:func:`blend_score`) before the
+    overlap passes and the ranking use it. ``truncate=False`` keeps every
+    survivor, ranked, for a judge pass to cut down.
+    """
     deduped = dedupe(candidates)
     log.info("%d candidates remain after dedupe.", len(deduped))
     breaks = boundaries.SentenceBreaks(transcript)
@@ -285,18 +341,78 @@ def build_clips(
                 reason=candidate.reason.strip(),
             )
         )
+        if audience is not None:
+            blend_score(clips[-1], audience)
 
     # Refinement can move edges enough that two survivors now overlap.
     clips = _dedupe_clips(clips)
     clips = resolve_overlaps(clips, transcript, config, breaks=breaks)
-    clips.sort(key=lambda c: c.score, reverse=True)
-    clips = clips[: config.max_clips]
-
-    for rank, clip in enumerate(clips, start=1):
-        clip.rank = rank
-
+    if not truncate:
+        return rank_clips(clips, None)
+    clips = rank_clips(clips, config.max_clips)
     log.info("Produced %d final clips.", len(clips))
     return clips
+
+
+def rank_clips(clips: list[Clip], max_clips: int | None) -> list[Clip]:
+    """Sort by score, keep the best ``max_clips`` (all when None), number them."""
+    ordered = sorted(clips, key=lambda c: c.score, reverse=True)
+    if max_clips is not None:
+        ordered = ordered[:max_clips]
+    for rank, clip in enumerate(ordered, start=1):
+        clip.rank = rank
+    return ordered
+
+
+# --------------------------------------------------------------------------
+# Audience signals
+# --------------------------------------------------------------------------
+
+
+def blend_score(clip: Clip, audience: AudienceOptions) -> None:
+    """Blend the audience curve into ``clip.score``; note the parts in its reason.
+
+    ``score = (1 - w) * AI + w * audience``, where ``audience`` is how hot the
+    clip's span is against the rest of the video (0..100) and ``w`` is the
+    audience weight (or the smaller energy weight when the curve holds only
+    loudness). Without curve data the clip keeps its AI score. The Clip row
+    has no score-component columns, so the parts go into ``reason``.
+    """
+    curve = audience.curve
+    value = curve.range_score(clip.start_s, clip.end_s) if curve.has_data else None
+    weight = audience.weight
+    if value is None or weight <= 0:
+        return
+    ai = clip.score
+    clip.score = max(0, min(100, round((1.0 - weight) * ai + weight * value)))
+    note = f"[score {clip.score} = AI {ai} x{1 - weight:.2f} + {curve.label} {value} x{weight:.2f}]"
+    clip.reason = f"{clip.reason} {note}".strip()
+
+
+def audience_hints(
+    curve: AudienceCurve, transcript: Transcript, window: TranscriptWindow, *, limit: int
+) -> list[str]:
+    """Prompt lines for the hotspots and chapters inside one window."""
+    if not transcript.words:
+        return []
+    start_s, end_s = transcript.time_range(window.first_word, window.last_word)
+    lines: list[str] = []
+    strength = "weak signal" if curve.kind == "energy" else "viewer signal"
+    for spot in curve.hotspots_between(start_s, end_s)[:limit]:
+        first = max(window.first_word, transcript.index_at_time(spot.start_s))
+        last = max(first, min(window.last_word, transcript.index_at_time(spot.end_s)))
+        lines.append(
+            f"- {clock(spot.start_s)}-{clock(spot.end_s)}, around words [{first}]-[{last}] "
+            f"({strength}, strength {round(spot.value * 100)}): {'; '.join(spot.reasons)}"
+        )
+    chapters = curve.chapters_between(start_s, end_s)
+    if chapters:
+        listed = ", ".join(
+            f'{clock(c.start_s)} "{c.title}" (from word [{transcript.index_at_time(c.start_s)}])'
+            for c in chapters[:6]
+        )
+        lines.append(f"- Chapters starting here: {listed}")
+    return lines
 
 
 def dedupe(

@@ -26,6 +26,9 @@ from ..db.models import Clip, Export, Job, Source, new_id, utcnow
 from ..db.models import Transcript as TranscriptRow
 from ..providers import build_provider, detection_config
 from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
+from . import judge as clip_judge
+from . import signals as audience_signals
+from . import youtube_captions as yt_captions
 from .prepare import Loudness, Silence
 from .reframe import ReframeConfig, build_crop_path
 from .reframe.croppath import CropPath
@@ -107,6 +110,15 @@ class JobWorkspace:
     @property
     def thumbnails(self) -> Path:
         return self.root / "thumbnails"
+
+    @property
+    def audience(self) -> Path:
+        """The per-second audience curve (see :mod:`autoclip.pipeline.signals`)."""
+        return self.root / "audience.json"
+
+    @property
+    def judge_report(self) -> Path:
+        return self.root / "judge.json"
 
     def crop_path(self, clip_id: str) -> Path:
         return self.root / "crops" / f"{clip_id}.json"
@@ -377,14 +389,18 @@ class PipelineRunner:
             self._finish_stage(stage)
             return transcript
 
-        self._emit(stage, 0.0, "Transcribing")
-        transcript = transcribe.transcribe(
-            audio,
-            self.settings.whisper,
-            duration_s=self.source.duration_s,
-            on_progress=self._stage_progress(stage),
-            cancelled=self._is_cancelled,
-        )
+        transcript = self._youtube_caption_transcript()
+        if transcript is not None:
+            self._emit(stage, 0.5, "Using YouTube's own captions")
+        else:
+            self._emit(stage, 0.0, "Transcribing")
+            transcript = transcribe.transcribe(
+                audio,
+                self.settings.whisper,
+                duration_s=self.source.duration_s,
+                on_progress=self._stage_progress(stage),
+                cancelled=self._is_cancelled,
+            )
 
         if self.settings.whisper.diarization:
             from ..config import HF_TOKEN_KEY, get_secret
@@ -407,6 +423,79 @@ class PipelineRunner:
 
         self._finish_stage(stage)
         return transcript
+
+    def _youtube_caption_transcript(self) -> Transcript | None:
+        """YouTube's own captions saved at ingest, when wanted and trustworthy.
+
+        Any doubt (setting off, not a YouTube source, no track, a track that
+        fails the checks, an error) returns None, and Whisper runs instead.
+        """
+        if not self.settings.ingest.prefer_youtube_captions or self.source.type != "youtube":
+            return None
+        try:
+            transcript = yt_captions.load_for_source(
+                Path(self.source.path).parent,
+                duration_s=self.source.duration_s,
+                language=self.settings.whisper.language,
+            )
+        except Exception:
+            log.warning("Could not read YouTube's captions; using Whisper.", exc_info=True)
+            return None
+        if transcript is not None:
+            log.info("Using %s as the transcript for job %s.", transcript.model, self.job.id)
+        return transcript
+
+    def _load_or_build_audience(
+        self, loudness: Loudness | None
+    ) -> audience_signals.AudienceCurve | None:
+        """The job's audience curve, built once and cached. Never raises."""
+        detection = self.settings.detection
+        if not detection.audience_signals:
+            return None
+        cache = self.workspace.audience
+        if cache.exists():
+            try:
+                return audience_signals.AudienceCurve.load(cache)
+            except (OSError, ValueError, TypeError, KeyError):
+                log.warning("Ignoring an unreadable audience curve; building it again.")
+        ingest_settings = self.settings.ingest
+
+        def fetch(url: str) -> list[audience_signals.Comment]:
+            return audience_signals.fetch_comments(
+                url,
+                max_comments=detection.max_comments,
+                cookies_from_browser=ingest_settings.cookies_from_browser,
+            )
+
+        try:
+            curve = audience_signals.build_for_source(
+                source_dir=Path(self.source.path).parent,
+                url=self.source.url,
+                is_youtube=self.source.type == "youtube",
+                duration_s=self.source.duration_s,
+                loudness_values=loudness.values if loudness else None,
+                loudness_step_s=loudness.step_s if loudness else 0.1,
+                use_comments=detection.fetch_comments and detection.max_comments > 0,
+                use_energy=detection.audio_energy,
+                fetch=fetch,
+            )
+            curve.save(cache)
+        except Exception:
+            log.warning("Building the audience curve failed; going without it.", exc_info=True)
+            return None
+        return curve
+
+    def _build_judge(self, provider: object, max_clips: int) -> clip_judge.ClipJudge | None:
+        detection = self.settings.detection
+        complete = getattr(provider, "_complete", None)
+        if not detection.judge or complete is None:
+            return None
+        return clip_judge.ClipJudge(
+            complete,
+            max_candidates=max(detection.judge_max_candidates, 2 * max_clips),
+            min_keep=detection.judge_min_keep,
+            title=self.source.title or "",
+        )
 
     def _load_or_detect_silences(self, audio: Path) -> list[Silence]:
         if self.workspace.silences.exists():
@@ -452,6 +541,21 @@ class PipelineRunner:
 
         self._emit(stage, 0.0, f"Finding highlights with {provider.name}")
         loudness = self._load_or_measure_loudness(audio) if audio is not None else None
+
+        detection = self.settings.detection
+        audience = None
+        curve = self._load_or_build_audience(loudness)
+        if curve is not None and curve.has_data:
+            audience = highlights.AudienceOptions(
+                curve=curve,
+                audience_weight=detection.audience_weight,
+                energy_weight=detection.energy_weight,
+                hints_per_window=detection.hints_per_window if detection.audience_hints else 0,
+            )
+            if detection.audience_hints:
+                config.prompt_version = "highlight_v2"
+        judge = self._build_judge(provider, config.max_clips)
+
         clips = await highlights.detect(
             transcript,
             provider,
@@ -462,7 +566,16 @@ class PipelineRunner:
             on_progress=self._stage_progress(stage),
             # DetectionCancelled is turned into JobCancelled by run().
             cancelled=self._is_cancelled,
+            audience=audience,
+            judge=judge,
         )
+        if judge is not None:
+            try:
+                self.workspace.judge_report.write_text(
+                    json.dumps(judge.report(), indent=1), encoding="utf-8"
+                )
+            except OSError:
+                log.debug("Could not write the judge report.", exc_info=True)
 
         store.replace_clips(self.job.id, clips)
         self._finish_stage(stage)

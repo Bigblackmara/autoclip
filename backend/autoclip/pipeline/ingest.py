@@ -11,11 +11,13 @@ to fix it, rather than surfacing a raw yt-dlp traceback.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .. import paths
 from ..config import IngestSettings
@@ -142,14 +144,13 @@ def ingest_youtube(
     if settings.cookies_from_browser:
         # yt-dlp expects a tuple; only the browser name is required.
         options["cookiesfrombrowser"] = (settings.cookies_from_browser,)
-    if settings.prefer_youtube_captions:
-        options["writeautomaticsub"] = True
-        options["subtitleslangs"] = ["en.*"]
-        options["subtitlesformat"] = "json3"
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             metadata = ydl.extract_info(url, download=True)
+            # Sidecars for the audience signals and the captions-first
+            # transcript. Best effort: they never fail an ingest.
+            save_sidecars(ydl, metadata, target_dir, captions=settings.prefer_youtube_captions)
     except yt_dlp.utils.DownloadError as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
         raise _translate_ytdlp_error(exc, settings) from exc
@@ -179,6 +180,48 @@ def ingest_youtube(
         has_audio=info.has_audio,
         has_video=info.has_video,
     )
+
+
+#: Info-json keys dropped before saving: large and useless after the download.
+_INFO_DROP = ("formats", "requested_formats", "requested_downloads", "thumbnails")
+
+
+def save_sidecars(ydl: Any, metadata: Any, target_dir: Path, *, captions: bool) -> None:
+    """Write ``info.json`` and (when ``captions``) the chosen caption track.
+
+    The info json carries YouTube's "Most replayed" heatmap and chapters for
+    :mod:`autoclip.pipeline.signals`. The caption track is fetched now, from
+    the link in the fresh info, because those links expire within hours.
+    Nothing here may fail the ingest: every error is logged and skipped.
+    """
+    from . import signals, youtube_captions
+
+    if not isinstance(metadata, dict):
+        return
+    try:
+        sanitized = ydl.sanitize_info(metadata) if hasattr(ydl, "sanitize_info") else metadata
+        info = {k: v for k, v in dict(sanitized).items() if k not in _INFO_DROP}
+        (target_dir / signals.INFO_FILE).write_text(
+            json.dumps(info, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+    except Exception:
+        log.warning("Could not save the video's info json.", exc_info=True)
+        info = metadata
+
+    if not captions:
+        return
+    try:
+        track = youtube_captions.pick_track(info)
+        if track is None:
+            log.info("No caption track in the video's own language; Whisper will transcribe.")
+            return
+        with ydl.urlopen(track.url) as response:
+            raw = response.read()
+        data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        youtube_captions.parse_json3(data)  # validates the shape before saving
+        (target_dir / track.filename).write_text(json.dumps(data), encoding="utf-8")
+    except Exception as exc:
+        log.warning("Could not fetch YouTube's captions (%s); Whisper will transcribe.", exc)
 
 
 def _translate_ytdlp_error(exc: Exception, settings: IngestSettings) -> IngestError:

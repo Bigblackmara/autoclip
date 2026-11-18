@@ -100,6 +100,10 @@ class TranscriptWindow:
     last_word: int
     duration_s: float = 0.0
     speakers: list[str] = field(default_factory=list)
+    #: Audience-signal lines for this window (YouTube "Most replayed" peaks,
+    #: comment timestamps, loud moments, chapters), strongest first. Rendered
+    #: into the prompt as hints; empty when the source has no such data.
+    hints: list[str] = field(default_factory=list)
 
     @property
     def word_count(self) -> int:
@@ -261,11 +265,18 @@ def render_window_prompt(window: TranscriptWindow, config: DetectionConfig) -> s
             f"\nThis section has {len(window.speakers)} distinct speakers "
             f"({', '.join(window.speakers)}); speaker labels are shown inline.\n"
         )
+    hint_note = ""
+    if window.hints:
+        hint_note = (
+            "\nAudience signals for this section (strongest first). They show where "
+            "real viewers re-watched or reacted; a hint is where to look, not where "
+            "to cut:\n" + "\n".join(window.hints) + "\n"
+        )
 
     return (
         f"Transcript section, words {window.first_word} to {window.last_word}.\n"
         f"Each word is tagged with its index as [index]word.\n"
-        f"{speaker_note}\n"
+        f"{speaker_note}{hint_note}\n"
         f"Clip length must be between {config.min_duration_s:.0f} and "
         f"{config.max_duration_s:.0f} seconds.\n"
         f"Return at most {config.max_clips} clips.\n\n"
