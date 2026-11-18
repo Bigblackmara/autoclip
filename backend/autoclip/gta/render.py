@@ -12,10 +12,8 @@ clip lands on the Shorts/TikTok target instead of near it.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -25,8 +23,12 @@ import numpy as np
 
 from ..config import ExportSettings
 from ..pipeline import captions, ffmpeg
+from ..pipeline import edit as shared_edit
+from ..pipeline.edit import Keep, loudnorm_filter, output_duration, remap_words
 from ..pipeline.export import encoder_args
 from ..pipeline.transcript import Word
+
+__all__ = ["Keep", "loudnorm_filter", "output_duration", "remap_words"]
 
 log = logging.getLogger(__name__)
 
@@ -53,18 +55,6 @@ LOGO_SIDE_PX = 40
 
 class RenderError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class Keep:
-    """A kept span of the section file, in section-local seconds."""
-
-    start: float
-    end: float
-
-    @property
-    def duration(self) -> float:
-        return self.end - self.start
 
 
 # --------------------------------------------------------------------------
@@ -202,30 +192,6 @@ def _quiet_runs(
     if run_start is not None and (j - run_start) * hop_s >= min_len_s:
         runs.append((run_start * hop_s, j * hop_s))
     return runs
-
-
-def remap_words(words: list[Word], keeps: list[Keep]) -> list[Word]:
-    """Word timings on the output timeline (cut spans removed)."""
-    out: list[Word] = []
-    offsets: list[float] = []
-    total = 0.0
-    for keep in keeps:
-        offsets.append(total)
-        total += keep.duration
-    for word in words:
-        for keep, offset in zip(keeps, offsets, strict=True):
-            if word.end <= keep.start or word.start >= keep.end:
-                continue
-            start = offset + max(word.start, keep.start) - keep.start
-            end = offset + min(word.end, keep.end) - keep.start
-            if end > start:
-                out.append(Word(text=word.text, start=start, end=end, speaker=word.speaker))
-            break
-    return out
-
-
-def output_duration(keeps: list[Keep]) -> float:
-    return sum(k.duration for k in keeps)
 
 
 # --------------------------------------------------------------------------
@@ -392,9 +358,6 @@ def _audio_only_graph(keeps: list[Keep], *, seek_s: float, tail: str) -> str:
     return ";".join(parts)
 
 
-_LOUDNORM_JSON = re.compile(r"\{[^{}]*\"input_i\"[^{}]*\}", re.S)
-
-
 def measure_loudnorm(
     source: Path,
     keeps: list[Keep],
@@ -408,54 +371,10 @@ def measure_loudnorm(
     graph = _audio_only_graph(
         keeps,
         seek_s=seek_s,
-        tail=f"loudnorm=I={target}:TP={true_peak}:LRA=11:print_format=json",
+        tail=shared_edit.measure_filter(target=target, true_peak=true_peak),
     )
-    command = [
-        ffmpeg.ffmpeg_path(),
-        "-hide_banner",
-        "-nostdin",
-        "-ss",
-        f"{seek_s:.4f}",
-        "-t",
-        f"{span_s:.4f}",
-        "-i",
-        str(source),
-        "-filter_complex",
-        graph,
-        "-map",
-        "[aout]",
-        "-f",
-        "null",
-        "-",
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
-    match = _LOUDNORM_JSON.search(result.stderr or "")
-    if result.returncode != 0 or not match:
-        log.warning("Loudness measurement failed; falling back to one-pass loudnorm.")
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except ValueError:
-        return None
-    needed = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
-    if not all(key in data for key in needed):
-        return None
-    try:
-        if float(data["input_i"]) < -70:  # (near) silent: linear gain would explode
-            return None
-    except ValueError:
-        return None
-    return {key: str(data[key]) for key in needed}
-
-
-def loudnorm_filter(measured: dict[str, str] | None, *, target: float, true_peak: float) -> str:
-    base = f"loudnorm=I={target}:TP={true_peak}:LRA=11"
-    if not measured:
-        return base
-    return (
-        f"{base}:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
-        f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
-        f":offset={measured['target_offset']}:linear=true"
+    return shared_edit.measure_loudnorm(
+        ["-ss", f"{seek_s:.4f}", "-t", f"{span_s:.4f}", "-i", str(source)], graph
     )
 
 

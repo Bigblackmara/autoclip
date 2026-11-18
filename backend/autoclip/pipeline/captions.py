@@ -13,6 +13,7 @@ it's why event counts look high relative to word counts.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -93,6 +94,13 @@ class CaptionStyle:
     boxed: bool = False
     box_colour: str = "#000000"
     box_alpha: int = 40
+    #: Colour and size of a key word (see :func:`build_ass` ``keywords``).
+    emphasis: str = "#7CFF55"
+    emphasis_scale: int = 122
+    #: Outline colour of the spoken word (neon glow). None keeps the outline.
+    active_outline: str | None = None
+    #: Edge blur applied to the whole line (a glow with a coloured outline).
+    blur: float = 0.0
 
     @property
     def font_path(self) -> Path:
@@ -114,6 +122,7 @@ PRESETS: dict[str, CaptionStyle] = {
         animation="scale",
         scale_percent=118,
         max_words=4,
+        emphasis="#7CFF55",
     ),
     "karaoke_fill": CaptionStyle(
         key="karaoke_fill",
@@ -128,6 +137,7 @@ PRESETS: dict[str, CaptionStyle] = {
         all_caps=True,
         animation="karaoke",
         max_words=5,
+        emphasis="#FFE500",
     ),
     "clean_lower": CaptionStyle(
         key="clean_lower",
@@ -145,6 +155,8 @@ PRESETS: dict[str, CaptionStyle] = {
         margin_v_ratio=0.10,
         animation="none",
         max_words=8,
+        emphasis="#FFD54A",
+        emphasis_scale=112,
     ),
     "boxed": CaptionStyle(
         key="boxed",
@@ -163,6 +175,86 @@ PRESETS: dict[str, CaptionStyle] = {
         boxed=True,
         box_colour="#000000",
         box_alpha=30,
+        emphasis="#FFE500",
+    ),
+    # CrestClip-style presets.
+    "pop": CaptionStyle(
+        key="pop",
+        label="Pop",
+        description="Big three-word bursts; the spoken word turns gold, key words green.",
+        font="Anton",
+        font_file="Anton-Regular.ttf",
+        size_ratio=0.061,
+        primary="#FFFFFF",
+        accent="#FFDD00",
+        outline_width=7.0,
+        shadow=3.0,
+        all_caps=True,
+        animation="scale",
+        scale_percent=112,
+        max_words=3,
+        emphasis="#7CFF55",
+        emphasis_scale=124,
+    ),
+    "neon": CaptionStyle(
+        key="neon",
+        label="Neon",
+        description="Glowing cyan outline; the spoken word lights up mint, key words magenta.",
+        font="Poppins ExtraBold",
+        font_file="Poppins-ExtraBold.ttf",
+        size_ratio=0.050,
+        primary="#FFFFFF",
+        accent="#7CFFB2",
+        outline="#00E5FF",
+        outline_width=3.0,
+        bold=False,
+        all_caps=True,
+        animation="scale",
+        scale_percent=100,
+        max_words=3,
+        emphasis="#FF4DFF",
+        emphasis_scale=118,
+        active_outline="#7CFFB2",
+        blur=4.0,
+    ),
+    "comic": CaptionStyle(
+        key="comic",
+        label="Comic",
+        description="Yellow comic-book lettering, two words at a time; key words in red.",
+        font="Bangers",
+        font_file="Bangers-Regular.ttf",
+        size_ratio=0.0625,
+        primary="#FFE600",
+        accent="#FFFFFF",
+        outline_width=9.0,
+        shadow=5.0,
+        bold=False,
+        all_caps=True,
+        animation="scale",
+        scale_percent=118,
+        max_words=2,
+        emphasis="#FF3838",
+        emphasis_scale=126,
+    ),
+    "minimal": CaptionStyle(
+        key="minimal",
+        label="Minimal",
+        description="Clean sentence-case lines with a soft shadow; only key words take colour.",
+        font="Poppins",
+        font_file="Poppins-Bold.ttf",
+        size_ratio=0.0375,
+        primary="#FFFFFF",
+        accent=None,
+        outline_width=0.0,
+        shadow=3.0,
+        bold=True,
+        all_caps=False,
+        margin_v_ratio=0.20,
+        animation="none",
+        max_words=5,
+        box_alpha=0x99,
+        emphasis="#FFD700",
+        emphasis_scale=100,
     ),
 }
 
@@ -249,11 +341,21 @@ def build_ass(
     height: int,
     time_offset_s: float = 0.0,
     margin_v_ratio: float | None = None,
+    keywords: Sequence[str] = (),
+    hook_text: str = "",
+    hook_s: float = 3.0,
+    hook_top_px: int | None = None,
+    duration_s: float | None = None,
 ) -> pysubs2.SSAFile:
     """Build an ASS subtitle file for a clip.
 
     ``time_offset_s`` is subtracted from every timestamp, so absolute transcript
     times become clip-relative ones.
+
+    ``keywords`` (normalised, see :func:`edit.pick_keywords`) are drawn in the
+    style's emphasis colour and size: at most one per caption line, and each
+    key word at most twice per clip. ``hook_text`` adds a headline at the top
+    for the first ``hook_s`` seconds (clip-relative, never past ``duration_s``).
 
     Preconditions:
         words are in chronological order and carry start/end timings.
@@ -272,16 +374,110 @@ def build_ass(
         subs.styles[STYLE_NAME].marginv = round(height * margin_v_ratio)
 
     groups = group_words(words, max_words=style.max_words)
+    used: dict[str, int] = {}
 
     for group in groups:
+        emph = _emphasis_index(group, keywords, used)
         if style.animation == "karaoke":
-            subs.events.append(_karaoke_event(group, style, time_offset_s))
+            subs.events.append(_karaoke_event(group, style, time_offset_s, emph))
         elif style.animation == "scale" and style.accent:
-            subs.events.extend(_per_word_events(group, style, time_offset_s))
+            subs.events.extend(_per_word_events(group, style, time_offset_s, emph))
         else:
-            subs.events.append(_static_event(group, style, time_offset_s))
+            subs.events.append(_static_event(group, style, time_offset_s, emph))
+
+    if hook_text.strip():
+        _add_hook(
+            subs,
+            hook_text,
+            width=width,
+            height=height,
+            hook_s=hook_s,
+            top_px=hook_top_px,
+            duration_s=duration_s,
+        )
 
     return subs
+
+
+HOOK_STYLE_NAME = "AutoClipHook"
+#: Headline look (CrestClip's): dark text on a white box, top centre.
+HOOK_FONT = "Poppins ExtraBold"
+HOOK_SIZE_RATIO = 0.0365
+HOOK_TEXT = "#1E1B2B"
+HOOK_BOX = "#FFFFFF"
+
+
+def _add_hook(
+    subs: pysubs2.SSAFile,
+    text: str,
+    *,
+    width: int,
+    height: int,
+    hook_s: float,
+    top_px: int | None,
+    duration_s: float | None,
+) -> None:
+    hook = pysubs2.SSAStyle()
+    hook.fontname = HOOK_FONT
+    hook.fontsize = round(height * HOOK_SIZE_RATIO)
+    hook.primarycolor = hex_to_ass(HOOK_TEXT)
+    hook.secondarycolor = hex_to_ass(HOOK_TEXT)
+    hook.outlinecolor = hex_to_ass(HOOK_BOX)
+    hook.backcolor = hex_to_ass(HOOK_BOX)
+    hook.bold = False
+    # BorderStyle 3: an opaque box; the outline width is the box padding.
+    hook.borderstyle = 3
+    hook.outline = round(height * 0.0115)
+    hook.shadow = 0
+    hook.alignment = pysubs2.Alignment.TOP_CENTER
+    hook.marginl = hook.marginr = round(width * 0.1)
+    subs.styles[HOOK_STYLE_NAME] = hook
+
+    end = hook_s + 0.2
+    if duration_s is not None:
+        end = min(end, max(1.5, duration_s - 0.2))
+    top = top_px if top_px is not None else round(height * 0.156)
+    body = escape_ass_text(text.strip())
+    subs.events.append(
+        pysubs2.SSAEvent(
+            start=0,
+            end=pysubs2.make_time(s=end),
+            style=HOOK_STYLE_NAME,
+            layer=1,
+            text=f"{{\\an8\\pos({width // 2},{top})\\fad(120,220)}}{body}",
+        )
+    )
+
+
+def _emphasis_index(group: CaptionGroup, keywords: Sequence[str], used: dict[str, int]) -> int:
+    """Which word of ``group`` to draw as a key word (-1 for none)."""
+    if not keywords:
+        return -1
+    from .edit import keyword_of
+
+    for index, word in enumerate(group.words):
+        keyword = keyword_of(word.text, keywords)
+        if keyword is None or used.get(keyword, 0) >= 2:
+            continue
+        used[keyword] = used.get(keyword, 0) + 1
+        return index
+    return -1
+
+
+def _emphasis_tags(style: CaptionStyle) -> str:
+    scale = style.emphasis_scale
+    tags = f"\\c{ass_colour_override(style.emphasis)}"
+    if scale != 100:
+        tags += f"\\fscx{scale}\\fscy{scale}"
+    return tags
+
+
+def _line_prefix(style: CaptionStyle) -> str:
+    return f"{{\\blur{style.blur:g}}}" if style.blur else ""
+
+
+def _reset(style: CaptionStyle) -> str:
+    return f"{{\\r\\blur{style.blur:g}}}" if style.blur else "{\\r}"
 
 
 def _build_ass_style(style: CaptionStyle, *, height: int, scale: float) -> pysubs2.SSAStyle:
@@ -345,12 +541,21 @@ def _event(start_s: float, end_s: float, text: str, offset: float) -> pysubs2.SS
     )
 
 
-def _static_event(group: CaptionGroup, style: CaptionStyle, offset: float) -> pysubs2.SSAEvent:
-    text = " ".join(_text_of(w, style) for w in group.words)
-    return _event(group.start, group.end, text, offset)
+def _static_event(
+    group: CaptionGroup, style: CaptionStyle, offset: float, emph: int = -1
+) -> pysubs2.SSAEvent:
+    parts: list[str] = []
+    for index, word in enumerate(group.words):
+        text = _text_of(word, style)
+        if index == emph:
+            text = f"{{{_emphasis_tags(style)}}}{text}{_reset(style)}"
+        parts.append(text)
+    return _event(group.start, group.end, _line_prefix(style) + " ".join(parts), offset)
 
 
-def _karaoke_event(group: CaptionGroup, style: CaptionStyle, offset: float) -> pysubs2.SSAEvent:
+def _karaoke_event(
+    group: CaptionGroup, style: CaptionStyle, offset: float, emph: int = -1
+) -> pysubs2.SSAEvent:
     r"""Build a ``\kf`` karaoke line.
 
     ``\kf`` sweeps the fill across each word over its own duration; durations
@@ -365,13 +570,19 @@ def _karaoke_event(group: CaptionGroup, style: CaptionStyle, offset: float) -> p
             gap = group.words[index + 1].start - word.end
             if 0 < gap < 0.5:
                 duration_cs += round(gap * 100)
-        parts.append(f"{{\\kf{duration_cs}}}{_text_of(word, style)}")
+        if index == emph:
+            parts.append(
+                f"{{\\kf{duration_cs}{_emphasis_tags(style)}}}{_text_of(word, style)}"
+                f"{_reset(style)}"
+            )
+        else:
+            parts.append(f"{{\\kf{duration_cs}}}{_text_of(word, style)}")
 
-    return _event(group.start, group.end, " ".join(parts), offset)
+    return _event(group.start, group.end, _line_prefix(style) + " ".join(parts), offset)
 
 
 def _per_word_events(
-    group: CaptionGroup, style: CaptionStyle, offset: float
+    group: CaptionGroup, style: CaptionStyle, offset: float, emph: int = -1
 ) -> list[pysubs2.SSAEvent]:
     """Emit one event per word, highlighting the active one.
 
@@ -379,23 +590,37 @@ def _per_word_events(
     the emphasised word changes between them.
     """
     accent_tag = f"\\c{ass_colour_override(style.accent or style.primary)}"
+    if style.active_outline:
+        accent_tag += f"\\3c{ass_colour_override(style.active_outline)}"
     scale = style.scale_percent
+    if scale != 100:
+        accent_tag += f"\\fscx{scale}\\fscy{scale}"
+    emphasis_tags = _emphasis_tags(style)
+    reset = _reset(style)
     events: list[pysubs2.SSAEvent] = []
 
     for active, word in enumerate(group.words):
         rendered: list[str] = []
         for index, other in enumerate(group.words):
             text = _text_of(other, style)
-            if index == active:
-                rendered.append(f"{{{accent_tag}\\fscx{scale}\\fscy{scale}}}{text}{{\\r}}")
-            else:
-                rendered.append(text)
+            # A key word keeps its emphasis while spoken (its tags come last).
+            tags = (accent_tag if index == active else "") + (
+                emphasis_tags if index == emph else ""
+            )
+            rendered.append(f"{{{tags}}}{text}{reset}" if tags else text)
 
         # Hold the last word until the group ends so the caption doesn't blink
         # out early when a word's measured end precedes the next word's start.
         end = word.end if active + 1 < len(group.words) else group.end
         next_start = group.words[active + 1].start if active + 1 < len(group.words) else end
-        events.append(_event(word.start, max(end, next_start), " ".join(rendered), offset))
+        events.append(
+            _event(
+                word.start,
+                max(end, next_start),
+                _line_prefix(style) + " ".join(rendered),
+                offset,
+            )
+        )
 
     return events
 
@@ -409,10 +634,16 @@ def write_ass(
     height: int,
     time_offset_s: float = 0.0,
     margin_v_ratio: float | None = None,
+    keywords: Sequence[str] = (),
+    hook_text: str = "",
+    hook_s: float = 3.0,
+    hook_top_px: int | None = None,
+    duration_s: float | None = None,
 ) -> Path:
     """Render captions to an .ass file and return its path.
 
-    ``margin_v_ratio`` overrides the style's bottom margin (fraction of height).
+    ``margin_v_ratio`` overrides the style's bottom margin (fraction of height);
+    the key-word and hook options are as for :func:`build_ass`.
     """
     subs = build_ass(
         words,
@@ -421,6 +652,11 @@ def write_ass(
         height=height,
         time_offset_s=time_offset_s,
         margin_v_ratio=margin_v_ratio,
+        keywords=keywords,
+        hook_text=hook_text,
+        hook_s=hook_s,
+        hook_top_px=hook_top_px,
+        duration_s=duration_s,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     subs.save(str(path), encoding="utf-8")

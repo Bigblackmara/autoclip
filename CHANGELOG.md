@@ -23,6 +23,10 @@ being validated against a fixed golden video set — see
   WIDE, or GENERAL; subjects too far apart to crop get a fitted frame over a
   blurred fill rather than someone being cut out.
 - **Four caption styles** with bundled OFL fonts, so nothing is fetched at runtime.
+- **Short-form editing for normal-mode exports** — pause cutting on measured silences with
+  re-timed captions, punch-in zooms, a hook headline, key-word highlighting, background
+  music with ducking, a text/PNG watermark, forced 30 fps and two-pass loudness. Four more
+  caption styles: `pop`, `neon`, `comic`, `minimal`.
 - **Web UI** — ingest, live job progress over SSE, clip review with word-snapping
   trim handles and caption editing, and export.
 - **Resumable stages.** Artifacts live on disk per job, so a retry restarts at the

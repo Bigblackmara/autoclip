@@ -71,7 +71,7 @@ class TestHealthAndSystem:
 
 
 class TestCaptionStyles:
-    def test_lists_all_four(self, client: TestClient) -> None:
+    def test_lists_all_presets(self, client: TestClient) -> None:
         styles = client.get("/api/caption-styles").json()
 
         assert {s["key"] for s in styles} == {
@@ -79,6 +79,10 @@ class TestCaptionStyles:
             "karaoke_fill",
             "clean_lower",
             "boxed",
+            "pop",
+            "neon",
+            "comic",
+            "minimal",
         }
 
     def test_includes_preview_metadata(self, client: TestClient) -> None:

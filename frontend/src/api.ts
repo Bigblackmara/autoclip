@@ -144,6 +144,11 @@ export interface ProviderStatus {
   has_key: boolean
 }
 
+export type Pace = 'off' | 'natural' | 'fast'
+export type Motion = 'off' | 'subtle' | 'dynamic'
+export type WatermarkMode = 'off' | 'text' | 'image'
+export type WatermarkCorner = 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
+
 export interface Settings {
   active_provider: string
   providers: Record<string, { model: string; base_url: string | null }>
@@ -162,6 +167,22 @@ export interface Settings {
     crf: number
     write_srt: boolean
     layout: Layout
+    // Short-form editing (normal-mode exports).
+    pace: Pace
+    hook_title: boolean
+    motion: Motion
+    keyword_highlight: boolean
+    music_enabled: boolean
+    music_path: string
+    music_volume: number
+    music_duck: boolean
+    watermark: WatermarkMode
+    watermark_text: string
+    watermark_image: string
+    watermark_corner: WatermarkCorner
+    watermark_opacity: number
+    fps: number
+    two_pass_loudnorm: boolean
   }
   insecure_secret_storage: boolean
   keys_present: Record<string, boolean>

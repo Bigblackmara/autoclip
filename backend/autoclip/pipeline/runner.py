@@ -537,6 +537,12 @@ class PipelineRunner:
         source_path = Path(self.source.path)
         destination_dir = paths.exports_dir() / self.job.id
         destination_dir.mkdir(parents=True, exist_ok=True)
+        # Short-form editing: pause cuts land on the silences measured at
+        # prepare time; the watermark is resolved (and a text logo drawn) once.
+        from . import edit
+
+        silences = self._export_silences()
+        watermark = edit.resolve_watermark(self.settings.export)
 
         for index, clip in enumerate(clips):
             self._check_cancelled()
@@ -557,6 +563,7 @@ class PipelineRunner:
             destination = destination_dir / export.output_filename(
                 clip.title or f"clip-{clip.rank}", ratio, rank=clip.rank
             )
+            layout = export.resolve_layout(self.settings.export.layout, facecam, ratio)
 
             request = export.ExportRequest(
                 source=source_path,
@@ -568,8 +575,20 @@ class PipelineRunner:
                 style=style,
                 ratio=ratio,
                 has_video=self.source.has_video,
-                layout=export.resolve_layout(self.settings.export.layout, facecam, ratio),
+                layout=layout,
                 facecam=facecam,
+                has_audio=self.source.has_audio,
+                edit=edit.plan_for_clip(
+                    self.settings.export,
+                    start_s=clip.start_s,
+                    end_s=clip.end_s,
+                    words=words,
+                    silences=silences,
+                    title=clip.title or clip.hook,
+                    seed=clip.id,
+                    allow_motion=self.source.has_video and layout != "split",
+                    watermark=watermark,
+                ),
             )
 
             def clip_progress(fraction: float, i: int = index) -> None:
@@ -596,6 +615,18 @@ class PipelineRunner:
             store.update_clip(clip.id, status="exported")
 
         self._finish_stage(stage)
+
+    def _export_silences(self) -> list[Silence]:
+        """The job's measured silences for pause cutting (empty when unavailable)."""
+        if self.settings.export.pace == "off":
+            return []
+        if not self.workspace.silences.exists() and not self.workspace.audio.exists():
+            return []
+        try:
+            return self._load_or_detect_silences(self.workspace.audio)
+        except Exception:
+            log.warning("Could not read silences; exporting without pause cuts.", exc_info=True)
+            return []
 
     @staticmethod
     def _already_exported(clip: Clip, ratio: str) -> bool:
