@@ -84,6 +84,21 @@ class IngestSettings(BaseModel):
     #: burned-in captions read as one lower-case run. Whisper is used whenever
     #: the captions are missing or look wrong.
     prefer_youtube_captions: bool = False
+    #: Keep yt-dlp current: check PyPI at startup and daily, upgrade when a
+    #: newer release is out, and once more when a YouTube download fails with
+    #: an error that usually means yt-dlp is outdated (see ytdlp_update.py).
+    ytdlp_auto_update: bool = True
+    #: Largest file a Google Drive / Dropbox / OneDrive / direct link may be.
+    link_max_mb: int = Field(default=20_000, ge=1, le=1_000_000)
+
+
+class HousekeepingSettings(BaseModel):
+    """Background clean-up of old work (see :mod:`autoclip.retention`)."""
+
+    #: Delete sources, jobs and clips (rows and files) this many days after
+    #: they were made. 0 keeps everything. Work still processing, and GTA
+    #: clips with a pending or scheduled upload, are never deleted.
+    retention_days: int = Field(default=0, ge=0, le=3650)
 
 
 class DetectionSettings(BaseModel):
@@ -180,6 +195,7 @@ class Settings(BaseModel):
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     export: ExportSettings = Field(default_factory=ExportSettings)
     detection: DetectionSettings = Field(default_factory=DetectionSettings)
+    housekeeping: HousekeepingSettings = Field(default_factory=HousekeepingSettings)
 
     #: Set when secrets had to be written to config.json because no keyring
     #: backend was usable. Surfaced as a warning in the UI and in `doctor`.

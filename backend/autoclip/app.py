@@ -81,12 +81,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # YouTube posting schedule; idle until switched on in GTA settings.
         await gta_poster.start()
 
+    # Housekeeping: hourly retention sweep (idle at retention_days = 0) and
+    # the daily yt-dlp update check (idle while ytdlp_auto_update is off).
+    from . import retention, ytdlp_update
+
+    if worker_enabled:
+        await retention.service.start()
+        await ytdlp_update.service.start()
+
     log.info("AutoClip %s ready. Artifacts in %s", __version__, paths.root())
 
     try:
         yield
     finally:
         if worker_enabled:
+            await ytdlp_update.service.stop()
+            await retention.service.stop()
             await gta_poster.stop()
             await asyncio.to_thread(gta_live.shutdown)
             await gta_queue.stop()
