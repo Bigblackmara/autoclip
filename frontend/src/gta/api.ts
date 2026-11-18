@@ -184,6 +184,24 @@ export interface PostingOverview {
 /** Max upload attempts per clip (backend gta/poster.py MAX_ATTEMPTS). */
 export const MAX_UPLOAD_ATTEMPTS = 3
 
+export type GtaCaptionStyle = 'gta' | 'pop' | 'neon' | 'comic' | 'minimal' | 'karaoke_fill'
+export type GtaMotion = 'off' | 'subtle' | 'dynamic'
+
+export const GTA_CAPTION_STYLES: { value: GtaCaptionStyle; label: string; hint: string }[] = [
+  { value: 'gta', label: 'GTA (classic)', hint: 'White with a black outline; the spoken word turns yellow.' },
+  { value: 'pop', label: 'Pop', hint: 'Big three-word bursts; spoken word gold, key words green.' },
+  { value: 'neon', label: 'Neon', hint: 'Glowing cyan outline; key words magenta.' },
+  { value: 'comic', label: 'Comic', hint: 'Yellow comic lettering, two words at a time; key words red.' },
+  { value: 'minimal', label: 'Minimal', hint: 'Clean sentence case with a soft shadow; only key words take colour.' },
+  { value: 'karaoke_fill', label: 'Karaoke Fill', hint: 'Words fill with colour as they are spoken.' },
+]
+
+export const GTA_MOTION_LEVELS: { value: GtaMotion; label: string }[] = [
+  { value: 'off', label: 'Off (punch-in only)' },
+  { value: 'subtle', label: 'Subtle (zoom every ~4.5 s)' },
+  { value: 'dynamic', label: 'Dynamic (zoom every ~2 s)' },
+]
+
 export interface GtaSettings {
   chunk_minutes: number
   chunk_tail_s: number
@@ -195,7 +213,11 @@ export interface GtaSettings {
   dead_air_min_s: number
   dead_air_keep_s: number
   hook_title_s: number
-  caption_style: string
+  caption_style: GtaCaptionStyle
+  keyword_highlight: boolean
+  motion: GtaMotion
+  comment_signal: boolean
+  youtube_captions: boolean
   loudness_lufs: number
   loudness_tolerance_lu: number
   true_peak_db: number

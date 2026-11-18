@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..pipeline import ffmpeg
+from ..pipeline import ffmpeg, youtube_captions
 from ..pipeline.ingest import IngestError, _translate_ytdlp_error, js_runtime_options
 
 log = logging.getLogger(__name__)
@@ -63,6 +63,9 @@ class ProbeResult:
     heatmap: list[tuple[float, float, float]] = field(default_factory=list)
     has_live_chat_replay: bool = False
     webpage_url: str = ""
+    #: YouTube's own caption track in the spoken language ({lang, kind, url}),
+    #: chosen like the normal pipeline's captions-first path; {} = none.
+    caption_track: dict[str, str] = field(default_factory=dict)
 
 
 def _translate(exc: Exception) -> IngestError:
@@ -115,6 +118,7 @@ def probe_from_info(info: dict[str, Any], url: str) -> ProbeResult:
     platform = detect_platform(info.get("webpage_url") or url)
     live_status = str(info.get("live_status") or "")
     subtitles = info.get("subtitles") or {}
+    track = youtube_captions.pick_track(info) if platform == "youtube" else None
     return ProbeResult(
         platform=platform,
         title=str(info.get("title") or info.get("fulltitle") or ""),
@@ -126,7 +130,39 @@ def probe_from_info(info: dict[str, Any], url: str) -> ProbeResult:
         heatmap=parse_heatmap(info.get("heatmap")),
         has_live_chat_replay=isinstance(subtitles, dict) and "live_chat" in subtitles,
         webpage_url=str(info.get("webpage_url") or url),
+        caption_track=({"lang": track.lang, "kind": track.kind, "url": track.url} if track else {}),
     )
+
+
+def download_caption_track(track: dict[str, str], directory: Path) -> Path | None:
+    """Save a probed caption track (json3) into ``directory``. Never raises.
+
+    Caption links expire within hours, so this runs right after the probe.
+    The file is named like the normal pipeline's (``captions.<kind>.<lang>
+    .json3``) so :func:`youtube_captions.load_for_source` reads it.
+    """
+    import json
+
+    url = str(track.get("url") or "")
+    if not url:
+        return None
+    caption = youtube_captions.CaptionTrack(
+        lang=str(track.get("lang") or ""), kind=str(track.get("kind") or "auto"), url=url
+    )
+    try:
+        import yt_dlp
+
+        with yt_dlp.YoutubeDL(_ydl_base_options()) as ydl, ydl.urlopen(url) as response:
+            raw = response.read()
+        data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        youtube_captions.parse_json3(data)  # validates the shape before saving
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / caption.filename
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+    except Exception as exc:
+        log.warning("Could not fetch YouTube's captions (%s); Whisper will transcribe.", exc)
+        return None
 
 
 def probe(url: str) -> ProbeResult:

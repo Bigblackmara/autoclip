@@ -18,7 +18,14 @@ import numpy as np
 from .signals import SILENCE_DB, ChatSeries
 
 #: Signal weights; renormalised over the signals a stream actually has.
-WEIGHTS = {"audio": 0.30, "chat": 0.25, "keywords": 0.20, "replayed": 0.15, "clips": 0.10}
+WEIGHTS = {
+    "audio": 0.30,
+    "chat": 0.25,
+    "keywords": 0.20,
+    "replayed": 0.15,
+    "comments": 0.15,
+    "clips": 0.10,
+}
 
 #: Baselines are medians over blocks this long, smoothed over this many blocks.
 BLOCK_S = 10
@@ -172,6 +179,29 @@ def clips_component(clips: np.ndarray) -> np.ndarray:
     return np.clip(clips / 3.0, 0.0, 1.0).astype(np.float32)
 
 
+def comments_component(comments: list | None, seconds: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """(0..1 contribution, timestamp hits per second) from viewer comments.
+
+    Reuses the normal pipeline's parsing and weighting
+    (:func:`autoclip.pipeline.signals.comment_component`: like-weighted
+    ``12:34`` mentions, a short kernel after each mention, None below three
+    mentions). ``comments`` are :class:`autoclip.pipeline.signals.Comment`.
+    """
+    from ..pipeline import signals as audience
+
+    if not comments or seconds <= 0:
+        return None
+    result = audience.comment_component(list(comments), seconds)
+    if result is None:
+        return None
+    series, hits = result
+    counts = np.zeros(seconds, dtype=np.float32)
+    for t, _likes in hits:
+        if 0 <= t < seconds:
+            counts[t] += 1
+    return series.astype(np.float32), counts
+
+
 def build_curve(
     seconds: int,
     *,
@@ -179,8 +209,13 @@ def build_curve(
     chat: ChatSeries | None = None,
     heat: np.ndarray | None = None,
     viewer_clips: np.ndarray | None = None,
+    comments: list | None = None,
 ) -> HypeCurve:
-    """Combine whatever signals exist into the curve and its markers."""
+    """Combine whatever signals exist into the curve and its markers.
+
+    ``comments`` (YouTube VODs) are the video's top comments; their
+    timestamps become the ``comments`` signal.
+    """
 
     def fit(values: np.ndarray) -> np.ndarray:
         out = np.zeros(seconds, dtype=np.float32)
@@ -208,6 +243,9 @@ def build_curve(
     if heat is not None and len(heat) and float(heat.max()) > 0:
         components["replayed"] = replayed_component(fit(heat))
         details["heat"] = fit(heat)
+    comment_result = comments_component(comments, seconds)
+    if comment_result is not None:
+        components["comments"], details["comment_hits"] = comment_result
     if viewer_clips is not None and len(viewer_clips) and float(viewer_clips.max()) > 0:
         components["clips"] = clips_component(fit(viewer_clips))
         details["clips"] = fit(viewer_clips)
@@ -284,6 +322,13 @@ def _reasons(index: int, details: dict[str, np.ndarray]) -> list[str]:
                 reasons.append(f"{label} x{count:.0f} in chat")
     if "heat" in details and _window_max(details["heat"], index) >= 0.6:
         reasons.append("YouTube Most Replayed peak")
+    if "comment_hits" in details:
+        a = max(0, index - 20)
+        b = min(len(details["comment_hits"]), index + 5)
+        mentions = int(details["comment_hits"][a:b].sum()) if b > a else 0
+        if mentions >= 1:
+            plural = "s" if mentions != 1 else ""
+            reasons.append(f"{mentions} viewer comment timestamp{plural}")
     if "clips" in details and _window_max(details["clips"], index) >= 1:
         reasons.append("viewers clipped this")
     return reasons

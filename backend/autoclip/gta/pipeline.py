@@ -34,6 +34,7 @@ from ..pipeline.transcript import Transcript, Word
 from . import align, fetch, hype, judging, logo, qa, render, signals, store
 from .gate import gate
 from .settings import GtaSettings, output_root, work_root
+from .settings import load as load_gta_settings
 from .store import GtaClip, GtaStream
 
 log = logging.getLogger(__name__)
@@ -92,6 +93,14 @@ class Workspace:
     @property
     def messages(self) -> Path:
         return self.root / "chat" / "messages.jsonl"
+
+    @property
+    def comments(self) -> Path:
+        return self.root / "comments.json"
+
+    @property
+    def captions_dir(self) -> Path:
+        return self.root / "captions"
 
     @property
     def viewer_clips(self) -> Path:
@@ -185,9 +194,10 @@ class Reporter:
 # --------------------------------------------------------------------------
 
 
-def stage_probe(stream: GtaStream, report: Reporter) -> None:
+def stage_probe(stream: GtaStream, report: Reporter, settings: GtaSettings | None = None) -> None:
     report(0.0, "Reading the stream link", force=True)
     ws = Workspace(stream.id)
+    settings = settings or load_gta_settings()
     result = fetch.probe(stream.url)
     if result.is_live:
         raise StageError(
@@ -203,6 +213,9 @@ def stage_probe(stream: GtaStream, report: Reporter) -> None:
             "heatmap": [list(item) for item in result.heatmap],
         },
     )
+    if settings.youtube_captions and result.caption_track:
+        # Now, while the signed caption link is fresh (it expires in hours).
+        fetch.download_caption_track(result.caption_track, ws.captions_dir)
     start, end = _range(stream, result.duration_s)
     store.update_stream(
         stream.id,
@@ -261,9 +274,39 @@ def stage_audio(stream: GtaStream, report: Reporter, settings: GtaSettings) -> N
     )
 
 
-def stage_signals(stream: GtaStream, report: Reporter) -> None:
+def _fetch_comments(url: str) -> list:
+    """Top comments of a YouTube VOD (network; raises on failure)."""
+    from ..pipeline import signals as audience
+
+    app = load_settings()
+    return audience.fetch_comments(
+        url,
+        max_comments=app.detection.max_comments or 300,
+        cookies_from_browser=app.ingest.cookies_from_browser,
+    )
+
+
+def load_comments(ws: Workspace, stream: GtaStream, *, fetch_missing: bool) -> list:
+    """The VOD's cached top comments, fetched once when missing. Never raises."""
+    from ..pipeline import signals as audience
+
+    if stream.platform != "youtube":
+        return []
+    try:
+        if not fetch_missing:
+            if not ws.comments.exists():
+                return []
+            return audience.parse_comments(json.loads(ws.comments.read_text(encoding="utf-8")))
+        return audience.load_or_fetch_comments(ws.comments, stream.url, _fetch_comments)
+    except Exception:
+        log.warning("Comment timestamps unavailable for %s.", stream.url, exc_info=True)
+        return []
+
+
+def stage_signals(stream: GtaStream, report: Reporter, settings: GtaSettings | None = None) -> None:
     """Chat replay + viewer clips. Missing signals are recorded, never fatal."""
     ws = Workspace(stream.id)
+    settings = settings or load_gta_settings()
     probe = _probe(ws)
     report(0.0, "Collecting chat and viewer signals", force=True)
     found = dict(stream.signals)
@@ -307,29 +350,120 @@ def stage_signals(stream: GtaStream, report: Reporter) -> None:
             notes.append("add Twitch API credentials in GTA settings to use viewer clips")
         _save_json(ws.viewer_clips, clips)
     found["viewer_clips"] = len(_load_json(ws.viewer_clips, []) or [])
+    report.check()
+
+    if settings.comment_signal and stream.platform == "youtube":
+        report(0.6, "Reading comment timestamps", force=True)
+        comments = load_comments(ws, stream, fetch_missing=True)
+        found["comments"] = len(comments)
+        if not comments:
+            notes.append("YouTube comments could not be read")
     if notes:
         found["notes"] = notes
     store.update_stream(stream.id, signals=found)
 
 
-def stage_transcribe(stream: GtaStream, report: Reporter) -> None:
+#: A caption part must reach this close to both ends of its audio part (s);
+#: a track that stops early or starts late is not trusted for that part.
+CAPTION_EDGE_S = 120.0
+
+
+def caption_transcript(
+    ws: Workspace, stream: GtaStream, settings: GtaSettings, *, language: str = ""
+) -> Transcript | None:
+    """YouTube's own captions for this VOD (stream time), or None.
+
+    Only for YouTube VODs with the setting on. A missing file is fetched once
+    more from the probed link (it may have expired: then Whisper). Never
+    raises.
+    """
+    from ..pipeline import youtube_captions
+
+    if not settings.youtube_captions or stream.platform != "youtube":
+        return None
+    try:
+        if not any(ws.captions_dir.glob(youtube_captions.FILE_GLOB)):
+            track = (_load_json(ws.probe, {}) or {}).get("caption_track") or {}
+            if not track:
+                return None
+            fetch.download_caption_track(track, ws.captions_dir)
+        return youtube_captions.load_for_source(
+            ws.captions_dir, duration_s=stream.duration_s, language=language
+        )
+    except Exception:
+        log.warning("YouTube captions unusable for %s; using Whisper.", stream.url, exc_info=True)
+        return None
+
+
+def caption_part(
+    captions: Transcript | None, part_start_s: float, part_end_s: float
+) -> Transcript | None:
+    """The captions of one audio part as a part-local Transcript, or None.
+
+    "Whisper on any doubt": too few words per minute for real speech (a
+    quiet stretch of gameplay included), or a track that doesn't cover the
+    part from end to end, and the part goes to Whisper instead.
+    """
+    from ..pipeline import youtube_captions
+
+    if captions is None or part_end_s - part_start_s < 30.0:
+        return None
+    inside = [w for w in captions.words if part_start_s <= w.start < part_end_s]
+    minutes = (part_end_s - part_start_s) / 60.0
+    if len(inside) < youtube_captions.MIN_WORDS:
+        return None
+    if len(inside) / minutes < youtube_captions.MIN_WORDS_PER_MINUTE:
+        return None
+    if inside[0].start - part_start_s > CAPTION_EDGE_S:
+        return None
+    if part_end_s - inside[-1].end > CAPTION_EDGE_S:
+        return None
+    local = [
+        Word(
+            text=w.text,
+            start=w.start - part_start_s,
+            end=min(w.end, part_end_s) - part_start_s,
+            speaker=w.speaker,
+        )
+        for w in inside
+    ]
+    return Transcript(
+        words=local,
+        segments=youtube_captions.build_segments(local),
+        language=captions.language,
+        model=captions.model,
+        source=youtube_captions.SOURCE,
+    )
+
+
+def stage_transcribe(
+    stream: GtaStream, report: Reporter, settings: GtaSettings | None = None
+) -> None:
     ws = Workspace(stream.id)
     if ws.transcript.exists():
         return
-    start, _ = _range(stream, stream.duration_s)
+    settings = settings or load_gta_settings()
+    start, end = _range(stream, stream.duration_s)
     parts = sorted(ws.parts_dir.glob("part_*.wav"))
     if not parts:
         raise StageError("The analysis audio is missing; retry the stream.")
     whisper = load_settings().whisper
+    captions = caption_transcript(ws, stream, settings, language=whisper.language)
     ws.transcripts_dir.mkdir(parents=True, exist_ok=True)
     words: list[Word] = []
     language = ""
     model = ""
+    caption_parts = 0
     for index, part in enumerate(parts):
         report.check()
         cache = ws.transcripts_dir / f"{part.stem}.json"
+        part_start = start + index * fetch.PART_S
+        from_captions = caption_part(captions, part_start, min(end, part_start + fetch.PART_S))
         if cache.exists():
             piece = Transcript.load(cache)
+        elif from_captions is not None:
+            piece = from_captions
+            piece.save(cache)
         else:
             label = f"Transcribing part {index + 1} of {len(parts)}"
             report(index / len(parts), label, force=True)
@@ -344,7 +478,9 @@ def stage_transcribe(stream: GtaStream, report: Reporter) -> None:
                     model_cache=_model_cache,
                 )
             piece.save(cache)
-        offset = start + index * fetch.PART_S
+        offset = part_start
+        if piece.source != "whisper":
+            caption_parts += 1
         language = language or piece.language
         model = model or piece.model
         words.extend(
@@ -353,6 +489,11 @@ def stage_transcribe(stream: GtaStream, report: Reporter) -> None:
         )
     words.sort(key=lambda w: w.start)
     Transcript(words=words, language=language, model=model).save(ws.transcript)
+    if captions is not None or settings.youtube_captions:
+        current = store.get_stream(stream.id)
+        found = dict(current.signals if current else stream.signals)
+        found["caption_parts"] = f"{caption_parts}/{len(parts)}"
+        store.update_stream(stream.id, signals=found)
 
 
 def stage_hype(stream: GtaStream, report: Reporter) -> None:
@@ -377,8 +518,15 @@ def stage_hype(stream: GtaStream, report: Reporter) -> None:
     viewer = [signals.ViewerClip(**c) for c in _load_json(ws.viewer_clips, []) or []]
     clips_curve = signals.clips_series(viewer, seconds) if viewer else None
 
+    settings = load_gta_settings()
+    comments = load_comments(ws, stream, fetch_missing=False) if settings.comment_signal else []
     curve = hype.build_curve(
-        seconds, loudness_db=loudness, chat=chat, heat=heat, viewer_clips=clips_curve
+        seconds,
+        loudness_db=loudness,
+        chat=chat,
+        heat=heat,
+        viewer_clips=clips_curve,
+        comments=comments,
     )
     # Outside the analysed range there is no audio; markers there are noise.
     curve.markers = [m for m in curve.markers if start <= m.t < end]
@@ -622,6 +770,8 @@ def render_extras(settings: GtaSettings, reaction_text: str) -> render.Extras:
         punch_in_s=settings.punch_in_s,
         reaction_text=reaction_text if settings.reaction_text else "",
         watermark=watermark,
+        keywords=settings.keyword_highlight,
+        motion=settings.motion,
     )
 
 

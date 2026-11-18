@@ -17,6 +17,8 @@ import {
   MOMENT_LABEL,
   STATUS_LABEL,
   clock,
+  GTA_CAPTION_STYLES,
+  GTA_MOTION_LEVELS,
   gtaApi,
   parseClock,
   type FeedbackReport,
@@ -369,6 +371,8 @@ function StreamRow({
             {counts.qa_failed ? ` · ${counts.qa_failed} failed QA` : ''}
             {typeof signals.hype_markers === 'number' && ` · ${signals.hype_markers} hype markers`}
             {typeof signals.chat_messages === 'number' && ` · ${signals.chat_messages} chat msgs`}
+            {typeof signals.comments === 'number' && signals.comments > 0 && ` · ${signals.comments} comments read`}
+            {typeof signals.caption_parts === 'string' && ` · YouTube captions for ${signals.caption_parts} parts`}
           </p>
           {notes.length > 0 && <p className="mt-1 text-xs text-ink-500">Signals: {notes.join('; ')}</p>}
           {stream.error && <p className="mt-2 whitespace-pre-line text-xs text-signal-bad">{stream.error}</p>}
@@ -891,6 +895,10 @@ function SettingsTab() {
           watermark_corner: s.watermark_corner,
           punch_in: String(s.punch_in),
           reaction_text: String(s.reaction_text),
+          keyword_highlight: String(s.keyword_highlight),
+          motion: s.motion,
+          comment_signal: String(s.comment_signal),
+          youtube_captions: String(s.youtube_captions),
         }
         for (const f of NUMBER_FIELDS) next[f.key] = String(s[f.key])
         next.listen_interval_s = String(s.live.listen_interval_s)
@@ -921,6 +929,10 @@ function SettingsTab() {
       watermark_corner: draft.watermark_corner || 'top_right',
       punch_in: draft.punch_in === 'true',
       reaction_text: draft.reaction_text === 'true',
+      keyword_highlight: draft.keyword_highlight === 'true',
+      motion: draft.motion || settings.motion,
+      comment_signal: draft.comment_signal === 'true',
+      youtube_captions: draft.youtube_captions === 'true',
       caption_style: draft.caption_style || settings.caption_style,
       live,
     }
@@ -981,8 +993,28 @@ function SettingsTab() {
             value={draft.caption_style ?? ''}
             onChange={(e) => setDraft((d) => ({ ...d, caption_style: e.target.value }))}
           >
-            <option value="bold_pop">Bold Pop</option>
-            <option value="karaoke_fill">Karaoke Fill</option>
+            {GTA_CAPTION_STYLES.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <span className="mt-1 block text-ink-500">
+            {GTA_CAPTION_STYLES.find((option) => option.value === draft.caption_style)?.hint}
+          </span>
+        </label>
+        <label className="text-xs text-ink-400">
+          Motion (zooms on the stream frame only)
+          <select
+            className="field"
+            value={draft.motion ?? 'subtle'}
+            onChange={(e) => setDraft((d) => ({ ...d, motion: e.target.value }))}
+          >
+            {GTA_MOTION_LEVELS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
           </select>
         </label>
         <div className="sm:col-span-2">
@@ -1032,6 +1064,34 @@ function SettingsTab() {
               {key === 'punch_in' ? 'Punch-in zoom on the key moment' : 'Reaction text at the key moment'}
             </label>
           ))}
+          <label className="flex items-center gap-2 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              checked={draft.keyword_highlight === 'true'}
+              onChange={(e) => setDraft((d) => ({ ...d, keyword_highlight: String(e.target.checked) }))}
+            />
+            Highlight 3–8 key words in the captions
+          </label>
+        </div>
+        <div className="flex flex-col gap-2 text-xs text-ink-400 sm:col-span-2">
+          YouTube VODs
+          <label className="flex items-center gap-2 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              checked={draft.comment_signal === 'true'}
+              onChange={(e) => setDraft((d) => ({ ...d, comment_signal: String(e.target.checked) }))}
+            />
+            Use timestamps viewers wrote in the comments in the Hype Curve
+          </label>
+          <label className="flex items-center gap-2 text-sm text-ink-200">
+            <input
+              type="checkbox"
+              checked={draft.youtube_captions === 'true'}
+              onChange={(e) => setDraft((d) => ({ ...d, youtube_captions: String(e.target.checked) }))}
+            />
+            Use YouTube&rsquo;s own captions as the transcript when they look right (skips Whisper;
+            automatic captions have no punctuation)
+          </label>
         </div>
       </section>
       <div className="flex items-center gap-4">
