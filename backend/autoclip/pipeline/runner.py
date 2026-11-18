@@ -25,7 +25,7 @@ from ..db import store
 from ..db.models import Clip, Export, Job, Source, new_id, utcnow
 from ..db.models import Transcript as TranscriptRow
 from ..providers import build_provider, detection_config
-from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
+from . import Stage, captions, export, ffmpeg, highlights, prepare, segments, transcribe
 from . import judge as clip_judge
 from . import signals as audience_signals
 from . import youtube_captions as yt_captions
@@ -123,6 +123,10 @@ class JobWorkspace:
     def crop_path(self, clip_id: str) -> Path:
         return self.root / "crops" / f"{clip_id}.json"
 
+    def segments(self, clip_id: str) -> Path:
+        """The source spans of a joined (multi-part) clip; absent for ordinary clips."""
+        return self.root / "segments" / f"{clip_id}.json"
+
     def facecam(self, clip_id: str) -> Path:
         """Cached facecam detection for one clip (``null`` when there is none)."""
         return self.root / "facecam" / f"{clip_id}.json"
@@ -152,6 +156,18 @@ JOB_SCOPED_SETTINGS: tuple[tuple[str, str], ...] = (
     ("export", "ratio"),
     ("export", "layout"),
 )
+
+
+def clip_spans(workspace: JobWorkspace, clip: Clip) -> list[segments.Span] | None:
+    """The parts of a joined clip, clipped to its (possibly trimmed) envelope.
+
+    None for an ordinary clip - and for a joined one trimmed down to nothing,
+    which then renders as its plain envelope rather than failing.
+    """
+    spans = segments.load(workspace.segments(clip.id))
+    if not spans:
+        return None
+    return segments.clip_to(spans, clip.start_s, clip.end_s) or None
 
 
 def wants_facecam(layout: str, ratio: str, has_video: bool) -> bool:
@@ -598,6 +614,7 @@ class PipelineRunner:
         )
         if self.settings.export.ratio == "16:9":
             config = ReframeConfig(aspect_w=16, aspect_h=9)
+        config.framing = self.settings.export.framing
 
         detect_cams = wants_facecam(
             self.settings.export.layout, self.settings.export.ratio, self.source.has_video
@@ -608,8 +625,25 @@ class PipelineRunner:
             if detect_cams:
                 facecam_for_clip(self.workspace, clip, self.source)
             cached = self.workspace.crop_path(clip.id)
+            spans = clip_spans(self.workspace, clip)
             if cached.exists():
                 crop_paths[clip.id] = CropPath.load(cached)
+            elif spans:
+                # A joined clip: each part is framed on its own, then laid
+                # end to end on the joined timeline.
+                crop_paths[clip.id] = segments.joined_crop_path(
+                    [
+                        build_crop_path(
+                            source_path,
+                            start_s=span.start,
+                            end_s=span.end,
+                            transcript=transcript,
+                            config=config,
+                        )
+                        for span in spans
+                    ]
+                )
+                crop_paths[clip.id].save(cached)
             else:
                 crop_paths[clip.id] = build_crop_path(
                     source_path,
@@ -666,8 +700,18 @@ class PipelineRunner:
                 self._emit(stage, (index + 1) / len(clips), f"Exporting clip {index + 1}")
                 continue
 
-            crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
+            spans = clip_spans(self.workspace, clip)
             words = transcript.slice(clip.start_word, clip.end_word)
+            # A joined clip renders on its own timeline: words and silences
+            # move onto it, the gaps between its parts drop out.
+            start_s, end_s, clip_silences = clip.start_s, clip.end_s, silences
+            if spans:
+                words = segments.words_on_timeline(words, spans)
+                start_s, end_s = 0.0, segments.total(spans)
+                clip_silences = segments.silences_on_timeline(silences, spans)
+            crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(
+                clip, ratio, duration_s=end_s - start_s
+            )
             facecam = (
                 facecam_for_clip(self.workspace, clip, self.source)
                 if wants_facecam(self.settings.export.layout, ratio, self.source.has_video)
@@ -695,8 +739,8 @@ class PipelineRunner:
             request = export.ExportRequest(
                 source=source_path,
                 destination=destination,
-                start_s=clip.start_s,
-                end_s=clip.end_s,
+                start_s=start_s,
+                end_s=end_s,
                 crop_path=crop_path,
                 words=localised.words,
                 style=style,
@@ -707,19 +751,24 @@ class PipelineRunner:
                 has_audio=self.source.has_audio,
                 edit=edit.plan_for_clip(
                     self.settings.export,
-                    start_s=clip.start_s,
-                    end_s=clip.end_s,
+                    start_s=start_s,
+                    end_s=end_s,
                     words=words,
-                    silences=silences,
+                    silences=clip_silences,
                     title=localised.hook,
                     seed=clip.id,
-                    allow_motion=self.source.has_video and layout != "split",
+                    allow_motion=(
+                        self.source.has_video and layout != "split" and not crop_path.has_split
+                    ),
                     watermark=watermark,
                     display_words=localised.words if localised.applied else None,
                     flash_forward=clip.flash_forward,
-                    teaser=clip.teaser,
+                    # The model's tease line is in source time; a joined clip
+                    # needs it on its own timeline (dropped if it falls in a gap).
+                    teaser=segments.range_to_joined(clip.teaser, spans) if spans else clip.teaser,
                     motion_seed=clip.motion_seed,
                 ),
+                spans=segments.as_pairs(spans) if spans else None,
             )
 
             def clip_progress(fraction: float, i: int = index) -> None:
@@ -769,7 +818,9 @@ class PipelineRunner:
             for record in store.list_exports(clip.id)
         )
 
-    def _fallback_crop_path(self, clip: Clip, ratio: str) -> CropPath:
+    def _fallback_crop_path(
+        self, clip: Clip, ratio: str, *, duration_s: float | None = None
+    ) -> CropPath:
         """Centre crop for sources with no reframe data (audio-only, or a failure)."""
         from .reframe.croppath import centre_crop
 
@@ -778,7 +829,7 @@ class PipelineRunner:
         return centre_crop(
             info.width or width,
             info.height or height,
-            clip.end_s - clip.start_s,
+            duration_s if duration_s is not None else clip.end_s - clip.start_s,
             aspect_w=9 if ratio == "9:16" else (1 if ratio == "1:1" else 16),
             aspect_h=16 if ratio == "9:16" else (1 if ratio == "1:1" else 9),
         )

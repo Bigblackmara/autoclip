@@ -9,6 +9,7 @@ import { GtaMode } from './pages/GtaMode'
 import { Ingest } from './pages/Ingest'
 import { JobProgress } from './pages/JobProgress'
 import { LiveWatch } from './pages/LiveWatch'
+import { PickParts } from './pages/PickParts'
 import { Review } from './pages/Review'
 import { Settings } from './pages/Settings'
 
@@ -21,6 +22,7 @@ const router = createBrowserRouter([
       { path: 'jobs/:jobId', element: <JobProgress /> },
       { path: 'jobs/:jobId/clips', element: <Review /> },
       { path: 'explore', element: <Explore /> },
+      { path: 'jobs/:jobId/pick', element: <PickParts /> },
       { path: 'live', element: <LiveWatch /> },
       { path: 'gta', element: <GtaMode /> },
       { path: 'settings', element: <Settings /> },

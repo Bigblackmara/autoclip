@@ -290,6 +290,18 @@ def create_clip(clip: Clip) -> Clip:
     return clip
 
 
+def add_clips(clips: list[Clip]) -> list[Clip]:
+    """Insert clips alongside a job's existing ones (e.g. parts the user picked).
+
+    Unlike :func:`replace_clips` nothing is deleted, so the job's detected
+    clips, their edits and their exports are untouched. Writes every column
+    (editor fields at their defaults included), like :func:`create_clip`.
+    """
+    with connection() as conn:
+        conn.executemany(_CLIP_INSERT, [_clip_values(c) for c in clips])
+    return clips
+
+
 def get_clip(clip_id: str) -> Clip | None:
     with connection() as conn:
         row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()

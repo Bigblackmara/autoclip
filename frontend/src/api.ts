@@ -115,6 +115,20 @@ export const LAYOUTS: { value: Layout; label: string }[] = [
   { value: 'crop', label: 'Crop' },
 ]
 
+/**
+ * How each shot is framed. `auto` splits two far-apart speakers into top and
+ * bottom halves and fits faceless (screen/game) shots over a blurred copy;
+ * `fill` always crops; `split` splits any two-person shot; `fit` fits all.
+ */
+export type Framing = 'auto' | 'fill' | 'split' | 'fit'
+
+export const FRAMINGS: { value: Framing; label: string }[] = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'fill', label: 'Fill (crop)' },
+  { value: 'split', label: 'Split speakers' },
+  { value: 'fit', label: 'Fit (blurred)' },
+]
+
 export interface Word {
   text: string
   start: number
@@ -134,9 +148,11 @@ export interface CropSegment {
   width: number
   height: number
   keyframes: CropKeyframe[]
-  strategy: 'track' | 'wide' | 'general'
+  strategy: 'track' | 'wide' | 'general' | 'split'
   zoom: number
   fit: boolean
+  /** Two-speaker split: the top and bottom panes, in source pixels. */
+  panes?: { x: number; y: number; width: number; height: number }[]
 }
 
 /** Mirrors autoclip.pipeline.reframe.croppath.CropPath. */
@@ -207,6 +223,7 @@ export interface Settings {
     crf: number
     write_srt: boolean
     layout: Layout
+    framing: Framing
     // Short-form editing (normal-mode exports).
     pace: Pace
     hook_title: boolean

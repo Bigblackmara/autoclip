@@ -22,7 +22,7 @@ from . import edit as edit_module
 from . import ffmpeg
 from .captions import CaptionStyle
 from .edit import EditPlan
-from .reframe.croppath import CropPath, segment_crop_filter
+from .reframe.croppath import CropPath, CropRect, CropSegment, segment_crop_filter, split_at
 from .reframe.facecam import Facecam
 from .transcript import Word
 
@@ -84,6 +84,17 @@ class ExportRequest:
     #: words, music, watermark, forced fps, two-pass loudness). None renders
     #: the plain crop + captions export, as Live Watch does.
     edit: EditPlan | None = None
+    #: A multi-part clip: source spans (absolute seconds, play order) joined
+    #: into one video. When set, ``start_s``/``end_s``, ``words``,
+    #: ``crop_path`` and ``edit`` are all on the *joined* timeline (0 = start
+    #: of the first part; see :mod:`autoclip.pipeline.segments`), and each span
+    #: is read as its own seeked input. None for an ordinary one-span clip.
+    spans: list[tuple[float, float]] | None = None
+
+    @property
+    def input_count(self) -> int:
+        """Inputs carrying the source: one per span, or the single seeked one."""
+        return len(self.spans) if self.spans else 1
 
     @property
     def is_split(self) -> bool:
@@ -123,8 +134,9 @@ class InputLayout:
 
 
 def input_layout(request: ExportRequest) -> InputLayout:
-    """Inputs are: 0 source, then background, watermark and music when used."""
-    index = 1
+    """Inputs are: the source (one per span for a joined clip), then
+    background, watermark and music when used."""
+    index = request.input_count
     background = watermark = music = None
     if not request.has_video:
         background, index = index, index + 1
@@ -249,6 +261,84 @@ def split_caption_margin(style: CaptionStyle, out_h: int, top_h: int) -> float:
     return max(0.04, min(style.margin_v_ratio, ceiling))
 
 
+def speakers_caption_margin(style: CaptionStyle) -> float:
+    """Caption bottom margin that centres a two-line block on the split's seam.
+
+    In the two-speaker split the bottom of the frame is the second person's
+    face; the seam between the halves is the one place text covers nobody.
+    """
+    return max(0.04, 0.5 - style.size_ratio * 1.25)
+
+
+def source_inputs(request: ExportRequest) -> list[str]:
+    """ffmpeg input arguments for the source: one seeked input per span.
+
+    Seeking before ``-i`` decodes from the nearest keyframe and is far faster
+    than an output-side seek; modern ffmpeg keeps it frame-accurate. Reading
+    each part of a joined clip as its own input means the gaps between parts
+    are never decoded at all.
+    """
+    if request.spans:
+        args: list[str] = []
+        for start, end in request.spans:
+            args += ["-ss", f"{start:.4f}", "-t", f"{end - start:.4f}", "-i", str(request.source)]
+        return args
+    return [
+        "-ss",
+        f"{request.start_s:.4f}",
+        "-t",
+        f"{request.duration_s:.4f}",
+        "-i",
+        str(request.source),
+    ]
+
+
+def span_offsets(request: ExportRequest) -> list[float]:
+    """Where each span starts on the joined timeline ([0.0] for a plain clip)."""
+    if not request.spans:
+        return [0.0]
+    offsets: list[float] = []
+    total = 0.0
+    for start, end in request.spans:
+        offsets.append(total)
+        total += end - start
+    return offsets
+
+
+def _joined_video(request: ExportRequest, label: str) -> str:
+    """Concatenate the span inputs' pictures into ``label``."""
+    assert request.spans
+    parts = [
+        f"[{k}:v]trim=duration={end - start:.4f},setpts=PTS-STARTPTS[jv{k}]"
+        for k, (start, end) in enumerate(request.spans)
+    ]
+    joined = "".join(f"[jv{k}]" for k in range(len(request.spans)))
+    parts.append(f"{joined}concat=n={len(request.spans)}:v=1:a=0{label}")
+    return ";".join(parts)
+
+
+def joined_audio(request: ExportRequest) -> tuple[list[str], str]:
+    """Filter parts producing the clip's speech, and the label carrying it.
+
+    A plain clip reads ``[0:a]`` directly. A joined clip concatenates its span
+    inputs, with 12 ms fades either side of every join so the cut never clicks.
+    """
+    if not request.spans:
+        return [], "[0:a]"
+    parts: list[str] = []
+    for k, (start, end) in enumerate(request.spans):
+        duration = end - start
+        fade = min(0.012, duration / 4)
+        parts.append(
+            f"[{k}:a]atrim=duration={duration:.4f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={fade:.3f},"
+            f"afade=t=out:st={duration - fade:.3f}:d={fade:.3f}[ja{k}]"
+        )
+    joined = "".join(f"[ja{k}]" for k in range(len(request.spans)))
+    parts.append(f"{joined}concat=n={len(request.spans)}:v=0:a=1[ajoin]")
+    return parts, "[ajoin]"
+
+
 def _even(value: float) -> int:
     rounded = int(round(value))
     return max(2, rounded - rounded % 2)
@@ -300,24 +390,39 @@ def build_video_filtergraph(
     """Build the ``-filter_complex`` video chain for one clip."""
     out_w, out_h = ratio_dimensions(request.ratio)
     if not request.has_video:
+        background = input_layout(request).background
         return _captions_chain(
             request,
-            "[1:v]setsar=1,format=yuv420p[vbg]",
+            f"[{background}:v]setsar=1,format=yuv420p[vbg]",
             "[vbg]",
             subtitle_name=subtitle_name,
             fonts_name=fonts_name,
         )
 
     if request.is_split:
+        if request.spans:
+            graph = ";".join(
+                [
+                    _joined_video(request, "[vjoin]"),
+                    _split_chain(request, out_w, out_h, source="[vjoin]"),
+                ]
+            )
+        else:
+            graph = _split_chain(request, out_w, out_h)
         return _captions_chain(
             request,
-            _split_chain(request, out_w, out_h),
+            graph,
             "[vstack]",
             subtitle_name=subtitle_name,
             fonts_name=fonts_name,
         )
 
-    segments = request.crop_path.segments
+    crop_path = request.crop_path
+    offsets = span_offsets(request)
+    if request.spans:
+        # Every crop segment must come from exactly one part.
+        crop_path = split_at(crop_path, offsets[1:])
+    segments = crop_path.segments
     if not segments:
         raise ExportError("The crop path has no segments.")
 
@@ -328,20 +433,31 @@ def build_video_filtergraph(
         label = f"v{index}"
         labels.append(f"[{label}]")
 
-        if len(segments) == 1:
+        if request.spans:
+            # Each part is its own input whose time starts at 0: trim the
+            # segment out of the part it falls in, in that part's time.
+            part = _span_index(offsets, (segment.start_s + segment.end_s) / 2)
+            source_label = f"[s{index}]"
+            parts.append(
+                f"[{part}:v]trim=start={segment.start_s - offsets[part]:.4f}:"
+                f"end={segment.end_s - offsets[part]:.4f},setpts=PTS-STARTPTS{source_label}"
+            )
+        elif len(segments) == 1:
             # No trim needed; the input is already seeked to the clip.
             source_label = "[0:v]"
-            prefix = ""
         else:
             source_label = f"[s{index}]"
-            prefix = (
+            parts.append(
                 f"[0:v]trim=start={segment.start_s:.4f}:end={segment.end_s:.4f},"
                 f"setpts=PTS-STARTPTS{source_label}"
             )
-            parts.append(prefix)
 
         if segment.fit:
             parts.extend(_fit_chain(source_label, index, out_w, out_h))
+            continue
+
+        if segment.is_split and request.ratio in SPLIT_RATIOS:
+            parts.extend(_speakers_chain(source_label, segment, index, out_w, out_h))
             continue
 
         chain = [segment_crop_filter(segment)]
@@ -363,7 +479,45 @@ def build_video_filtergraph(
     )
 
 
-def _split_chain(request: ExportRequest, out_w: int, out_h: int) -> str:
+def _span_index(offsets: list[float], t: float) -> int:
+    """Which part of a joined clip timeline position ``t`` falls in."""
+    index = 0
+    for k, offset in enumerate(offsets):
+        if t >= offset:
+            index = k
+    return index
+
+
+#: Colour and thickness of the line between the two halves of a speaker split.
+SPEAKERS_DIVIDER = "0xFFF7EC@1"
+SPEAKERS_DIVIDER_PX = 6
+
+
+def _speakers_chain(
+    source_label: str, segment: CropSegment, index: int, out_w: int, out_h: int
+) -> list[str]:
+    """Two-speaker split: each pane cropped steady, stacked top/bottom into ``[v{index}]``."""
+    top, bottom = segment.panes
+    top_h = _even(out_h / 2)
+    bottom_h = out_h - top_h
+    divider_y = top_h - SPEAKERS_DIVIDER_PX // 2
+
+    def crop(rect: CropRect) -> str:
+        return f"crop={rect.width}:{rect.height}:{int(round(rect.x))}:{int(round(rect.y))}"
+
+    return [
+        f"{source_label}split=2[pa{index}][pb{index}]",
+        f"[pa{index}]{crop(top)},scale={out_w}:{top_h}:flags=lanczos,setsar=1[pt{index}]",
+        f"[pb{index}]{crop(bottom)},scale={out_w}:{bottom_h}:flags=lanczos,setsar=1[pu{index}]",
+        (
+            f"[pt{index}][pu{index}]vstack=inputs=2,"
+            f"drawbox=x=0:y={divider_y}:w={out_w}:h={SPEAKERS_DIVIDER_PX}:"
+            f"color={SPEAKERS_DIVIDER}:t=fill,setsar=1,format=yuv420p[v{index}]"
+        ),
+    ]
+
+
+def _split_chain(request: ExportRequest, out_w: int, out_h: int, *, source: str = "[0:v]") -> str:
     """Facecam panel stacked over a gameplay panel, producing ``[vstack]``."""
     assert request.facecam is not None
     geometry = split_geometry(request.facecam, request.crop_path, out_w, out_h)
@@ -372,7 +526,7 @@ def _split_chain(request: ExportRequest, out_w: int, out_h: int) -> str:
     bottom_h = out_h - geometry.top_h
     return ";".join(
         [
-            "[0:v]split=2[camsrc][gamesrc]",
+            f"{source}split=2[camsrc][gamesrc]",
             (
                 f"[camsrc]crop={cw}:{ch}:{cx}:{cy},"
                 f"scale={out_w}:{geometry.top_h}:flags=lanczos,setsar=1[cam]"
@@ -443,7 +597,13 @@ def _edit_video_chain(request: ExportRequest, current: str) -> tuple[list[str], 
 
     # Zooms would cut into the facecam panel of the split stack, and there is
     # nothing to zoom on an audio-only background.
-    if edit.has_motion and request.has_video and not request.is_split:
+    # ... nor into the halves of a two-speaker split.
+    if (
+        edit.has_motion
+        and request.has_video
+        and not request.is_split
+        and not request.crop_path.has_split
+    ):
         zoom = edit_module.zoom_filter(edit.zooms, edit.intro_zoom, out_w, out_h, fps)
         parts.append(f"{current}{zoom},setsar=1[ezoom]")
         current = "[ezoom]"
@@ -473,14 +633,16 @@ def build_edit_audio_graph(
     parts: list[str] = []
     speech: str | None = None
     if request.has_audio:
+        join_parts, audio_in = joined_audio(request)
+        parts.extend(join_parts)
         if request.is_cut:
             keeps = edit.kept(request.duration_s)
             if len(keeps) > 1:
                 labels = "".join(f"[ea{i}]" for i in range(len(keeps)))
-                parts.append(f"[0:a]asplit={len(keeps)}{labels}")
+                parts.append(f"{audio_in}asplit={len(keeps)}{labels}")
                 sources = [f"[ea{i}]" for i in range(len(keeps))]
             else:
-                sources = ["[0:a]"]
+                sources = [audio_in]
             for i, (keep, source) in enumerate(zip(keeps, sources, strict=True)):
                 fade = min(0.012, keep.duration / 4)
                 parts.append(
@@ -491,7 +653,7 @@ def build_edit_audio_graph(
             joined = "".join(f"[eac{i}]" for i in range(len(keeps)))
             parts.append(f"{joined}concat=n={len(keeps)}:v=0:a=1,{edit_module.AUDIO_FORMAT}[esp]")
         else:
-            parts.append(f"[0:a]{edit_module.AUDIO_FORMAT}[esp]")
+            parts.append(f"{audio_in}{edit_module.AUDIO_FORMAT}[esp]")
         speech = "[esp]"
 
     if edit.music is not None and music_index is not None:
@@ -637,6 +799,12 @@ def export_clip(
         if request.is_split and request.facecam is not None:
             top_h = split_geometry(request.facecam, request.crop_path, out_w, out_h).top_h
             margin_v_ratio = split_caption_margin(request.style, out_h, top_h)
+        elif (
+            request.has_video
+            and request.ratio in SPLIT_RATIOS
+            and request.crop_path.split_share >= 0.5
+        ):
+            margin_v_ratio = speakers_caption_margin(request.style)
         ass_path = captions_module.write_ass(
             workspace / "captions.ass",
             caption_words if request.burn_captions else [],
@@ -670,6 +838,15 @@ def export_clip(
     # The edited export mixes its audio inside the filtergraph (cuts, music)
     # and, with two-pass loudness, measures that exact mix first.
     audio_map = ["-map", "0:a?", "-af", build_audio_filtergraph(settings)]
+    if edit is None and request.spans:
+        # A joined clip's speech only exists inside the filtergraph.
+        audio_map = []
+        if request.has_audio:
+            join_parts, audio_in = joined_audio(request)
+            filtergraph = ";".join(
+                [filtergraph, *join_parts, f"{audio_in}{build_audio_filtergraph(settings)}[aout]"]
+            )
+            audio_map = ["-map", "[aout]"]
     if edit is not None:
         audio_map = []
         target = settings.loudness_lufs
@@ -678,16 +855,11 @@ def export_clip(
             measure_graph = build_edit_audio_graph(
                 request,
                 tail=edit_module.measure_filter(target=target, true_peak=LOUDNESS_TRUE_PEAK),
-                music_index=1 if edit.music is not None else None,
+                music_index=request.input_count if edit.music is not None else None,
             )
             if measure_graph is not None:
                 measure_inputs = [
-                    "-ss",
-                    f"{request.start_s:.4f}",
-                    "-t",
-                    f"{request.duration_s:.4f}",
-                    "-i",
-                    str(request.source),
+                    *source_inputs(request),
                     *(_music_input(edit.music) if edit.music is not None else []),
                 ]
                 measured = edit_module.measure_loudnorm(measure_inputs, measure_graph)
@@ -739,15 +911,7 @@ def export_clip(
     # and need no escaping regardless of the working directory.
     def render_args(video_args: list[str]) -> list[str]:
         return [
-            # Seeking before -i decodes from the nearest keyframe and is far
-            # faster than an output-side seek; modern ffmpeg keeps it
-            # frame-accurate.
-            "-ss",
-            f"{request.start_s:.4f}",
-            "-t",
-            f"{request.duration_s:.4f}",
-            "-i",
-            str(request.source),
+            *source_inputs(request),
             *background_input,
             *extra_inputs,
             "-filter_complex",
@@ -831,11 +995,12 @@ def export_clip(
         )
 
     log.info(
-        "Exported %s (%.1fs, %s, %s%s)",
+        "Exported %s (%.1fs, %s, %s%s%s)",
         request.destination.name,
         out_duration,
         request.ratio,
         "split" if request.is_split else "crop",
+        f", {len(request.spans)} parts joined" if request.spans else "",
         f"; {', '.join(edit.summary())}" if edit is not None and edit.summary() else "",
     )
     return request.destination

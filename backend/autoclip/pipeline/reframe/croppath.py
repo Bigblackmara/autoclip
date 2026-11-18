@@ -45,6 +45,9 @@ class Strategy(StrEnum):
     WIDE = "wide"
     #: No usable face; centre crop, optionally with a slow push-in.
     GENERAL = "general"
+    #: Two people far apart (a podcast two-shot): each gets their own half of
+    #: the frame, stacked top and bottom. See :attr:`CropSegment.panes`.
+    SPLIT = "split"
 
 
 @dataclass
@@ -54,6 +57,16 @@ class CropKeyframe:
     t: float
     x: float
     y: float
+
+
+@dataclass
+class CropRect:
+    """A fixed window in source pixels (top-left corner plus size)."""
+
+    x: float
+    y: float
+    width: int
+    height: int
 
 
 @dataclass
@@ -72,10 +85,20 @@ class CropSegment:
     #: wider than any crop of the target ratio can hold — cropping there would
     #: cut someone out of frame, which the acceptance bar forbids.
     fit: bool = False
+    #: Two-speaker split screen: the top and bottom halves of the output, each
+    #: a steady window around one person. Empty for every other strategy. The
+    #: segment's own ``width``/``height``/``keyframes`` still describe an
+    #: ordinary crop of the target ratio, used where a split can't render
+    #: (non-vertical ratios) and by the review preview.
+    panes: list[CropRect] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
+
+    @property
+    def is_split(self) -> bool:
+        return len(self.panes) == 2
 
     @property
     def is_static(self) -> bool:
@@ -101,6 +124,18 @@ class CropPath:
     def duration_s(self) -> float:
         return self.segments[-1].end_s if self.segments else 0.0
 
+    @property
+    def split_share(self) -> float:
+        """Fraction of the clip rendered as a two-speaker split (0..1)."""
+        total = self.duration_s
+        if total <= 0:
+            return 0.0
+        return sum(s.duration_s for s in self.segments if s.is_split) / total
+
+    @property
+    def has_split(self) -> bool:
+        return any(s.is_split for s in self.segments)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source_width": self.source_width,
@@ -123,6 +158,7 @@ class CropPath:
                     strategy=Strategy(raw.get("strategy", "general")),
                     zoom=raw.get("zoom", 0.0),
                     fit=raw.get("fit", False),
+                    panes=[CropRect(**p) for p in raw.get("panes") or []],
                 )
             )
         return cls(
@@ -144,6 +180,109 @@ class CropPath:
 # --------------------------------------------------------------------------
 # Construction helpers
 # --------------------------------------------------------------------------
+
+
+def fit_segment(start_s: float, end_s: float, source_width: int, source_height: int) -> CropSegment:
+    """The whole frame fitted over a blurred copy of itself.
+
+    The answer for screen recordings, slides and gameplay with no presenter: a
+    blind centre crop of those throws away most of what the viewer needs.
+    """
+    return CropSegment(
+        start_s=start_s,
+        end_s=end_s,
+        width=source_width,
+        height=source_height,
+        keyframes=[CropKeyframe(t=start_s, x=0.0, y=0.0)],
+        strategy=Strategy.GENERAL,
+        fit=True,
+    )
+
+
+def fit_path(source_width: int, source_height: int, duration_s: float) -> CropPath:
+    """A one-segment path that fits the whole clip (see :func:`fit_segment`)."""
+    return CropPath(
+        source_width=source_width,
+        source_height=source_height,
+        segments=[fit_segment(0.0, duration_s, source_width, source_height)],
+    )
+
+
+def shifted(segment: CropSegment, offset_s: float) -> CropSegment:
+    """A copy of ``segment`` moved ``offset_s`` later on the timeline."""
+    return CropSegment(
+        start_s=segment.start_s + offset_s,
+        end_s=segment.end_s + offset_s,
+        width=segment.width,
+        height=segment.height,
+        keyframes=[CropKeyframe(k.t + offset_s, k.x, k.y) for k in segment.keyframes],
+        strategy=segment.strategy,
+        zoom=segment.zoom,
+        fit=segment.fit,
+        panes=[CropRect(p.x, p.y, p.width, p.height) for p in segment.panes],
+    )
+
+
+def join_paths(paths: list[CropPath]) -> CropPath:
+    """Concatenate per-part crop paths onto one joined timeline.
+
+    Each path covers its own part from 0; part ``k`` is shifted by the summed
+    length of the parts before it, so segment boundaries land exactly on the
+    joins and no segment ever straddles two parts.
+
+    Preconditions:
+        ``paths`` is non-empty and every path has at least one segment.
+    """
+    offset = 0.0
+    segments: list[CropSegment] = []
+    for path in paths:
+        segments.extend(shifted(s, offset) for s in path.segments)
+        offset += path.duration_s
+    return CropPath(
+        source_width=paths[0].source_width,
+        source_height=paths[0].source_height,
+        segments=segments,
+    )
+
+
+def split_at(path: CropPath, times: list[float]) -> CropPath:
+    """Cut segments at ``times`` (e.g. the joins of a multi-part clip).
+
+    Keyframes are left as they are — they're absolute on the timeline, so each
+    piece still evaluates to the same positions. A path built by
+    :func:`join_paths` comes back unchanged; this is for paths that weren't,
+    such as a centre-crop fallback spanning the whole joined clip.
+    """
+    cuts = sorted(t for t in times if t > 0)
+    out: list[CropSegment] = []
+    for segment in path.segments:
+        edges = [segment.start_s]
+        edges += [t for t in cuts if segment.start_s + 1e-6 < t < segment.end_s - 1e-6]
+        edges.append(segment.end_s)
+        for a, b in zip(edges, edges[1:], strict=False):
+            piece = shifted(segment, 0.0)
+            piece.start_s, piece.end_s = a, b
+            inside = [k for k in piece.keyframes if a <= k.t <= b]
+            if not inside or inside[0].t > a:
+                at = _position_at(segment.keyframes, a)
+                inside.insert(0, CropKeyframe(a, at[0], at[1]))
+            piece.keyframes = inside
+            out.append(piece)
+    return CropPath(path.source_width, path.source_height, out)
+
+
+def _position_at(keyframes: list[CropKeyframe], t: float) -> tuple[float, float]:
+    """Linear interpolation of the crop position at ``t``."""
+    if not keyframes:
+        return 0.0, 0.0
+    if t <= keyframes[0].t:
+        return keyframes[0].x, keyframes[0].y
+    for k0, k1 in zip(keyframes, keyframes[1:], strict=False):
+        if k0.t <= t <= k1.t:
+            span = k1.t - k0.t
+            r = (t - k0.t) / span if span > 0 else 0.0
+            return k0.x + (k1.x - k0.x) * r, k0.y + (k1.y - k0.y) * r
+    return keyframes[-1].x, keyframes[-1].y
 
 
 def target_crop_size(
