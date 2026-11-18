@@ -4,7 +4,7 @@
  *
  * To add a page: register its route in routes.tsx, then add one line here.
  * Entries whose route isn't registered yet are hidden automatically, so an
- * entry can land before its page does (Schedule and Autopilot below).
+ * entry can land before its page does.
  */
 
 import {

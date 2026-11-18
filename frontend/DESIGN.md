@@ -25,9 +25,7 @@ CSS variables).
    the item up, e.g. `['/jobs/*']`).
 
    **Entries whose route isn't registered are hidden automatically**
-   (`isRouteRegistered` in routes.tsx), so `Schedule` (`/schedule`) and
-   `Autopilot` (`/autopilot`) are already in `NAV_ITEMS` and appear as soon as
-   their routes are added.
+   (`isRouteRegistered` in routes.tsx), so an entry can land before its page.
 
 The sidebar (desktop, collapsible), the phone drawer and the active state all
 read from `NAV_ITEMS`; nothing else needs touching.
