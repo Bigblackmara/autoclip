@@ -75,8 +75,8 @@ export function Toast({ toast, onDismiss }: { toast: ToastMessage | null; onDism
     <div className="pointer-events-none fixed inset-x-4 bottom-4 z-40 flex justify-end sm:inset-x-auto sm:right-6 sm:bottom-6">
       <div
         role="status"
-        className={`rise pointer-events-auto flex max-w-md items-start gap-4 border-l-2 bg-ink-800 py-3 pr-2 pl-4 shadow-[0_12px_40px_-12px_rgb(0_0_0/0.7)] ${
-          toast.tone === 'good' ? 'border-signal-good' : 'border-signal-bad'
+        className={`rise pointer-events-auto flex max-w-md items-start gap-4 rounded-xl border border-l-4 border-line bg-surface py-3 pr-2 pl-4 shadow-[var(--shadow-pop)] ${
+          toast.tone === 'good' ? 'border-l-success' : 'border-l-danger'
         }`}
       >
         <p className="pt-0.5 text-sm leading-relaxed text-ink-100">{toast.text}</p>
@@ -168,7 +168,7 @@ export function Spinner({ className = '' }: { className?: string }) {
   return (
     <span
       aria-hidden
-      className={`inline-block size-3 shrink-0 animate-spin rounded-full border border-ink-600 border-t-sodium-500 ${className}`}
+      className={`inline-block size-3 shrink-0 animate-spin rounded-full border-2 border-line-strong border-t-accent ${className}`}
     />
   )
 }

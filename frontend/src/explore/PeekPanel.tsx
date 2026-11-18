@@ -100,8 +100,8 @@ export function PeekPanel({ target, onClose }: { target: PeekTarget; onClose: ()
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end" role="dialog" aria-modal="true" aria-label={title}>
-      <button type="button" className="absolute inset-0 bg-ink-900/70" onClick={onClose} aria-label="Close preview" />
-      <aside className="relative flex h-full w-full max-w-2xl flex-col overflow-y-auto border-l border-ink-800 bg-ink-900 shadow-2xl">
+      <button type="button" className="absolute inset-0 bg-scrim" onClick={onClose} aria-label="Close preview" />
+      <aside className="relative flex h-full w-full max-w-2xl flex-col overflow-y-auto border-l border-line bg-surface shadow-[var(--shadow-pop)]">
         <div className="flex items-center justify-between border-b border-ink-800 px-6 py-3">
           <span className="eyebrow">Peek</span>
           <button type="button" onClick={onClose} className="btn btn-quiet" aria-label="Close">

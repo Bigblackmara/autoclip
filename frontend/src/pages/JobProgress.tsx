@@ -1,18 +1,35 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 
 import { api, formatDuration } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 import { useJobStream } from '../useJobStream'
+import {
+  Badge,
+  Button,
+  ButtonLink,
+  Card,
+  CheckIcon,
+  PageHeader,
+  PageSkeleton,
+  ProgressBar,
+  RefreshIcon,
+  ScissorsIcon,
+  Spinner,
+  XIcon,
+  cx,
+  type Tone,
+} from '../ui'
 
 /** Stage order and labels, mirroring autoclip.pipeline.Stage. */
 const STAGES = [
-  { key: 'prepare', label: 'Prepare', note: 'Extracting audio and thumbnails' },
-  { key: 'transcribe', label: 'Transcribe', note: 'Word-level timing' },
-  { key: 'highlights', label: 'Highlights', note: 'Choosing the moments worth cutting' },
-  { key: 'reframe', label: 'Reframe', note: 'Tracking the speaker into vertical' },
-  { key: 'captions', label: 'Captions', note: 'Building subtitle timing' },
-  { key: 'export', label: 'Export', note: 'Rendering clips' },
+  { key: 'prepare', label: 'Getting the video ready', note: 'Extracting audio and thumbnails' },
+  { key: 'transcribe', label: 'Writing down every word', note: 'Word-level timing for captions' },
+  { key: 'highlights', label: 'Finding the best moments', note: 'The AI picks what is worth cutting' },
+  { key: 'reframe', label: 'Reframing to vertical', note: 'Following the speaker into 9:16' },
+  { key: 'captions', label: 'Timing the captions', note: 'Building subtitle timing' },
+  { key: 'export', label: 'Rendering clips', note: 'Making the video files' },
+
 ] as const
 
 export function JobProgress() {
@@ -36,7 +53,7 @@ export function JobProgress() {
   }, [job?.status, job?.id, navigate])
 
   if (!job) {
-    return <p className="pt-24 text-sm text-ink-500">Loading…</p>
+    return <PageSkeleton cards={1} />
   }
 
   const activeIndex = STAGES.findIndex((s) => s.key === job.current_stage)
@@ -69,143 +86,166 @@ export function JobProgress() {
     }
   }
 
-  return (
-    <div className="pt-14">
-      <div className="rise flex flex-wrap items-baseline justify-between gap-6 border-b border-ink-800 pb-6">
-        <div className="min-w-0">
-          <p className="eyebrow">{job.status}</p>
-          <h1 className="mt-2 max-w-3xl truncate font-display text-[clamp(1.75rem,4vw,3rem)] leading-tight text-ink-100">
-            {job.source?.title || 'Untitled'}
-          </h1>
-          {job.source && (
-            <p className="numeric mt-2 text-xs text-ink-500">
-              {formatDuration(job.source.duration_s)}
-              {job.source.width ? ` · ${job.source.width}×${job.source.height}` : ''} ·{' '}
-              {job.provider}
-            </p>
-          )}
-        </div>
+  const statusLook: Record<string, { tone: Tone; label: string }> = {
+    queued: { tone: 'neutral', label: 'Waiting to start' },
+    running: { tone: 'accent', label: 'Working on it' },
+    done: { tone: 'success', label: 'Finished' },
+    failed: { tone: 'danger', label: 'Stopped with an error' },
+    cancelled: { tone: 'neutral', label: 'Cancelled' },
+  }
+  const look = statusLook[job.status] ?? { tone: 'neutral' as Tone, label: job.status }
 
-        <div className="flex items-baseline gap-8">
-          <span className="numeric font-display text-[clamp(2.5rem,6vw,4rem)] leading-none text-sodium-500">
-            {percent}
-            <span className="text-2xl text-ink-600">%</span>
-          </span>
-          {(job.status === 'running' || job.status === 'queued') && (
-            <button onClick={cancel} disabled={cancelling} className="btn btn-ghost">
-              {cancelling ? 'Cancelling…' : 'Cancel'}
-            </button>
-          )}
-          {(job.status === 'failed' || job.status === 'cancelled') && (
-            <button onClick={retry} disabled={retrying} className="btn btn-primary">
-              {retrying ? 'Retrying…' : 'Retry'}
-            </button>
-          )}
-          {job.status === 'done' && (
-            <Link to={`/jobs/${job.id}/pick`} className="btn btn-ghost">
-              Pick parts
-            </Link>
-          )}
-          {job.status === 'done' && (
-            <button onClick={() => navigate(`/jobs/${job.id}/clips`)} className="btn btn-primary">
-              Review clips
-            </button>
-          )}
-        </div>
-      </div>
+  return (
+    <div>
+      <PageHeader
+        back={{ to: '/projects', label: 'All projects' }}
+        eyebrow={
+          <Badge tone={look.tone} dot pulse={job.status === 'running'}>
+            {look.label}
+          </Badge>
+        }
+        title={job.source?.title || 'Untitled'}
+        description={
+          job.source ? (
+            <span className="numeric">
+              {formatDuration(job.source.duration_s)}
+              {job.source.width ? ` · ${job.source.width}×${job.source.height}` : ''} · {job.provider}
+            </span>
+          ) : undefined
+        }
+        actions={
+          <>
+            {(job.status === 'running' || job.status === 'queued') && (
+              <Button onClick={cancel} loading={cancelling} icon={XIcon}>
+                {cancelling ? 'Cancelling…' : 'Cancel'}
+              </Button>
+            )}
+            {(job.status === 'failed' || job.status === 'cancelled') && (
+              <Button variant="primary" onClick={retry} loading={retrying} icon={RefreshIcon}>
+                {retrying ? 'Retrying…' : 'Try again'}
+              </Button>
+            )}
+            {job.status === 'done' && (
+              <ButtonLink to={`/jobs/${job.id}/pick`} icon={ScissorsIcon}>
+                Pick parts
+              </ButtonLink>
+            )}
+            {job.status === 'done' && (
+              <Button variant="primary" onClick={() => navigate(`/jobs/${job.id}/clips`)}>
+                Review clips
+              </Button>
+            )}
+          </>
+        }
+      />
 
       {job.error && (
-        <div className="mt-8 max-w-3xl">
+        <div className="mb-6 max-w-3xl">
           <ErrorNote error={new Error(job.error)} />
-          <p className="mt-3 text-xs text-ink-500">
-            Retrying resumes from the stage that failed — finished stages are not redone.
+          <p className="mt-2 text-xs text-fg-muted">
+            “Try again” resumes from the step that failed — finished steps are not redone.
           </p>
         </div>
       )}
 
       {actionError && (
-        <div className="mt-8 max-w-3xl">
+        <div className="mb-6 max-w-3xl">
           <ErrorNote error={actionError} onDismiss={() => setActionError(null)} />
         </div>
       )}
 
-      <ol className="mt-12 max-w-3xl">
-        {STAGES.map((stage, index) => {
-          // A failed job stopped *at* current_stage, so that stage must read as
-          // failed rather than as still running — otherwise the checklist claims
-          // work is in progress while the banner says it died.
-          const failedHere =
-            (job.status === 'failed' || job.status === 'cancelled') && index === activeIndex
+      <Card className="max-w-3xl" padding="lg">
+        <div className="flex items-end justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium text-fg-muted">Overall progress</p>
+            <p className="numeric mt-1 text-4xl font-bold tracking-tight text-fg">
+              {percent}
+              <span className="text-xl text-fg-subtle">%</span>
+            </p>
+          </div>
+          {job.status === 'running' && (
+            <p className="max-w-xs text-right text-xs text-fg-muted">
+              You can leave this page — the work keeps going and shows up in Projects.
+            </p>
+          )}
+        </div>
+        <ProgressBar
+          value={percent / 100}
+          className="mt-4 h-2"
+          tone={job.status === 'failed' ? 'danger' : job.status === 'done' ? 'success' : 'accent'}
+          label="Overall progress"
+        />
 
-          const state =
-            job.status === 'done' || (activeIndex >= 0 && index < activeIndex)
-              ? 'done'
-              : failedHere
-                ? 'stopped'
-                : index === activeIndex && job.status === 'running'
-                  ? 'active'
-                  : 'pending'
+        <ol className="mt-8 space-y-1">
+          {STAGES.map((stage, index) => {
+            // A failed job stopped *at* current_stage, so that stage must read as
+            // failed rather than as still running — otherwise the checklist claims
+            // work is in progress while the banner says it died.
+            const failedHere =
+              (job.status === 'failed' || job.status === 'cancelled') && index === activeIndex
 
-          const fraction =
-            state === 'done' ? 1 : state === 'active' ? (progress?.stageProgress ?? 0) : 0
+            const state =
+              job.status === 'done' || (activeIndex >= 0 && index < activeIndex)
+                ? 'done'
+                : failedHere
+                  ? 'stopped'
+                  : index === activeIndex && job.status === 'running'
+                    ? 'active'
+                    : 'pending'
 
-          return (
-            <li
-              key={stage.key}
-              className="rise grid grid-cols-[2.5rem_1fr] items-start gap-x-5 border-b border-ink-850 py-5"
-              style={{ animationDelay: `${index * 55}ms` }}
-            >
-              <span
-                className={[
-                  'numeric pt-0.5 text-xs',
-                  state === 'done'
-                    ? 'text-signal-good'
-                    : state === 'stopped'
-                      ? 'text-signal-bad'
-                      : state === 'active'
-                        ? 'text-sodium-500'
-                        : 'text-ink-600',
-                ].join(' ')}
+            const fraction =
+              state === 'done' ? 1 : state === 'active' ? (progress?.stageProgress ?? 0) : 0
+
+            return (
+              <li
+                key={stage.key}
+                className={cx(
+                  'grid grid-cols-[2rem_1fr] items-start gap-x-4 rounded-xl px-3 py-3',
+                  state === 'active' && 'bg-accent-soft/60',
+                )}
               >
-                {state === 'done' ? '✓' : state === 'stopped' ? '✕' : String(index + 1).padStart(2, '0')}
-              </span>
+                <span
+                  className={cx(
+                    'numeric grid size-8 place-items-center rounded-full text-xs font-semibold',
+                    state === 'done' && 'bg-success-soft text-success',
+                    state === 'stopped' && 'bg-danger-soft text-danger',
+                    state === 'active' && 'bg-accent text-accent-fg',
+                    state === 'pending' && 'bg-subtle text-fg-subtle',
+                  )}
+                >
+                  {state === 'done' ? (
+                    <CheckIcon size={15} />
+                  ) : state === 'stopped' ? (
+                    <XIcon size={15} />
+                  ) : state === 'active' ? (
+                    <Spinner size={14} />
+                  ) : (
+                    index + 1
+                  )}
+                </span>
 
-              <div>
-                <div className="flex flex-wrap items-baseline justify-between gap-x-4">
-                  <span
-                    className={[
-                      'text-[0.9375rem]',
-                      state === 'pending' ? 'text-ink-600' : 'text-ink-100',
-                    ].join(' ')}
-                  >
-                    {stage.label}
-                  </span>
-                  <span
-                    className={`text-xs ${state === 'stopped' ? 'text-signal-bad' : 'text-ink-500'}`}
-                  >
-                    {state === 'stopped'
-                      ? job.status === 'cancelled'
-                        ? 'cancelled here'
-                        : 'failed here'
-                      : state === 'active'
-                        ? (progress?.message ?? stage.note)
-                        : stage.note}
-                  </span>
+                <div className="min-w-0 pt-1">
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-4">
+                    <span className={cx('text-sm font-semibold', state === 'pending' ? 'text-fg-subtle' : 'text-fg')}>
+                      {stage.label}
+                    </span>
+                    <span className={cx('text-xs', state === 'stopped' ? 'text-danger' : 'text-fg-muted')}>
+                      {state === 'stopped'
+                        ? job.status === 'cancelled'
+                          ? 'cancelled here'
+                          : 'failed here'
+                        : state === 'active'
+                          ? (progress?.message ?? stage.note)
+                          : stage.note}
+                    </span>
+                  </div>
+                  {state === 'active' && <ProgressBar value={fraction} className="mt-2.5" label={stage.label} />}
                 </div>
-
-                {/* A hairline that fills. No track chrome — the rule below the
-                    row already provides the container. */}
-                <div className="mt-3 h-px w-full bg-ink-800">
-                  <div
-                    className="h-px origin-left bg-sodium-500 transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]"
-                    style={{ transform: `scaleX(${fraction})` }}
-                  />
-                </div>
-              </div>
-            </li>
-          )
-        })}
-      </ol>
+              </li>
+            )
+          })}
+        </ol>
+      </Card>
     </div>
   )
 }

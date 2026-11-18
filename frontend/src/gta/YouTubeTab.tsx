@@ -150,7 +150,7 @@ export function YouTubeTab() {
   }
 
   return (
-    <div className="mt-8 grid max-w-4xl gap-12">
+    <div className="grid max-w-4xl gap-6">
       {error && <p className="whitespace-pre-line text-sm text-signal-bad">{error}</p>}
       {note && <p className="text-sm text-signal-good">{note}</p>}
       <ConnectSection status={status} attestation={attestation} onChange={refreshAll} />
@@ -286,9 +286,9 @@ function ConnectSection({
   }
 
   return (
-    <section>
-      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-ink-800 pb-2">
-        <h2 className="eyebrow">YouTube channel</h2>
+    <section className="card min-w-0 p-5 sm:p-6">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-base font-semibold text-fg">YouTube channel</h2>
         <span className={`text-xs ${connected ? 'text-signal-good' : 'text-ink-500'}`}>
           {status === null
             ? 'checking…'
@@ -356,7 +356,7 @@ function ConnectSection({
               </p>
               {status?.redirect_uri && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <code ref={redirectRef} className="bg-ink-850 px-2 py-1 font-mono text-xs text-ink-200">
+                  <code ref={redirectRef} className="min-w-0 rounded-md bg-ink-850 px-2 py-1 font-mono text-xs break-all text-ink-200">
                     {status.redirect_uri}
                   </code>
                   <button type="button" className="btn btn-quiet" onClick={copyRedirect}>
@@ -475,9 +475,9 @@ function InstagramSection({
   const keySaved = info?.key_saved === true
 
   return (
-    <section>
-      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-ink-800 pb-2">
-        <h2 className="eyebrow">Instagram (via Zernio)</h2>
+    <section className="card min-w-0 p-5 sm:p-6">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-base font-semibold text-fg">Instagram (via Zernio)</h2>
         <span className={`text-xs ${keySaved ? 'text-signal-good' : 'text-ink-500'}`}>
           {info === null ? 'checking…' : keySaved ? 'API key saved' : 'no API key'}
         </span>
@@ -637,8 +637,8 @@ function ScheduleSection({ overview, onChange }: { overview: PostingOverview; on
 
   const enabledPlatforms = PLATFORMS.filter((p) => saved[p])
   return (
-    <section>
-      <h2 className="eyebrow border-b border-ink-800 pb-2">Posting schedule</h2>
+    <section className="card min-w-0 p-5 sm:p-6">
+      <h2 className="text-base font-semibold text-fg">Posting schedule</h2>
       <div className="mt-5 grid gap-5 sm:grid-cols-2">
         <label className="flex items-center gap-3 text-sm text-ink-100 sm:col-span-2">
           <input
@@ -787,8 +787,8 @@ function PlanSection({ overview }: { overview: PostingOverview }) {
     else slots.push({ slot_at: entry.slot_at, entries: [entry] })
   }
   return (
-    <section>
-      <h2 className="eyebrow border-b border-ink-800 pb-2">Coming up</h2>
+    <section className="card min-w-0 p-5 sm:p-6">
+      <h2 className="text-base font-semibold text-fg">Coming up</h2>
       {slots.length === 0 ? (
         <p className="mt-3 text-sm text-ink-500">No posting times set, or no platform selected.</p>
       ) : (
@@ -835,8 +835,8 @@ function HistorySection({ overview, onChange }: { overview: PostingOverview; onC
     }
   }
   return (
-    <section>
-      <h2 className="eyebrow border-b border-ink-800 pb-2">Uploads</h2>
+    <section className="card min-w-0 p-5 sm:p-6">
+      <h2 className="text-base font-semibold text-fg">Uploads</h2>
       {error && <p className="mt-3 text-sm text-signal-bad">{error}</p>}
       {uploads.length === 0 ? (
         <p className="mt-3 text-sm text-ink-500">Nothing uploaded yet.</p>

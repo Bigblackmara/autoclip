@@ -20,6 +20,7 @@ import { LiveSettingsSection } from '../live/LiveSettingsSection'
 import { StreamsPanel } from '../live/StreamsPanel'
 import { LiveAnnouncer, Toast, type ToastMessage } from '../live/ui'
 import { takePendingConnect } from '../live/UploadsSettings'
+import { Badge, Button, Card, PageHeader, RadioIcon, SettingsIcon, Tabs, tabPanelProps } from '../ui'
 
 type View = 'watch' | 'settings'
 
@@ -43,12 +44,9 @@ export function LiveWatch() {
   const [focusUploads, setFocusUploads] = useState(0)
   const [authRefresh, setAuthRefresh] = useState(0)
   const [toast, setToast] = useState<ToastMessage | null>(null)
-  const tabs = useRef(new Map<View, HTMLButtonElement>())
   const settingsSeen = useRef(false)
   const returnHandled = useRef(false)
   const baseId = useId()
-  const tabId = (key: View) => `${baseId}-tab-${key}`
-  const panelId = (key: View) => `${baseId}-panel-${key}`
 
   // Follow the URL when it changes underneath us (back/forward, the top nav).
   useEffect(() => {
@@ -158,114 +156,67 @@ export function LiveWatch() {
 
   const dismissToast = useCallback(() => setToast(null), [])
 
-  const onTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
-    const last = VIEWS.length - 1
-    const target =
-      event.key === 'ArrowRight'
-        ? index === last
-          ? 0
-          : index + 1
-        : event.key === 'ArrowLeft'
-          ? index === 0
-            ? last
-            : index - 1
-          : event.key === 'Home'
-            ? 0
-            : event.key === 'End'
-              ? last
-              : null
-    if (target === null) return
-    event.preventDefault()
-    const next = VIEWS[target].key
-    showView(next)
-    tabs.current.get(next)?.focus()
-  }
-
-  const eyebrow = !status
-    ? 'Live'
-    : !status.enabled
-      ? 'Live · off'
-      : status.running === false
-        ? 'Live · not running'
-        : 'Live · on'
+  const liveBadge = !status ? null : !status.enabled ? (
+    <Badge>Off</Badge>
+  ) : status.running === false ? (
+    <Badge tone="warn" dot>
+      On · not running
+    </Badge>
+  ) : (
+    <Badge tone="success" dot pulse>
+      On
+    </Badge>
+  )
 
   return (
-    <div className="pt-14">
+    <div>
       <LiveAnnouncer />
 
-      <header className="rise">
-        <p className="eyebrow">{eyebrow}</p>
-        <h1 className="mt-3 font-display text-[clamp(2rem,4vw,3rem)] leading-none text-ink-100">
-          Live Watch
-        </h1>
-        <p className="mt-4 max-w-2xl text-[0.9375rem] leading-relaxed text-ink-300">
-          Watch livestreams around the clock. When chat and audio spike and the judge agrees,
-          the moment is cut into a captioned vertical clip while the stream is still going.
-        </p>
-        <p className="mt-3 max-w-2xl text-xs leading-relaxed text-ink-500">
-          Clip only streams you have the rights or permission to repost.{' '}
-          <button
-            onClick={openUploadSettings}
-            className="text-ink-300 underline underline-offset-4 transition-colors hover:text-sodium-400"
-          >
+      <PageHeader
+        eyebrow={liveBadge}
+        title="Live Watch"
+        description="Watch livestreams around the clock. When chat and audio spike and the judge agrees, the moment becomes a captioned vertical clip while the stream is still going."
+        actions={
+          <Button icon={SettingsIcon} onClick={openUploadSettings}>
             Rights &amp; uploads
-          </button>
-        </p>
-      </header>
-
-      <div
-        role="tablist"
-        aria-label="Live Watch"
-        className="rise mt-10 flex gap-8 border-b border-ink-800"
-        style={{ animationDelay: '60ms' }}
+          </Button>
+        }
       >
-        {VIEWS.map((item, index) => {
-          const active = view === item.key
-          return (
-            <button
-              key={item.key}
-              ref={(element) => {
-                if (element) tabs.current.set(item.key, element)
-                else tabs.current.delete(item.key)
-              }}
-              role="tab"
-              id={tabId(item.key)}
-              aria-selected={active}
-              aria-controls={panelId(item.key)}
-              tabIndex={active ? 0 : -1}
-              onClick={() => showView(item.key)}
-              onKeyDown={(event) => onTabKeyDown(event, index)}
-              className={`-mb-px inline-flex items-center gap-2 border-b-2 pb-3 text-sm font-medium transition-colors duration-200 ${
-                active ? 'border-sodium-500 text-ink-100' : 'border-transparent text-ink-400 hover:text-ink-200'
-              }`}
-            >
-              {item.label}
-              {item.key === 'settings' && settingsDirty && (
+        <Tabs
+          label="Live Watch"
+          idBase={baseId}
+          items={VIEWS.map((item) => ({
+            key: item.key,
+            label: item.label,
+            icon: item.key === 'watch' ? RadioIcon : SettingsIcon,
+            badge:
+              item.key === 'settings' && settingsDirty ? (
                 <>
-                  <span aria-hidden className="size-1.5 rounded-full bg-sodium-500" />
+                  <span aria-hidden className="size-1.5 rounded-full bg-accent" />
                   <span className="sr-only">(unsaved changes)</span>
                 </>
-              )}
-            </button>
-          )
-        })}
-      </div>
-
-      <div
-        role="tabpanel"
-        id={panelId('watch')}
-        aria-labelledby={tabId('watch')}
-        hidden={view !== 'watch'}
-        className="pt-10"
-      >
-        <StreamsPanel
-          onStreamsChange={handleStreams}
-          onStreamRemoved={handleRemoved}
-          onStatusChange={setStatus}
-          onRequestEnable={requestEnable}
-          refreshSignal={streamsRefresh}
+              ) : undefined,
+          }))}
+          value={view}
+          onChange={showView}
         />
-        <div className="mt-16">
+      </PageHeader>
+
+      <p className="-mt-2 mb-6 text-xs leading-relaxed text-fg-muted">
+        Clip only streams you have the rights or permission to repost.
+      </p>
+
+      <div {...tabPanelProps(baseId, 'watch')} hidden={view !== 'watch'}>
+        <Card padding="md">
+          <StreamsPanel
+            onStreamsChange={handleStreams}
+            onStreamRemoved={handleRemoved}
+            onStatusChange={setStatus}
+            onRequestEnable={requestEnable}
+            refreshSignal={streamsRefresh}
+          />
+        </Card>
+        <Card padding="md" className="mt-6">
           <ClipsPanel
             streams={streams}
             removedStream={removedStream}
@@ -273,15 +224,10 @@ export function LiveWatch() {
             liveEnabled={status ? status.enabled : null}
             onOpenUploadSettings={openUploadSettings}
           />
-        </div>
+        </Card>
       </div>
 
-      <div
-        role="tabpanel"
-        id={panelId('settings')}
-        aria-labelledby={tabId('settings')}
-        hidden={view !== 'settings'}
-      >
+      <div {...tabPanelProps(baseId, 'settings')} hidden={view !== 'settings'}>
         <LiveSettingsSection
           onSettingsChange={handleSettings}
           onDirtyChange={setSettingsDirty}

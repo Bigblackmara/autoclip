@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useParams } from 'react-router-dom'
 
 import {
   api,
@@ -19,8 +19,36 @@ import { ClipTextEditor } from '../components/ClipTextEditor'
 import { ClipPlayer } from '../components/ClipPlayer'
 import { ErrorNote } from '../components/ErrorNote'
 import { TrimBar } from '../components/TrimBar'
+import {
+  Badge,
+  Button,
+  ButtonLink,
+  Card,
+  CheckIcon,
+  DownloadIcon,
+  EmptyState,
+  FilmIcon,
+  PageHeader,
+  PageSkeleton,
+  RefreshIcon,
+  ScissorsIcon,
+  Segmented,
+  SparklesIcon,
+  Tabs,
+  TrashIcon,
+  XIcon,
+  cx,
+  tabPanelProps,
+} from '../ui'
 
 const RATIOS = ['9:16', '1:1', '16:9'] as const
+
+type EditorTab = 'text' | 'captions' | 'look'
+const EDITOR_TABS = [
+  { key: 'text', label: 'Hook & post text' },
+  { key: 'captions', label: 'Captions' },
+  { key: 'look', label: 'Style & layout' },
+] as const
 
 export function Review() {
   const { jobId } = useParams()
@@ -38,6 +66,9 @@ export function Review() {
   const [exportingKept, setExportingKept] = useState(false)
   const [makingVariant, setMakingVariant] = useState<string | null>(null)
   const [error, setError] = useState<Error | null>(null)
+  const [editorTab, setEditorTab] = useState<EditorTab>('text')
+  const editorTabs = useId()
+
 
   useEffect(() => {
     if (!jobId) return
@@ -217,54 +248,62 @@ export function Review() {
 
   if (error && clips.length === 0) {
     return (
-      <div className="max-w-3xl pt-24">
+      <div className="max-w-3xl">
+        <PageHeader back={{ to: '/projects', label: 'All projects' }} title="Couldn't open these clips" />
         <ErrorNote error={error} />
       </div>
     )
   }
 
-  if (!job) return <p className="pt-24 text-sm text-ink-500">Loading…</p>
+  if (!job) return <PageSkeleton cards={2} />
 
   return (
-    <div className="pt-10">
-      <div className="flex flex-wrap items-baseline justify-between gap-4 border-b border-ink-800 pb-5">
-        <div className="min-w-0">
-          <Link to="/" className="eyebrow transition-colors hover:text-sodium-500">
-            ← All jobs
-          </Link>
-          <h1 className="mt-2 max-w-2xl truncate font-display text-[clamp(1.5rem,3vw,2.25rem)] leading-tight text-ink-100">
-            {job.source?.title || 'Untitled'}
-          </h1>
-        </div>
-
-        <div className="flex items-baseline gap-6">
-          <span className="numeric text-xs text-ink-500">
-            {clips.length} clips · {keptCount} kept
+    <div>
+      <PageHeader
+        back={{ to: '/projects', label: 'All projects' }}
+        title={job.source?.title || 'Untitled'}
+        description={
+          <span className="numeric">
+            {clips.length} clip{clips.length === 1 ? '' : 's'} · {keptCount} kept. Keep the ones you like, tweak
+            them, then export.
           </span>
-          <button
-            onClick={exportKept}
-            disabled={keptCount === 0 || exportingKept}
-            className="btn btn-primary"
-          >
-            {exportingKept ? 'Exporting…' : 'Export kept'}
-          </button>
-        </div>
-      </div>
+        }
+        actions={
+          <>
+            <ButtonLink to={`/jobs/${job.id}/pick`} icon={ScissorsIcon}>
+              Pick your own parts
+            </ButtonLink>
+            <Button
+              variant="primary"
+              icon={DownloadIcon}
+              onClick={exportKept}
+              disabled={keptCount === 0}
+              loading={exportingKept}
+              title={keptCount === 0 ? 'Keep at least one clip first' : undefined}
+            >
+              {exportingKept ? 'Exporting…' : `Export kept${keptCount ? ` (${keptCount})` : ''}`}
+            </Button>
+          </>
+        }
+      />
 
       {error && (
-        <div className="mt-6 max-w-3xl">
+        <div className="mb-6 max-w-3xl">
           <ErrorNote error={error} onDismiss={() => setError(null)} />
         </div>
       )}
 
       {clips.length === 0 ? (
-        <EmptyState />
+        <NoClips jobId={job.id} />
       ) : (
-        <div className="mt-8 grid gap-x-10 gap-y-10 lg:grid-cols-[minmax(0,20rem)_minmax(0,26rem)_minmax(0,1fr)]">
+        <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,19rem)_minmax(0,1fr)]">
           {/* Ranked list */}
-          <section className="lg:max-h-[76vh] lg:overflow-y-auto lg:pr-1">
-            <p className="eyebrow border-b border-ink-800 pb-2">Ranked</p>
-            <ul>
+          <Card padding="none" className="overflow-hidden lg:sticky lg:top-6">
+            <div className="flex items-baseline justify-between border-b border-line px-4 py-3">
+              <h2 className="text-sm font-semibold text-fg">Clips, best first</h2>
+              <span className="numeric text-xs text-fg-muted">{clips.length}</span>
+            </div>
+            <ul className="max-h-[22rem] divide-y divide-line overflow-y-auto lg:max-h-[calc(100vh-12rem)]">
               {clips.map((clip, index) => (
                 <li key={clip.id}>
                   <ClipRow
@@ -272,189 +311,240 @@ export function Review() {
                     index={index}
                     selected={clip.id === selectedId}
                     onSelect={() => setSelectedId(clip.id)}
-                    onKeep={() =>
-                      setStatus(clip, clip.status === 'kept' ? 'candidate' : 'kept')
-                    }
-                    onDiscard={() =>
-                      setStatus(clip, clip.status === 'discarded' ? 'candidate' : 'discarded')
-                    }
+                    onKeep={() => setStatus(clip, clip.status === 'kept' ? 'candidate' : 'kept')}
+                    onDiscard={() => setStatus(clip, clip.status === 'discarded' ? 'candidate' : 'discarded')}
                   />
                 </li>
               ))}
             </ul>
-          </section>
+          </Card>
 
-          {/* Player + trim */}
-          <section className="space-y-8">
-            {selected && jobId && (
-              <>
-                <ClipPlayer
-                  src={api.mediaUrl(jobId)}
-                  startS={selected.start_s}
-                  endS={selected.end_s}
-                  words={words}
-                  style={activeStyle}
-                  ratio={selected.ratio}
-                  cropPath={cropPath}
-                />
-                <TrimBar
-                  words={words}
-                  startS={selected.start_s}
-                  endS={selected.end_s}
-                  originalStart={selected.start_s}
-                  originalEnd={selected.end_s}
-                  onCommit={commitTrim}
-                />
-              </>
-            )}
-          </section>
+          {selected && jobId && (
+            <Card padding="none" className="min-w-0">
+              {/* Clip header: title, score, keep / drop, export */}
+              <div className="flex flex-wrap items-start justify-between gap-4 border-b border-line px-5 py-4 sm:px-6">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <ScoreBadge score={selected.score} />
+                    <span className="numeric text-xs text-fg-muted">{formatDuration(selected.duration_s)}</span>
+                    {selected.status === 'kept' && <Badge tone="success">Kept</Badge>}
+                    {selected.status === 'discarded' && <Badge>Dropped</Badge>}
+                    {selected.variant_of && <Badge tone="info">Variant</Badge>}
+                  </div>
+                  <h2 className="mt-1.5 text-lg font-semibold leading-snug text-fg">{selected.title || 'Untitled clip'}</h2>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    icon={CheckIcon}
+                    variant={selected.status === 'kept' ? 'primary' : 'secondary'}
+                    aria-pressed={selected.status === 'kept'}
+                    onClick={() => setStatus(selected, selected.status === 'kept' ? 'candidate' : 'kept')}
+                  >
+                    {selected.status === 'kept' ? 'Kept' : 'Keep'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={selected.status === 'discarded' ? RefreshIcon : TrashIcon}
+                    onClick={() =>
+                      setStatus(selected, selected.status === 'discarded' ? 'candidate' : 'discarded')
+                    }
+                  >
+                    {selected.status === 'discarded' ? 'Restore' : 'Drop'}
+                  </Button>
+                </div>
+              </div>
 
-          {/* Editor + style */}
-          <section className="space-y-10">
-            {selected && (
-              <>
-                <div>
-                  <p className="eyebrow">Why this clip</p>
-                  <p className="mt-2 max-w-prose text-[0.9375rem] leading-relaxed text-ink-300">
-                    {selected.reason || 'No rationale returned for this clip.'}
-                  </p>
-                  {selected.hook && (
-                    <p className="mt-3 border-l-2 border-ink-700 pl-3 font-display text-lg italic text-ink-200">
-                      “{selected.hook}”
+              <div className="grid gap-8 p-5 sm:p-6 xl:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
+                {/* Player + trim + export */}
+                <div className="min-w-0 space-y-6">
+                  <ClipPlayer
+                    src={api.mediaUrl(jobId)}
+                    startS={selected.start_s}
+                    endS={selected.end_s}
+                    words={words}
+                    style={activeStyle}
+                    ratio={selected.ratio}
+                    cropPath={cropPath}
+                  />
+                  <TrimBar
+                    words={words}
+                    startS={selected.start_s}
+                    endS={selected.end_s}
+                    originalStart={selected.start_s}
+                    originalEnd={selected.end_s}
+                    onCommit={commitTrim}
+                  />
+                  <div className="rounded-xl border border-line bg-subtle/60 p-4">
+                    <Button
+                      variant="primary"
+                      block
+                      icon={DownloadIcon}
+                      onClick={() => exportClip(selected)}
+                      loading={exporting.has(selected.id)}
+                    >
+                      {exporting.has(selected.id) ? 'Rendering…' : 'Export this clip'}
+                    </Button>
+                    <Button
+                      block
+                      className="mt-2"
+                      icon={SparklesIcon}
+                      onClick={() => makeVariant(selected)}
+                      disabled={makingVariant !== null}
+                      loading={makingVariant === selected.id}
+                      title="Same moment with the next caption style, zoom pattern and hook, so it can be posted again"
+                    >
+                      {makingVariant === selected.id ? 'Rendering variant…' : 'Make a variant'}
+                    </Button>
+                    <p className="mt-2 text-xs leading-snug text-fg-muted">
+                      A variant is the same moment with a different look, so you can post it again.
                     </p>
-                  )}
-                </div>
 
-                <ClipTextEditor clip={selected} onSave={(patch) => saveText(selected, patch)} />
-
-                <CaptionEditor
-                  words={words}
-                  onChange={(next) => {
-                    setWords(next)
-                    setWordsDirty(true)
-                  }}
-                  onSave={saveWords}
-                  saving={savingWords}
-                  dirty={wordsDirty}
-                />
-
-                <div>
-                  <p className="eyebrow border-b border-ink-800 pb-2">Caption style</p>
-                  <div className="mt-3 space-y-1">
-                    {styles.map((style) => (
-                      <button
-                        key={style.key}
-                        onClick={() => setStyle(selected, style.key)}
-                        aria-pressed={style.key === selected.caption_style}
-                        className={[
-                          'block w-full border-l-2 py-2 pl-3 text-left transition-colors duration-200',
-                          style.key === selected.caption_style
-                            ? 'border-sodium-500 bg-ink-850/60'
-                            : 'border-transparent hover:border-ink-700 hover:bg-ink-850/30',
-                        ].join(' ')}
-                      >
-                        <span className="text-sm text-ink-100">{style.label}</span>
-                        <span className="mt-0.5 block text-xs leading-snug text-ink-500">
-                          {style.description}
-                        </span>
-                      </button>
-                    ))}
+                    {selected.exports.length > 0 && (
+                      <div className="mt-4 border-t border-line pt-3">
+                        <p className="text-xs font-semibold text-fg">Downloads</p>
+                        <ul className="mt-2 space-y-1.5">
+                          {selected.exports.map((record) => (
+                            <li key={record.id} className="flex items-center justify-between gap-3 text-sm">
+                              <a
+                                href={record.download_url}
+                                download
+                                className="inline-flex min-w-0 items-center gap-1.5 font-medium text-accent-text hover:underline"
+                              >
+                                <DownloadIcon size={14} />
+                                <span className="truncate">
+                                  {record.ratio} · {record.style}
+                                </span>
+                              </a>
+                              <span className="numeric shrink-0 text-xs text-fg-muted">{formatBytes(record.size_bytes)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                   </div>
                 </div>
 
-                <div>
-                  <p className="eyebrow border-b border-ink-800 pb-2">Aspect ratio</p>
-                  <div className="mt-3 flex gap-2">
-                    {RATIOS.map((ratio) => (
-                      <button
-                        key={ratio}
-                        onClick={() => setRatio(selected, ratio)}
-                        aria-pressed={ratio === selected.ratio}
-                        className={[
-                          'numeric btn',
-                          ratio === selected.ratio ? 'btn-primary' : 'btn-ghost',
-                        ].join(' ')}
-                      >
-                        {ratio}
-                      </button>
-                    ))}
+                {/* Editing */}
+                <div className="min-w-0">
+                  <div className="rounded-xl bg-accent-soft/60 p-4">
+                    <p className="flex items-center gap-1.5 text-sm font-semibold text-fg">
+                      <SparklesIcon size={15} className="text-accent-text" />
+                      Why the AI picked this
+                    </p>
+                    <p className="mt-1.5 text-sm leading-relaxed text-fg-muted">
+                      {selected.reason || 'No reason was returned for this clip.'}
+                    </p>
+                    {selected.hook && (
+                      <p className="mt-2 border-l-2 border-accent pl-3 text-sm font-medium italic text-fg">“{selected.hook}”</p>
+                    )}
+                  </div>
+
+                  <Tabs
+                    className="mt-5"
+                    label="Edit this clip"
+                    idBase={editorTabs}
+                    items={EDITOR_TABS}
+                    value={editorTab}
+                    onChange={setEditorTab}
+                  />
+
+                  <div className="pt-5" {...tabPanelProps(editorTabs, editorTab)}>
+                    {editorTab === 'text' && (
+                      <ClipTextEditor clip={selected} onSave={(patch) => saveText(selected, patch)} />
+                    )}
+
+                    {editorTab === 'captions' && (
+                      <CaptionEditor
+                        words={words}
+                        onChange={(next) => {
+                          setWords(next)
+                          setWordsDirty(true)
+                        }}
+                        onSave={saveWords}
+                        saving={savingWords}
+                        dirty={wordsDirty}
+                      />
+                    )}
+
+                    {editorTab === 'look' && (
+                      <div className="space-y-7">
+                        <div>
+                          <p className="text-sm font-semibold text-fg">Caption style</p>
+                          <div className="mt-2.5 grid gap-2 sm:grid-cols-2">
+                            {styles.map((style) => {
+                              const active = style.key === selected.caption_style
+                              return (
+                                <button
+                                  key={style.key}
+                                  onClick={() => setStyle(selected, style.key)}
+                                  aria-pressed={active}
+                                  className={cx(
+                                    'rounded-xl border px-3.5 py-2.5 text-left transition-colors duration-150',
+                                    active
+                                      ? 'border-accent bg-accent-soft ring-1 ring-accent'
+                                      : 'border-line hover:border-line-strong hover:bg-subtle',
+                                  )}
+                                >
+                                  <span className="text-sm font-semibold text-fg">{style.label}</span>
+                                  <span className="mt-0.5 block text-xs leading-snug text-fg-muted">{style.description}</span>
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
+
+                        <div>
+                          <p className="mb-2.5 text-sm font-semibold text-fg">Shape</p>
+                          <Segmented
+                            label="Aspect ratio"
+                            options={RATIOS.map((r) => ({
+                              value: r,
+                              label: r === '9:16' ? '9:16 · Vertical' : r === '1:1' ? '1:1 · Square' : '16:9 · Wide',
+                            }))}
+                            value={selected.ratio as (typeof RATIOS)[number]}
+                            onChange={(ratio) => setRatio(selected, ratio)}
+                          />
+                        </div>
+
+                        <div>
+                          <p className="mb-2.5 text-sm font-semibold text-fg">Layout</p>
+                          <Segmented
+                            label="Layout"
+                            options={LAYOUTS.map(({ value, label }) => ({ value, label }))}
+                            value={layouts[selected.id] ?? selected.layout}
+                            onChange={(value) => setLayouts((all) => ({ ...all, [selected.id]: value }))}
+                            disabled={selected.ratio !== '9:16'}
+                          />
+                          <p className="mt-2 text-xs leading-snug text-fg-muted">
+                            {selected.ratio === '9:16'
+                              ? 'Facecam + gameplay stacks a streamer’s webcam above the game. Auto uses it only when a facecam overlay is found. Applies to the next export.'
+                              : 'Stacked layouts need 9:16; this shape always crops.'}
+                          </p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
-
-                <div>
-                  <p className="eyebrow border-b border-ink-800 pb-2">Layout</p>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {LAYOUTS.map(({ value, label }) => {
-                      const current = layouts[selected.id] ?? selected.layout
-                      return (
-                        <button
-                          key={value}
-                          onClick={() =>
-                            setLayouts((all) => ({ ...all, [selected.id]: value }))
-                          }
-                          aria-pressed={value === current}
-                          disabled={selected.ratio !== '9:16'}
-                          className={['btn', value === current ? 'btn-primary' : 'btn-ghost'].join(
-                            ' ',
-                          )}
-                        >
-                          {label}
-                        </button>
-                      )
-                    })}
-                  </div>
-                  <p className="mt-2 text-xs leading-snug text-ink-500">
-                    {selected.ratio === '9:16'
-                      ? 'Facecam + gameplay stacks a streamer’s webcam above the game. Auto uses it only when a facecam overlay is found.'
-                      : 'Stacked layouts need 9:16; this ratio always crops.'}
-                  </p>
-                </div>
-
-                <div className="border-t border-ink-800 pt-6">
-                  <button
-                    onClick={() => exportClip(selected)}
-                    disabled={exporting.has(selected.id)}
-                    className="btn btn-primary w-full"
-                  >
-                    {exporting.has(selected.id) ? 'Rendering…' : 'Export this clip'}
-                  </button>
-                  <button
-                    onClick={() => makeVariant(selected)}
-                    disabled={makingVariant !== null}
-                    className="btn btn-ghost mt-2 w-full"
-                    title="Same moment with the next caption style, zoom pattern and hook, so it can be posted again"
-                  >
-                    {makingVariant === selected.id ? 'Rendering variant…' : 'Make variant'}
-                  </button>
-
-                  {selected.exports.length > 0 && (
-                    <ul className="mt-4 space-y-2">
-                      {selected.exports.map((record) => (
-                        <li
-                          key={record.id}
-                          className="flex items-baseline justify-between gap-3 text-xs"
-                        >
-                          <a
-                            href={record.download_url}
-                            download
-                            className="truncate text-sodium-500 underline underline-offset-4"
-                          >
-                            {record.ratio} · {record.style}
-                          </a>
-                          <span className="numeric shrink-0 text-ink-600">
-                            {formatBytes(record.size_bytes)}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              </>
-            )}
-          </section>
+              </div>
+            </Card>
+          )}
         </div>
       )}
     </div>
+  )
+}
+
+function ScoreBadge({ score }: { score: number }) {
+  const tone = score >= 85 ? 'bg-accent text-accent-fg' : score >= 70 ? 'bg-accent-soft text-accent-text' : 'bg-subtle text-fg-muted'
+  return (
+    <span
+      className={cx('numeric inline-flex h-6 min-w-9 items-center justify-center rounded-full px-2 text-xs font-bold', tone)}
+      title="How strong the AI thinks this clip is, out of 100"
+    >
+      {score}
+    </span>
   )
 }
 
@@ -475,12 +565,12 @@ function ClipRow({
 }) {
   return (
     <div
-      className={[
-        'rise group grid cursor-pointer grid-cols-[2.25rem_1fr] gap-x-3 border-b border-ink-850 py-3 pl-2 transition-colors duration-200',
-        selected ? 'bg-ink-850/70' : 'hover:bg-ink-850/35',
-        clip.status === 'discarded' ? 'opacity-40' : '',
-      ].join(' ')}
-      style={{ animationDelay: `${Math.min(index, 10) * 35}ms` }}
+      className={cx(
+        'rise group relative grid cursor-pointer grid-cols-[auto_1fr] items-start gap-x-3 px-4 py-3 transition-colors duration-150',
+        selected ? 'bg-accent-soft' : 'hover:bg-subtle',
+        clip.status === 'discarded' && 'opacity-50',
+      )}
+      style={{ animationDelay: `${Math.min(index, 10) * 30}ms` }}
       onClick={onSelect}
       role="button"
       tabIndex={0}
@@ -495,39 +585,28 @@ function ClipRow({
         }
       }}
     >
-      {/* The score is the thing you scan by, so it gets the display face. */}
-      <span
-        className={[
-          'numeric self-start font-display text-2xl leading-none',
-          clip.score >= 85 ? 'text-sodium-500' : selected ? 'text-ink-200' : 'text-ink-500',
-        ].join(' ')}
-      >
-        {clip.score}
-      </span>
+      {selected && <span className="absolute inset-y-2 left-0 w-1 rounded-r-full bg-accent" aria-hidden />}
+      <ScoreBadge score={clip.score} />
 
       <div className="min-w-0">
-        <p className="truncate text-[0.9375rem] leading-snug text-ink-100">
+        <p className={cx('line-clamp-2 text-sm leading-snug', selected ? 'font-semibold text-fg' : 'font-medium text-fg')}>
           {clip.title || 'Untitled clip'}
         </p>
-        <div className="mt-1 flex items-baseline gap-3">
-          <span className="numeric text-xs text-ink-500">{formatDuration(clip.duration_s)}</span>
-          {clip.user_trimmed && <span className="text-xs text-ink-600">trimmed</span>}
-          {clip.variant_of && <span className="text-xs text-ink-500">variant</span>}
-          {clip.exports.length > 0 && (
-            <span className="text-xs text-signal-good">exported</span>
-          )}
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="numeric text-xs text-fg-muted">{formatDuration(clip.duration_s)}</span>
+          {clip.status === 'kept' && <span className="text-xs font-medium text-success">Kept</span>}
+          {clip.user_trimmed && <span className="text-xs text-fg-subtle">trimmed</span>}
+          {clip.variant_of && <span className="text-xs text-fg-subtle">variant</span>}
+          {clip.exports.length > 0 && <span className="text-xs font-medium text-success">exported</span>}
 
-          {/* Secondary actions appear on hover or when the row is current —
-              progressive disclosure keeps the scan column clean. */}
+          {/* Quick keep / drop: on hover, focus, or the current row. */}
           <span
-            className={[
-              'ml-auto flex gap-3 pr-2 transition-opacity duration-200',
+            className={cx(
+              'ml-auto flex gap-1 transition-opacity duration-150',
               // focus-within: keyboard users tabbing onto an invisible
               // button could not see what they were about to press.
-              selected
-                ? 'opacity-100'
-                : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
-            ].join(' ')}
+              selected ? 'opacity-100' : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100',
+            )}
           >
             <button
               onClick={(e) => {
@@ -536,9 +615,13 @@ function ClipRow({
               }}
               aria-pressed={clip.status === 'kept'}
               aria-label={`Keep ${clip.title || 'clip'}`}
-              className={`text-xs ${clip.status === 'kept' ? 'text-signal-good' : 'text-ink-400 hover:text-ink-100'}`}
+              title={clip.status === 'kept' ? 'Un-keep' : 'Keep'}
+              className={cx(
+                'grid size-7 place-items-center rounded-md transition-colors',
+                clip.status === 'kept' ? 'bg-success-soft text-success' : 'text-fg-muted hover:bg-surface hover:text-success',
+              )}
             >
-              {clip.status === 'kept' ? 'kept' : 'keep'}
+              <CheckIcon size={15} />
             </button>
             <button
               onClick={(e) => {
@@ -546,9 +629,10 @@ function ClipRow({
                 onDiscard()
               }}
               aria-label={`${clip.status === 'discarded' ? 'Restore' : 'Drop'} ${clip.title || 'clip'}`}
-              className="text-xs text-ink-400 hover:text-signal-bad"
+              title={clip.status === 'discarded' ? 'Restore' : 'Drop'}
+              className="grid size-7 place-items-center rounded-md text-fg-muted transition-colors hover:bg-surface hover:text-danger"
             >
-              {clip.status === 'discarded' ? 'undo' : 'drop'}
+              {clip.status === 'discarded' ? <RefreshIcon size={14} /> : <XIcon size={15} />}
             </button>
           </span>
         </div>
@@ -557,18 +641,20 @@ function ClipRow({
   )
 }
 
-function EmptyState() {
+function NoClips({ jobId }: { jobId: string }) {
   return (
-    <div className="max-w-xl pt-20">
-      <h2 className="font-display text-3xl text-ink-200">No clips came back.</h2>
-      <p className="mt-4 text-sm leading-relaxed text-ink-400">
-        The model found nothing self-contained enough to stand alone — which is a real
-        answer for some source material, not necessarily a failure.
-      </p>
-      <p className="mt-3 text-sm leading-relaxed text-ink-400">
-        If you expected clips, try a larger provider model, or widen the length range so
-        shorter moments qualify.
-      </p>
-    </div>
+    <EmptyState
+      icon={FilmIcon}
+      title="No clips came back"
+      description="The AI found nothing that stands on its own — a real answer for some videos. If you expected clips, try a bigger AI model or a wider clip length in Settings, or pick the parts yourself."
+      action={
+        <>
+          <ButtonLink to={`/jobs/${jobId}/pick`} variant="primary" icon={ScissorsIcon}>
+            Pick parts myself
+          </ButtonLink>
+          <ButtonLink to="/settings">Open Settings</ButtonLink>
+        </>
+      }
+    />
   )
 }

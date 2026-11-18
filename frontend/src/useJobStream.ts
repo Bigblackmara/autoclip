@@ -49,7 +49,9 @@ export function useJobStream(jobId: string | undefined) {
 
     source.addEventListener('snapshot', (event) => {
       const data = JSON.parse((event as MessageEvent).data) as Job
-      setJob(data)
+      // The stream's snapshot may leave out the source; keep the one the
+      // initial fetch returned so the page title doesn't drop to "Untitled".
+      setJob((current) => ({ ...data, source: data.source ?? current?.source ?? null }))
       if (['done', 'failed', 'cancelled'].includes(data.status)) close()
     })
 

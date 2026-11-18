@@ -7,7 +7,7 @@
  * view lives in the URL (?tab=...). Lists poll every few seconds while open.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
 import { ApiError } from '../api'
@@ -34,16 +34,56 @@ import {
   type UploadStatus,
 } from '../gta/api'
 import { YouTubeTab } from '../gta/YouTubeTab'
+import {
+  Badge,
+  Button,
+  Callout,
+  CaptionsIcon,
+  Card,
+  CheckIcon,
+  ChevronDownIcon,
+  CopyIcon,
+  EmptyState,
+  Field,
+  FilmIcon,
+  FolderIcon,
+  Input,
+  KeyIcon,
+  PageHeader,
+  PlayIcon,
+  PlusIcon,
+  ProgressBar,
+  RadioIcon,
+  RefreshIcon,
+  SectionTitle,
+  Select,
+  SendIcon,
+  SettingsIcon,
+  Skeleton,
+  SkeletonCard,
+  StampIcon,
+  Tabs,
+  Textarea,
+  Toggle,
+  TrashIcon,
+  TrendingIcon,
+  cx,
+  tabPanelProps,
+  useToast,
+  type TabItem,
+  type Tone,
+} from '../ui'
 
 type Tab = 'queue' | 'live' | 'youtube' | 'working' | 'settings'
 
-const TABS: readonly { key: Tab; label: string }[] = [
-  { key: 'queue', label: 'Streams & clips' },
-  { key: 'live', label: 'GTA Live' },
-  { key: 'youtube', label: 'Posting' },
-  { key: 'working', label: "What's working" },
-  { key: 'settings', label: 'Settings' },
+const TABS: readonly TabItem<Tab>[] = [
+  { key: 'queue', label: 'Streams & clips', icon: FilmIcon },
+  { key: 'live', label: 'GTA Live', icon: RadioIcon },
+  { key: 'youtube', label: 'Posting', icon: SendIcon },
+  { key: 'working', label: "What's working", icon: TrendingIcon },
+  { key: 'settings', label: 'Settings', icon: SettingsIcon },
 ]
+
 
 const POLL_MS = 2500
 
@@ -134,6 +174,7 @@ export function GtaMode() {
     refreshStreams()
     refreshClips()
   }, [refreshStreams, refreshClips])
+  const tabsId = useId()
 
   const show = (key: Tab) =>
     setParams(
@@ -150,53 +191,30 @@ export function GtaMode() {
   const liveStreams = (streams ?? []).filter((s) => s.is_live)
 
   return (
-    <div className="pt-10">
-      <header className="flex flex-wrap items-end justify-between gap-6 border-b border-ink-800 pb-5">
-        <div>
-          <p className="eyebrow">Separate mode</p>
-          <h1 className="font-display mt-1 text-4xl leading-none text-ink-100">
-            GTA <span className="italic text-sodium-500">Mode</span>
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-ink-400">
-            Face-cam streamers only. Hype Curve first, 12-minute chunks, two harsh judging rounds, the
-            whole stream frame uncropped over a blurred fill, QA on every clip.
-          </p>
-        </div>
-        <nav className="flex gap-5" role="tablist" aria-label="GTA Mode views">
-          {TABS.map((t) => (
-            <button
-              key={t.key}
-              role="tab"
-              aria-selected={tab === t.key}
-              onClick={() => show(t.key)}
-              className={`border-b-2 pb-1 text-sm font-medium transition-colors ${
-                tab === t.key
-                  ? 'border-sodium-500 text-sodium-500'
-                  : 'border-transparent text-ink-400 hover:text-ink-200'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-      </header>
+    <div>
+      <PageHeader
+        eyebrow={<Badge tone="accent">Separate mode</Badge>}
+        title="GTA Mode"
+        description="Strict clipping of face-cam streamers: finds the hype moments first, judges every pick twice, keeps the whole stream frame over a blurred fill, and checks each clip before it can be posted."
+      >
+        <Tabs label="GTA Mode sections" idBase={tabsId} items={TABS} value={tab} onChange={show} />
+      </PageHeader>
 
       {(streamsError || clipsError) && (
-        <p className="mt-6 whitespace-pre-line text-sm text-signal-bad">{streamsError || clipsError}</p>
+        <Callout tone="danger" className="mb-6">
+          <span className="whitespace-pre-line">{streamsError || clipsError}</span>
+        </Callout>
       )}
 
-      {tab === 'queue' && (
-        <QueueTab
-          streams={vodStreams}
-          clips={clips ?? []}
-          onChange={refresh}
-          loaded={streams !== null}
-        />
-      )}
-      {tab === 'live' && <LiveTab streams={liveStreams} clips={clips ?? []} onChange={refresh} />}
-      {tab === 'youtube' && <YouTubeTab />}
-      {tab === 'working' && <WorkingTab />}
-      {tab === 'settings' && <SettingsTab />}
+      <div {...tabPanelProps(tabsId, tab)}>
+        {tab === 'queue' && (
+          <QueueTab streams={vodStreams} clips={clips ?? []} onChange={refresh} loaded={streams !== null} />
+        )}
+        {tab === 'live' && <LiveTab streams={liveStreams} clips={clips ?? []} onChange={refresh} />}
+        {tab === 'youtube' && <YouTubeTab />}
+        {tab === 'working' && <WorkingTab />}
+        {tab === 'settings' && <SettingsTab />}
+      </div>
     </div>
   )
 }
@@ -221,22 +239,28 @@ function QueueTab({
   const byStream = useMemo(() => groupByStream(clips), [clips])
 
   return (
-    <div className="mt-8 grid gap-12">
+    <div className="grid gap-6">
       <AddStreams onAdded={onChange} />
-      <section>
-        <h2 className="eyebrow mb-3">Queue</h2>
-        {!loaded ? (
-          <p className="text-sm text-ink-500">Loading…</p>
-        ) : streams.length === 0 ? (
-          <p className="text-sm text-ink-500">No streams yet. Paste links above to start.</p>
-        ) : (
-          <ul className="divide-y divide-ink-800 border-y border-ink-800">
-            {streams.map((s) => (
-              <StreamRow key={s.id} stream={s} clips={byStream.get(s.id) ?? []} onChange={onChange} />
-            ))}
-          </ul>
-        )}
-      </section>
+      <Card padding="none" title="Queue" description="Streams being analysed, newest first.">
+        <div className="border-t border-line">
+          {!loaded ? (
+            <div className="space-y-3 p-5" aria-label="Loading">
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-3 w-1/3" />
+            </div>
+          ) : streams.length === 0 ? (
+            <p className="px-5 py-8 text-center text-sm text-fg-muted sm:px-6">
+              No streams yet. Paste links above to start.
+            </p>
+          ) : (
+            <ul className="divide-y divide-line">
+              {streams.map((s) => (
+                <StreamRow key={s.id} stream={s} clips={byStream.get(s.id) ?? []} onChange={onChange} />
+              ))}
+            </ul>
+          )}
+        </div>
+      </Card>
       <ClipWall title="Ready to post" clips={ready} streams={streams} />
     </div>
   )
@@ -280,42 +304,31 @@ function AddStreams({ onAdded }: { onAdded: () => void }) {
   }
 
   return (
-    <section>
-      <h2 className="eyebrow mb-3">Add streams</h2>
-      <textarea
-        className="field min-h-24 font-mono text-sm"
-        placeholder="Paste stream / VOD links — one per line (YouTube, Twitch, Kick)"
+    <Card title="Add streams" description="Paste stream or VOD links — one per line. YouTube, Twitch and Kick work.">
+      <Textarea
+        aria-label="Stream links"
+        className="min-h-24 font-mono"
+        placeholder={'https://www.twitch.tv/videos/…\nhttps://www.youtube.com/watch?v=…'}
         value={text}
         onChange={(e) => setText(e.target.value)}
       />
-      <div className="mt-4 flex flex-wrap items-end gap-6">
-        <label className="w-40 text-xs text-ink-400">
-          Only from (optional)
-          <input
-            className="field"
-            placeholder="0:00:00"
-            value={start}
-            onChange={(e) => setStart(e.target.value)}
-          />
-        </label>
-        <label className="w-40 text-xs text-ink-400">
-          Until (optional)
-          <input className="field" placeholder="end" value={end} onChange={(e) => setEnd(e.target.value)} />
-        </label>
-        <button className="btn btn-primary" disabled={busy || !text.trim()} onClick={submit}>
+      <div className="mt-4 flex flex-wrap items-end gap-4">
+        <Field label="Only from" optional className="w-36">
+          <Input placeholder="0:00:00" value={start} onChange={(e) => setStart(e.target.value)} />
+        </Field>
+        <Field label="Until" optional className="w-36">
+          <Input placeholder="end" value={end} onChange={(e) => setEnd(e.target.value)} />
+        </Field>
+        <Button variant="primary" icon={PlusIcon} loading={busy} disabled={!text.trim()} onClick={submit}>
           {busy ? 'Queuing…' : 'Queue streams'}
-        </button>
+        </Button>
       </div>
       {message && (
-        <p
-          className={`mt-3 whitespace-pre-line text-sm ${
-            message.tone === 'good' ? 'text-signal-good' : 'text-signal-bad'
-          }`}
-        >
-          {message.text}
-        </p>
+        <Callout tone={message.tone === 'good' ? 'success' : 'danger'} className="mt-4" onDismiss={() => setMessage(null)}>
+          <span className="whitespace-pre-line">{message.text}</span>
+        </Callout>
       )}
-    </section>
+    </Card>
   )
 }
 
@@ -335,38 +348,34 @@ function StreamRow({
   const signals = stream.signals
   const notes = Array.isArray(signals.notes) ? (signals.notes as string[]) : []
   const working = (counts.approved ?? 0) + (counts.downloading ?? 0) + (counts.rendering ?? 0)
+  const tone: Tone =
+    stream.status === 'failed' ? 'danger' : stream.status === 'done' ? 'success' : stream.status === 'cancelled' ? 'neutral' : 'accent'
 
   return (
-    <li className="py-4">
+    <li className="px-5 py-4 sm:px-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold text-ink-100">
+          <p className="truncate text-sm font-semibold text-fg">
             {stream.channel || stream.platform || 'Stream'}
-            <span className="ml-2 font-normal text-ink-400">{stream.title || stream.url}</span>
+            <span className="ml-2 font-normal text-fg-muted">{stream.title || stream.url}</span>
           </p>
-          <p className="mt-1 text-xs text-ink-400">
-            <span className={stream.status === 'failed' ? 'text-signal-bad' : 'text-sodium-400'}>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-fg-muted">
+            <Badge tone={tone} dot pulse={active && stream.status !== 'analyzed'}>
               {STATUS_LABEL[stream.status] ?? stream.status}
-            </span>
-            {stream.detail && <span> · {stream.detail}</span>}
-            {stream.duration_s > 0 && <span> · {clock(stream.duration_s)} long</span>}
+            </Badge>
+            {stream.detail && <span>{stream.detail}</span>}
+            {stream.duration_s > 0 && <span>· {clock(stream.duration_s)} long</span>}
             {(stream.range_start_s != null || stream.range_end_s != null) && (
               <span>
-                {' '}
                 · range {clock(stream.range_start_s ?? 0)}–
                 {stream.range_end_s != null ? clock(stream.range_end_s) : 'end'}
               </span>
             )}
-          </p>
+          </div>
           {active && stream.status !== 'analyzed' && (
-            <div className="mt-2 h-1 w-full max-w-md bg-ink-800">
-              <div
-                className="h-1 bg-sodium-500 transition-all"
-                style={{ width: `${Math.round(stream.progress * 100)}%` }}
-              />
-            </div>
+            <ProgressBar value={stream.progress} className="mt-2.5 max-w-md" label="Stream progress" />
           )}
-          <p className="mt-2 text-xs text-ink-500">
+          <p className="mt-2 text-xs text-fg-muted">
             {counts.ready ?? 0} ready · {working} in progress · {counts.rejected ?? 0} rejected
             {counts.qa_failed ? ` · ${counts.qa_failed} failed QA` : ''}
             {typeof signals.hype_markers === 'number' && ` · ${signals.hype_markers} hype markers`}
@@ -374,30 +383,30 @@ function StreamRow({
             {typeof signals.comments === 'number' && signals.comments > 0 && ` · ${signals.comments} comments read`}
             {typeof signals.caption_parts === 'string' && ` · YouTube captions for ${signals.caption_parts} parts`}
           </p>
-          {notes.length > 0 && <p className="mt-1 text-xs text-ink-500">Signals: {notes.join('; ')}</p>}
-          {stream.error && <p className="mt-2 whitespace-pre-line text-xs text-signal-bad">{stream.error}</p>}
-          {error && <p className="mt-2 whitespace-pre-line text-xs text-signal-bad">{error}</p>}
+          {notes.length > 0 && <p className="mt-1 text-xs text-fg-muted">Signals: {notes.join('; ')}</p>}
+          {stream.error && <p className="mt-2 whitespace-pre-line text-xs text-danger">{stream.error}</p>}
+          {error && <p className="mt-2 whitespace-pre-line text-xs text-danger">{error}</p>}
         </div>
-        <div className="flex shrink-0 gap-2">
+        <div className="flex shrink-0 flex-wrap gap-2">
           {clips.length > 0 && (
-            <button className="btn btn-ghost" onClick={() => setOpen((v) => !v)}>
+            <Button size="sm" onClick={() => setOpen((v) => !v)} iconRight={ChevronDownIcon} aria-expanded={open}>
               {open ? 'Hide moments' : `Moments (${clips.length})`}
-            </button>
+            </Button>
           )}
           {active && (
-            <button className="btn btn-ghost" disabled={busy} onClick={() => run(() => gtaApi.cancel(stream.id))}>
+            <Button size="sm" disabled={busy} onClick={() => run(() => gtaApi.cancel(stream.id))}>
               Cancel
-            </button>
+            </Button>
           )}
           {(stream.status === 'failed' || stream.status === 'cancelled') && (
-            <button className="btn btn-primary" disabled={busy} onClick={() => run(() => gtaApi.retry(stream.id))}>
+            <Button size="sm" variant="primary" icon={RefreshIcon} disabled={busy} onClick={() => run(() => gtaApi.retry(stream.id))}>
               Retry
-            </button>
+            </Button>
           )}
           {!active && (
-            <button className="btn btn-quiet" disabled={busy} onClick={() => run(() => gtaApi.remove(stream.id))}>
+            <Button size="sm" variant="ghost" icon={TrashIcon} disabled={busy} onClick={() => run(() => gtaApi.remove(stream.id))}>
               Remove
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -409,19 +418,19 @@ function StreamRow({
 function Moments({ clips }: { clips: GtaClip[] }) {
   const sorted = [...clips].sort((a, b) => a.start_s - b.start_s)
   const tone = (c: GtaClip) =>
-    c.status === 'ready' ? 'text-signal-good' : c.status === 'rejected' ? 'text-ink-500' : 'text-sodium-400'
+    c.status === 'ready' ? 'text-success' : c.status === 'rejected' ? 'text-fg-subtle' : 'text-accent-text'
   return (
-    <ul className="mt-4 grid gap-2 border-l border-ink-800 pl-4">
+    <ul className="mt-4 grid gap-1.5 rounded-xl bg-subtle p-3">
       {sorted.map((c) => (
-        <li key={c.id} className="text-xs">
-          <span className="font-mono text-ink-400">
+        <li key={c.id} className="text-xs leading-relaxed">
+          <span className="font-mono text-fg-muted">
             {clock(c.start_s)}–{clock(c.end_s)}
           </span>{' '}
-          <span className={tone(c)}>{c.status}</span>{' '}
-          <span className="text-ink-200">{c.hook_title || c.hook_quote}</span>
-          {c.hype_score > 0 && <span className="text-ink-500"> · hype {Math.round(c.hype_score)}</span>}
-          {c.reject_reason && <span className="text-ink-500"> — {c.reject_reason}</span>}
-          {c.error && c.status !== 'ready' && <span className="text-signal-bad"> — {c.error}</span>}
+          <span className={cx('font-medium', tone(c))}>{c.status}</span>{' '}
+          <span className="text-fg">{c.hook_title || c.hook_quote}</span>
+          {c.hype_score > 0 && <span className="text-fg-muted"> · hype {Math.round(c.hype_score)}</span>}
+          {c.reject_reason && <span className="text-fg-muted"> — {c.reject_reason}</span>}
+          {c.error && c.status !== 'ready' && <span className="text-danger"> — {c.error}</span>}
         </li>
       ))}
     </ul>
@@ -437,13 +446,14 @@ function ClipWall({ title, clips, streams }: { title: string; clips: GtaClip[]; 
   const sorted = [...clips].sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99))
   return (
     <section>
-      <h2 className="eyebrow mb-3">
-        {title} ({clips.length})
-      </h2>
+      <SectionTitle
+        title={`${title} (${clips.length})`}
+        description="Each clip comes with a copy-ready caption and hashtags."
+      />
       {clips.length === 0 ? (
-        <p className="text-sm text-ink-500">Finished clips appear here with their caption and hashtags.</p>
+        <EmptyState compact icon={FilmIcon} title="No finished clips yet" description="Finished clips appear here with their caption and hashtags." />
       ) : (
-        <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-3">
+        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
           {sorted.map((c) => (
             <ClipCard key={c.id} clip={c} streamer={names.get(c.stream_id) ?? ''} />
           ))}
@@ -464,13 +474,13 @@ const POSTING_WORD: Record<UploadStatus, string> = {
 }
 
 const POSTING_TONE: Record<UploadStatus, string> = {
-  uploading: 'text-sodium-400',
-  scheduled: 'text-signal-good',
-  checking: 'text-sodium-400',
-  posted: 'text-signal-good',
-  failed: 'text-signal-bad',
-  interrupted: 'text-signal-bad',
-  skipped: 'text-ink-500',
+  uploading: 'text-accent-text',
+  scheduled: 'text-success',
+  checking: 'text-accent-text',
+  posted: 'text-success',
+  failed: 'text-danger',
+  interrupted: 'text-danger',
+  skipped: 'text-fg-subtle',
 }
 
 /** Where this clip stands in the posting schedule (per platform), with Don't post / Allow. */
@@ -510,7 +520,7 @@ function PostingRow({ clip }: { clip: GtaClip }) {
         {i > 0 && ' · '}
         <span title={upload.error ?? undefined}>
           {PLATFORM_SHORT[platform]}:{' '}
-          <span className={POSTING_TONE[upload.status]}>
+          <span className={cx('font-medium', POSTING_TONE[upload.status])}>
             {POSTING_WORD[upload.status]}
             {upload.status === 'failed' && ` (${upload.attempts}/${MAX_UPLOAD_ATTEMPTS})`}
           </span>
@@ -520,7 +530,7 @@ function PostingRow({ clip }: { clip: GtaClip }) {
           {upload.url && (
             <>
               {' '}
-              <a href={upload.url} target="_blank" rel="noreferrer" className="text-sodium-400 underline">
+              <a href={upload.url} target="_blank" rel="noreferrer" className="link">
                 open ↗
               </a>
             </>
@@ -533,33 +543,34 @@ function PostingRow({ clip }: { clip: GtaClip }) {
   let action: React.ReactNode = null
   if (skipped) {
     action = (
-      <button className="btn btn-quiet" disabled={busy} onClick={() => toggle(false)}>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={() => toggle(false)}>
         Allow posting
-      </button>
+      </Button>
     )
   } else if (clip.qa.passed && !allSettled) {
     action = (
-      <button
-        className="btn btn-quiet"
+      <Button
+        size="sm"
+        variant="ghost"
         disabled={busy || anyUploading}
         title={anyUploading ? 'Uploading right now — wait for it to finish' : undefined}
         onClick={() => toggle(true)}
       >
         Don't post
-      </button>
+      </Button>
     )
   }
   const failure = rows.find((r) => r.upload.status === 'failed' && r.upload.error)
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-400">
+    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-fg-muted">
       <span className="min-w-0">{text}</span>
       {action}
       {failure && (
-        <span className="w-full text-signal-bad">
+        <span className="w-full text-danger">
           {PLATFORM_NAME[failure.platform]}: {failure.upload.error}
         </span>
       )}
-      {error && <span className="w-full text-signal-bad">{error}</span>}
+      {error && <span className="w-full text-danger">{error}</span>}
     </div>
   )
 }
@@ -567,48 +578,46 @@ function PostingRow({ clip }: { clip: GtaClip }) {
 function QaChip({ label, ok }: { label: string; ok: boolean | undefined }) {
   if (ok === undefined) return null
   return (
-    <span
-      className={`border px-1.5 py-0.5 text-[10px] tracking-wide uppercase ${
-        ok ? 'border-signal-good text-signal-good' : 'border-signal-bad text-signal-bad'
-      }`}
-    >
-      {label}
-    </span>
+    <Badge tone={ok ? 'success' : 'danger'} title={ok ? 'Passed' : 'Failed'}>
+      {ok ? '✓' : '✕'} {label}
+    </Badge>
   )
 }
 
 function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
   const [copied, setCopied] = useState(false)
+  const toast = useToast()
   const copy = async () => {
     if (await copyText(clip.post_text)) {
       setCopied(true)
+      toast.success('Caption copied', 'Paste it with the clip when you post.')
       window.setTimeout(() => setCopied(false), 1800)
     }
   }
   const qa = clip.qa
   return (
-    <article className="flex flex-col gap-3 bg-ink-850 p-3">
+    <article className="card flex flex-col gap-3 p-3">
       {clip.has_video ? (
         <video
-          className="aspect-[9/16] w-full bg-black"
+          className="aspect-[9/16] w-full rounded-lg bg-media"
           src={gtaApi.videoUrl(clip.id)}
           controls
           preload="metadata"
         />
       ) : (
-        <div className="flex aspect-[9/16] w-full items-center justify-center bg-ink-800 text-xs text-ink-500">
+        <div className="flex aspect-[9/16] w-full items-center justify-center rounded-lg bg-subtle text-xs text-fg-muted">
           Video file missing
         </div>
       )}
-      <div>
-        <p className="text-sm font-semibold text-ink-100">{clip.hook_title}</p>
-        <p className="text-xs text-ink-400">
+      <div className="px-1">
+        <p className="text-sm font-semibold text-fg">{clip.hook_title}</p>
+        <p className="mt-0.5 text-xs text-fg-muted">
           {streamer} · {MOMENT_LABEL[clip.moment_type] ?? clip.moment_type} · score {clip.score}
           {qa.duration_s ? ` · ${qa.duration_s.toFixed(0)} s` : ''}
           {qa.turnaround_s !== undefined && ` · live turnaround ${Math.round(qa.turnaround_s)} s`}
         </p>
       </div>
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap gap-1.5 px-1">
         <QaChip label="< 60 s" ok={qa.length?.ok} />
         <QaChip label="loudness" ok={qa.loudness?.ok} />
         <QaChip label="no black" ok={qa.black_frames?.ok} />
@@ -617,19 +626,19 @@ function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
         <QaChip label="own edit" ok={qa.own_value?.ok} />
         <QaChip label="logo" ok={qa.watermark?.ok} />
       </div>
-      {qa.notes && qa.notes.length > 0 && <p className="text-xs text-ink-500">{qa.notes.join('; ')}</p>}
-      <textarea
+      {qa.notes && qa.notes.length > 0 && <p className="px-1 text-xs text-fg-muted">{qa.notes.join('; ')}</p>}
+      <Textarea
         readOnly
-        className="field min-h-24 text-xs"
+        className="min-h-24 text-xs"
         value={clip.post_text}
         onFocus={(e) => e.currentTarget.select()}
         aria-label="Caption and hashtags"
       />
-      <button className="btn btn-primary" onClick={copy}>
-        {copied ? 'Copied ✓' : 'Copy caption + hashtags'}
-      </button>
+      <Button variant="primary" icon={copied ? CheckIcon : CopyIcon} onClick={copy}>
+        {copied ? 'Copied' : 'Copy caption + hashtags'}
+      </Button>
       {clip.status === 'ready' && <PostingRow clip={clip} />}
-      <p className="truncate font-mono text-[10px] text-ink-500" title={clip.path}>
+      <p className="truncate px-1 font-mono text-[10px] text-fg-subtle" title={clip.path}>
         {clip.path}
       </p>
     </article>
@@ -662,72 +671,79 @@ function LiveTab({
     })
 
   return (
-    <div className="mt-8 grid gap-12">
-      <section>
-        <h2 className="eyebrow mb-3">Clip this live stream</h2>
-        <p className="mb-3 max-w-2xl text-sm text-ink-400">
-          Listens every 20 seconds. When the chat explodes or the streamer loses it, the last 60 seconds
-          are judged with the same strict rules and a "yes" is rendered within about 3 minutes. Twitch
-          also uses live chat; YouTube and Kick lives trigger on the streamer's audio.
-        </p>
-        <div className="flex flex-wrap items-end gap-4">
-          <input
-            className="field max-w-xl flex-1"
+    <div className="grid gap-6">
+      <Card
+        title="Clip a live stream"
+        icon={RadioIcon}
+        description="Listens every 20 seconds. When the chat explodes or the streamer loses it, the last 60 seconds are judged with the same strict rules, and a “yes” is rendered within about 3 minutes. Twitch also uses live chat; YouTube and Kick lives trigger on the streamer’s audio."
+      >
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <Input
+            aria-label="Live stream link"
+            className="sm:max-w-xl"
             placeholder="https://www.twitch.tv/streamer"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
           />
-          <button className="btn btn-primary" disabled={busy || !url.trim()} onClick={start}>
+          <Button variant="primary" icon={PlayIcon} disabled={busy || !url.trim()} onClick={start}>
             Start watching
-          </button>
+          </Button>
         </div>
-        {error && <p className="mt-3 whitespace-pre-line text-sm text-signal-bad">{error}</p>}
-      </section>
-      <section>
-        <h2 className="eyebrow mb-3">Live watches</h2>
-        {streams.length === 0 ? (
-          <p className="text-sm text-ink-500">Nothing is being watched.</p>
-        ) : (
-          <ul className="divide-y divide-ink-800 border-y border-ink-800">
-            {streams.map((s) => {
-              const running = LIVE_RUNNING.has(s.status)
-              const mine = byStream.get(s.id) ?? []
-              const readyCount = mine.filter((c) => c.status === 'ready').length
-              const rejected = mine.filter((c) => c.status === 'rejected').length
-              return (
-                <li key={s.id} className="flex flex-wrap items-start justify-between gap-4 py-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold text-ink-100">{s.channel || s.url}</p>
-                    <p className="mt-1 text-xs text-ink-400">
-                      <span className={running ? 'text-signal-good' : 'text-ink-400'}>
-                        {STATUS_LABEL[s.status] ?? s.status}
-                      </span>
-                      {s.detail && ` · ${s.detail}`} · {readyCount} ready · {rejected} rejected
-                    </p>
-                    {s.error && <p className="mt-1 whitespace-pre-line text-xs text-signal-bad">{s.error}</p>}
-                  </div>
-                  <div className="flex gap-2">
-                    {running ? (
-                      <button className="btn btn-ghost" disabled={busy} onClick={() => run(() => gtaApi.stopLive(s.id))}>
-                        Stop
-                      </button>
-                    ) : (
-                      <>
-                        <button className="btn btn-primary" disabled={busy} onClick={() => run(() => gtaApi.retry(s.id))}>
-                          Watch again
-                        </button>
-                        <button className="btn btn-quiet" disabled={busy} onClick={() => run(() => gtaApi.remove(s.id))}>
-                          Remove
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
+        {error && (
+          <Callout tone="danger" className="mt-3">
+            <span className="whitespace-pre-line">{error}</span>
+          </Callout>
         )}
-      </section>
+      </Card>
+      <Card padding="none" title="Live watches">
+        <div className="border-t border-line">
+          {streams.length === 0 ? (
+            <p className="px-5 py-8 text-center text-sm text-fg-muted sm:px-6">Nothing is being watched.</p>
+          ) : (
+            <ul className="divide-y divide-line">
+              {streams.map((s) => {
+                const running = LIVE_RUNNING.has(s.status)
+                const mine = byStream.get(s.id) ?? []
+                const readyCount = mine.filter((c) => c.status === 'ready').length
+                const rejected = mine.filter((c) => c.status === 'rejected').length
+                return (
+                  <li key={s.id} className="flex flex-wrap items-start justify-between gap-4 px-5 py-4 sm:px-6">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-semibold text-fg">{s.channel || s.url}</p>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-fg-muted">
+                        <Badge tone={running ? 'success' : 'neutral'} dot pulse={running}>
+                          {STATUS_LABEL[s.status] ?? s.status}
+                        </Badge>
+                        {s.detail && <span>{s.detail}</span>}
+                        <span>
+                          · {readyCount} ready · {rejected} rejected
+                        </span>
+                      </div>
+                      {s.error && <p className="mt-1.5 whitespace-pre-line text-xs text-danger">{s.error}</p>}
+                    </div>
+                    <div className="flex gap-2">
+                      {running ? (
+                        <Button size="sm" disabled={busy} onClick={() => run(() => gtaApi.stopLive(s.id))}>
+                          Stop
+                        </Button>
+                      ) : (
+                        <>
+                          <Button size="sm" variant="primary" disabled={busy} onClick={() => run(() => gtaApi.retry(s.id))}>
+                            Watch again
+                          </Button>
+                          <Button size="sm" variant="ghost" icon={TrashIcon} disabled={busy} onClick={() => run(() => gtaApi.remove(s.id))}>
+                            Remove
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      </Card>
       <ClipWall title="Live clips ready" clips={ready} streams={streams} />
     </div>
   )
@@ -741,27 +757,37 @@ function StatTable({ title, rows }: { title: string; rows: Record<string, GroupS
   const entries = Object.entries(rows)
   if (!entries.length) return null
   return (
-    <div>
-      <h3 className="eyebrow mb-2">{title}</h3>
-      <table className="w-full text-sm">
-        <tbody>
-          {entries.map(([name, stat]) => (
-            <tr key={name} className="border-b border-ink-800">
-              <td className="py-1.5 text-ink-200">{MOMENT_LABEL[name] ?? name}</td>
-              <td className="py-1.5 text-right text-ink-400">{stat.count} Shorts</td>
-              <td className="py-1.5 text-right text-ink-400">{stat.average_views.toLocaleString()} avg</td>
-              <td
-                className={`py-1.5 text-right font-semibold ${
-                  stat.vs_channel >= 1 ? 'text-signal-good' : 'text-signal-bad'
-                }`}
-              >
-                {stat.vs_channel.toFixed(2)}×
-              </td>
+    <Card padding="none" title={title}>
+      <div className="overflow-x-auto border-t border-line">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-fg-muted">
+              <th className="px-5 py-2 font-medium">Group</th>
+              <th className="px-3 py-2 text-right font-medium">Shorts</th>
+              <th className="px-3 py-2 text-right font-medium">Avg views</th>
+              <th className="px-5 py-2 text-right font-medium">vs channel</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody className="divide-y divide-line">
+            {entries.map(([name, stat]) => (
+              <tr key={name}>
+                <td className="px-5 py-2 text-fg">{MOMENT_LABEL[name] ?? name}</td>
+                <td className="numeric px-3 py-2 text-right text-fg-muted">{stat.count}</td>
+                <td className="numeric px-3 py-2 text-right text-fg-muted">{stat.average_views.toLocaleString()}</td>
+                <td
+                  className={cx(
+                    'numeric px-5 py-2 text-right font-semibold',
+                    stat.vs_channel >= 1 ? 'text-success' : 'text-danger',
+                  )}
+                >
+                  {stat.vs_channel.toFixed(2)}×
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
   )
 }
 
@@ -796,43 +822,57 @@ function WorkingTab() {
   }
 
   return (
-    <div className="mt-8 grid gap-10">
-      <section>
-        <h2 className="eyebrow mb-3">Look at what's working</h2>
-        <p className="mb-3 max-w-2xl text-sm text-ink-400">
-          Reads the view counts of the channel's posted Shorts, finds which moment types and streamers beat
-          the channel average, and leans future picks toward them (only groups with 3+ Shorts count).
-        </p>
-        <div className="flex flex-wrap items-end gap-4">
-          <input
-            className="field max-w-xl flex-1"
+    <div className="grid gap-6">
+      <Card
+        title="See what's working"
+        icon={TrendingIcon}
+        description="Reads the view counts of your channel's posted Shorts, finds which moment types and streamers beat the channel average, and leans future picks toward them (only groups with 3+ Shorts count)."
+      >
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <Input
+            aria-label="Your YouTube channel link"
+            className="sm:max-w-xl"
             placeholder="https://www.youtube.com/@yourchannel"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
           />
-          <button className="btn btn-primary" disabled={busy || !url.trim()} onClick={runReport}>
-            {busy ? 'Reading views…' : 'Look at what’s working'}
-          </button>
+          <Button variant="primary" loading={busy} disabled={!url.trim()} onClick={runReport}>
+            {busy ? 'Reading views…' : 'Check my channel'}
+          </Button>
         </div>
-        {error && <p className="mt-3 whitespace-pre-line text-sm text-signal-bad">{error}</p>}
-      </section>
+        {error && (
+          <Callout tone="danger" className="mt-3">
+            <span className="whitespace-pre-line">{error}</span>
+          </Callout>
+        )}
+      </Card>
       {report && (
-        <section className="grid gap-8">
-          <p className="text-sm text-ink-300">
-            {report.count} Shorts · channel average {report.channel_average.toLocaleString()} views ·{' '}
-            {report.matched} matched to GTA clips
-          </p>
+        <>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Stat label="Shorts read" value={report.count.toLocaleString()} />
+            <Stat label="Channel average" value={`${report.channel_average.toLocaleString()} views`} />
+            <Stat label="Matched to GTA clips" value={report.matched.toLocaleString()} />
+          </div>
           {report.bias.summary && (
-            <p className="whitespace-pre-line border-l-2 border-sodium-500 pl-3 text-sm text-ink-200">
-              {report.bias.summary}
-            </p>
+            <Callout tone="info" title="What AutoClip will lean toward">
+              <span className="whitespace-pre-line">{report.bias.summary}</span>
+            </Callout>
           )}
-          <div className="grid gap-8 lg:grid-cols-2">
+          <div className="grid gap-6 lg:grid-cols-2">
             <StatTable title="Moment types" rows={report.moment_types} />
             <StatTable title="Streamers" rows={report.streamers} />
           </div>
-        </section>
+        </>
       )}
+    </div>
+  )
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="card p-4">
+      <p className="text-xs font-medium text-fg-muted">{label}</p>
+      <p className="numeric mt-1 text-xl font-bold text-fg">{value}</p>
     </div>
   )
 }
@@ -872,6 +912,21 @@ const NUMBER_FIELDS: { key: NumberKey; label: string; step: number }[] = [
   { key: 'watermark_opacity', label: 'Logo opacity (0.1–1)', step: 0.05 },
 ]
 
+/** Which number fields go in which settings card. */
+const NUMBER_GROUPS: { title: string; description: string; keys: NumberKey[] }[] = [
+  {
+    title: 'Clip length & picking',
+    description: 'How long clips are and how many each stream can give.',
+    keys: ['min_clip_s', 'target_clip_s', 'max_clip_s', 'max_clips_per_stream', 'chunk_minutes', 'face_min_ratio'],
+  },
+  {
+    title: 'Editing',
+    description: 'Hook title, silence cuts, zoom and loudness.',
+    keys: ['hook_title_s', 'dead_air_min_s', 'punch_in_zoom', 'loudness_lufs'],
+  },
+  { title: 'Speed', description: 'How much runs at once.', keys: ['network_workers'] },
+]
+
 function SettingsTab() {
   const [settings, setSettings] = useState<GtaSettings | null>(null)
   const [draft, setDraft] = useState<Record<string, string>>({})
@@ -879,6 +934,7 @@ function SettingsTab() {
   const [clientId, setClientId] = useState('')
   const [secret, setSecret] = useState('')
   const [logoVersion, setLogoVersion] = useState('0')
+  const toast = useToast()
 
   const load = useCallback(() => {
     gtaApi
@@ -909,7 +965,18 @@ function SettingsTab() {
   }, [])
   useEffect(load, [load])
 
-  if (!settings) return <p className="mt-8 text-sm text-ink-500">{message?.text ?? 'Loading…'}</p>
+  if (!settings) {
+    return message ? (
+      <Callout tone="danger">
+        <span className="whitespace-pre-line">{message.text}</span>
+      </Callout>
+    ) : (
+      <div className="grid gap-6">
+        <SkeletonCard lines={4} />
+        <SkeletonCard lines={3} />
+      </div>
+    )
+  }
 
   const save = async () => {
     const live = {
@@ -946,7 +1013,8 @@ function SettingsTab() {
     }
     try {
       await gtaApi.saveSettings(patch as Partial<GtaSettings>)
-      setMessage({ tone: 'good', text: 'Saved.' })
+      setMessage(null)
+      toast.success('GTA settings saved')
       load()
     } catch (err) {
       setMessage({ tone: 'bad', text: errorText(err) })
@@ -956,10 +1024,7 @@ function SettingsTab() {
   const saveTwitch = async (clear = false) => {
     try {
       const result = await gtaApi.saveTwitch(clear ? '' : clientId.trim(), clear ? '' : secret.trim())
-      setMessage({
-        tone: 'good',
-        text: result.twitch_credentials_set ? 'Twitch credentials saved.' : 'Twitch credentials removed.',
-      })
+      toast.success(result.twitch_credentials_set ? 'Twitch credentials saved' : 'Twitch credentials removed')
       setClientId('')
       setSecret('')
       load()
@@ -968,185 +1033,153 @@ function SettingsTab() {
     }
   }
 
-  const field = (key: string, label: string, props: Record<string, unknown> = {}) => (
-    <label key={key} className="text-xs text-ink-400">
-      {label}
-      <input
-        className="field"
-        value={draft[key] ?? ''}
-        onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
-        {...props}
-      />
-    </label>
+  const set = (key: string, value: string) => setDraft((d) => ({ ...d, [key]: value }))
+  const field = (key: string, label: string, props: Record<string, unknown> = {}, hint?: string) => (
+    <Field key={key} label={label} hint={hint}>
+      <Input value={draft[key] ?? ''} onChange={(e) => set(key, e.target.value)} {...props} />
+    </Field>
+  )
+  const numberField = (f: (typeof NUMBER_FIELDS)[number]) => field(f.key, f.label, { type: 'number', step: f.step })
+  const check = (key: string, label: string, hint?: string) => (
+    <Toggle key={key} label={label} hint={hint} checked={draft[key] === 'true'} onChange={(on) => set(key, String(on))} />
   )
 
   return (
-    <div className="mt-8 grid max-w-3xl gap-10">
-      <section className="grid gap-5 sm:grid-cols-2">
-        {NUMBER_FIELDS.map((f) => field(f.key, f.label, { type: 'number', step: f.step }))}
-        {field('listen_interval_s', 'GTA Live: listen every (s)', { type: 'number', step: 1 })}
-        {field('context_s', 'GTA Live: judge the last (s)', { type: 'number', step: 5 })}
-        <label className="text-xs text-ink-400">
-          Caption style
-          <select
-            className="field"
-            value={draft.caption_style ?? ''}
-            onChange={(e) => setDraft((d) => ({ ...d, caption_style: e.target.value }))}
-          >
-            {GTA_CAPTION_STYLES.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <span className="mt-1 block text-ink-500">
-            {GTA_CAPTION_STYLES.find((option) => option.value === draft.caption_style)?.hint}
-          </span>
-        </label>
-        <label className="text-xs text-ink-400">
-          Motion (zooms on the stream frame only)
-          <select
-            className="field"
-            value={draft.motion ?? 'subtle'}
-            onChange={(e) => setDraft((d) => ({ ...d, motion: e.target.value }))}
-          >
-            {GTA_MOTION_LEVELS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="sm:col-span-2">
-          {field('output_dir', 'Save finished clips to (empty = AutoClip exports/gta)')}
+    <div className="grid max-w-4xl gap-6">
+      {NUMBER_GROUPS.map((group) => (
+        <Card key={group.title} title={group.title} description={group.description}>
+          <div className="grid gap-5 sm:grid-cols-2">
+            {NUMBER_FIELDS.filter((f) => group.keys.includes(f.key)).map(numberField)}
+          </div>
+        </Card>
+      ))}
+
+      <Card title="Captions & motion" icon={CaptionsIcon}>
+        <div className="grid gap-5 sm:grid-cols-2">
+          <Field label="Caption style" hint={GTA_CAPTION_STYLES.find((option) => option.value === draft.caption_style)?.hint}>
+            <Select
+              value={draft.caption_style ?? ''}
+              onChange={(e) => set('caption_style', e.target.value)}
+              options={GTA_CAPTION_STYLES.map((o) => ({ value: o.value, label: o.label }))}
+            />
+          </Field>
+          <Field label="Motion" hint="Zooms on the stream frame only.">
+            <Select
+              value={draft.motion ?? 'subtle'}
+              onChange={(e) => set('motion', e.target.value)}
+              options={GTA_MOTION_LEVELS.map((o) => ({ value: o.value, label: o.label }))}
+            />
+          </Field>
+          <div className="grid gap-4 sm:col-span-2">
+            {check('punch_in', 'Punch-in zoom on the key moment')}
+            {check('reaction_text', 'Reaction text at the key moment')}
+            {check('keyword_highlight', 'Highlight 3–8 key words in the captions')}
+          </div>
         </div>
-        {field('watermark_text', 'Logo text (drawn when no PNG is set)', { maxLength: 40 })}
-        {field('watermark_font', 'Logo font file (empty = Lemon Milk Bold)', {
-          placeholder: 'C:\\Windows\\Fonts\\your-font.otf',
-        })}
-        <div className="sm:col-span-2">
-          {field('watermark_path', 'Or use a logo image — full path to a PNG (wins over the text)', {
-            placeholder: 'C:\\Users\\you\\Pictures\\logo.png',
-          })}
-          {!settings.watermark_path && !settings.watermark_text ? (
-            <p className="mt-1 text-xs text-signal-bad">No logo set yet — clips are flagged until you add one.</p>
+      </Card>
+
+      <Card title="Logo" icon={StampIcon} description="Every GTA clip carries your logo. Use a PNG, or text drawn in a font.">
+        <div className="grid gap-5 sm:grid-cols-2">
+          {field('watermark_text', 'Logo text', { maxLength: 40 }, 'Drawn when no PNG is set.')}
+          {field('watermark_font', 'Logo font file', { placeholder: 'C:\\Windows\\Fonts\\your-font.otf' }, 'Empty = Lemon Milk Bold.')}
+          <div className="sm:col-span-2">
+            {field(
+              'watermark_path',
+              'Logo image (PNG)',
+              { placeholder: 'C:\\Users\\you\\Pictures\\logo.png' },
+              'Full path to a PNG. Wins over the text.',
+            )}
+            {!settings.watermark_path && !settings.watermark_text ? (
+              <Callout tone="warn" className="mt-3">
+                No logo set yet — clips are flagged until you add one.
+              </Callout>
+            ) : (
+              <div className="mt-3 inline-flex items-center gap-3 rounded-xl border border-line bg-subtle p-3">
+                <span className="text-xs text-fg-muted">Current logo</span>
+                <img key={logoVersion} src={gtaApi.logoUrl(logoVersion)} alt="Current logo" className="h-8 w-auto" />
+              </div>
+            )}
+          </div>
+          <Field label="Logo corner">
+            <Select
+              value={draft.watermark_corner ?? 'top_right'}
+              onChange={(e) => set('watermark_corner', e.target.value)}
+              options={[
+                { value: 'top_right', label: 'Top right' },
+                { value: 'top_left', label: 'Top left' },
+              ]}
+            />
+          </Field>
+          <div className="grid gap-5 sm:col-span-2 sm:grid-cols-2">
+            {NUMBER_FIELDS.filter((f) => f.key === 'watermark_width_px' || f.key === 'watermark_opacity').map(numberField)}
+          </div>
+        </div>
+      </Card>
+
+      <Card title="GTA Live" icon={RadioIcon} description="How often a live stream is checked, and how much of it is judged.">
+        <div className="grid gap-5 sm:grid-cols-2">
+          {field('listen_interval_s', 'Listen every (seconds)', { type: 'number', step: 1 })}
+          {field('context_s', 'Judge the last (seconds)', { type: 'number', step: 5 })}
+        </div>
+      </Card>
+
+      <Card title="YouTube VODs" description="Extra signals for YouTube videos.">
+        <div className="grid gap-4">
+          {check('comment_signal', 'Use timestamps viewers wrote in the comments in the Hype Curve')}
+          {check(
+            'youtube_captions',
+            'Use YouTube’s own captions as the transcript when they look right',
+            'Skips Whisper; automatic captions have no punctuation.',
+          )}
+        </div>
+      </Card>
+
+      <Card title="Where clips are saved" icon={FolderIcon}>
+        {field('output_dir', 'Save finished clips to', {}, 'Empty = AutoClip exports/gta.')}
+      </Card>
+
+      <div className="sticky bottom-3 z-10 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface/95 px-4 py-3 shadow-[var(--shadow-pop)] backdrop-blur">
+        <p className="min-w-0 text-sm text-fg-muted" aria-live="polite">
+          {message?.tone === 'bad' ? (
+            <span className="whitespace-pre-line text-danger">{message.text}</span>
           ) : (
-            <div className="mt-3 inline-block rounded-md bg-ink-800 p-3">
-              <img
-                key={logoVersion}
-                src={gtaApi.logoUrl(logoVersion)}
-                alt="Current logo"
-                className="h-8 w-auto"
-              />
-            </div>
+            'Changes apply after you save.'
           )}
-        </div>
-        <label className="text-xs text-ink-400">
-          Logo corner
-          <select
-            className="field"
-            value={draft.watermark_corner ?? 'top_right'}
-            onChange={(e) => setDraft((d) => ({ ...d, watermark_corner: e.target.value }))}
-          >
-            <option value="top_right">Top right</option>
-            <option value="top_left">Top left</option>
-          </select>
-        </label>
-        <div className="flex flex-col gap-2 text-xs text-ink-400">
-          Own-value edits
-          {(['punch_in', 'reaction_text'] as const).map((key) => (
-            <label key={key} className="flex items-center gap-2 text-sm text-ink-200">
-              <input
-                type="checkbox"
-                checked={draft[key] === 'true'}
-                onChange={(e) => setDraft((d) => ({ ...d, [key]: String(e.target.checked) }))}
-              />
-              {key === 'punch_in' ? 'Punch-in zoom on the key moment' : 'Reaction text at the key moment'}
-            </label>
-          ))}
-          <label className="flex items-center gap-2 text-sm text-ink-200">
-            <input
-              type="checkbox"
-              checked={draft.keyword_highlight === 'true'}
-              onChange={(e) => setDraft((d) => ({ ...d, keyword_highlight: String(e.target.checked) }))}
-            />
-            Highlight 3–8 key words in the captions
-          </label>
-        </div>
-        <div className="flex flex-col gap-2 text-xs text-ink-400 sm:col-span-2">
-          YouTube VODs
-          <label className="flex items-center gap-2 text-sm text-ink-200">
-            <input
-              type="checkbox"
-              checked={draft.comment_signal === 'true'}
-              onChange={(e) => setDraft((d) => ({ ...d, comment_signal: String(e.target.checked) }))}
-            />
-            Use timestamps viewers wrote in the comments in the Hype Curve
-          </label>
-          <label className="flex items-center gap-2 text-sm text-ink-200">
-            <input
-              type="checkbox"
-              checked={draft.youtube_captions === 'true'}
-              onChange={(e) => setDraft((d) => ({ ...d, youtube_captions: String(e.target.checked) }))}
-            />
-            Use YouTube&rsquo;s own captions as the transcript when they look right (skips Whisper;
-            automatic captions have no punctuation)
-          </label>
-        </div>
-      </section>
-      <div className="flex items-center gap-4">
-        <button className="btn btn-primary" onClick={save}>
-          Save settings
-        </button>
-        {message && (
-          <p
-            className={`whitespace-pre-line text-sm ${
-              message.tone === 'good' ? 'text-signal-good' : 'text-signal-bad'
-            }`}
-          >
-            {message.text}
-          </p>
-        )}
-      </div>
-      <section>
-        <h2 className="eyebrow mb-2">Twitch viewer clips (optional)</h2>
-        <p className="mb-3 text-sm text-ink-400">
-          With a free Twitch developer app (dev.twitch.tv → Your Console → Register an application), the
-          Hype Curve also uses the clips viewers made of a VOD. Status:{' '}
-          <span className={settings.twitch_credentials_set ? 'text-signal-good' : 'text-ink-300'}>
-            {settings.twitch_credentials_set ? 'connected' : 'not set'}
-          </span>
         </p>
+        <Button variant="primary" icon={CheckIcon} onClick={save}>
+          Save settings
+        </Button>
+      </div>
+
+      <Card
+        title="Twitch viewer clips"
+        icon={KeyIcon}
+        description="Optional. With a free Twitch developer app (dev.twitch.tv → Your Console → Register an application), the Hype Curve also uses the clips viewers made of a VOD."
+        actions={
+          <Badge tone={settings.twitch_credentials_set ? 'success' : 'neutral'} dot>
+            {settings.twitch_credentials_set ? 'Connected' : 'Not set'}
+          </Badge>
+        }
+      >
         <div className="grid gap-4 sm:grid-cols-2">
-          <input
-            className="field"
-            placeholder="Client ID"
-            value={clientId}
-            onChange={(e) => setClientId(e.target.value)}
-          />
-          <input
-            className="field"
-            type="password"
-            placeholder="Client Secret"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-          />
+          <Field label="Client ID">
+            <Input value={clientId} onChange={(e) => setClientId(e.target.value)} autoComplete="off" />
+          </Field>
+          <Field label="Client secret">
+            <Input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="off" />
+          </Field>
         </div>
-        <div className="mt-4 flex gap-3">
-          <button
-            className="btn btn-ghost"
-            disabled={!clientId.trim() || !secret.trim()}
-            onClick={() => saveTwitch()}
-          >
+        <div className="mt-4 flex gap-2">
+          <Button disabled={!clientId.trim() || !secret.trim()} onClick={() => saveTwitch()}>
             Save credentials
-          </button>
+          </Button>
           {settings.twitch_credentials_set && (
-            <button className="btn btn-quiet" onClick={() => saveTwitch(true)}>
+            <Button variant="ghost" icon={TrashIcon} onClick={() => saveTwitch(true)}>
               Remove
-            </button>
+            </Button>
           )}
         </div>
-      </section>
+      </Card>
     </div>
   )
 }

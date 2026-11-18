@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 
 import {
   ApiError,
   api,
   detectLink,
   formatBytes,
-  formatDuration,
   LAYOUTS,
   LINK_LABELS,
   type DriveFolderListing,
@@ -19,12 +18,55 @@ import {
   type Settings,
 } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
+import { JobList } from '../components/JobList'
+import {
+  ArrowRightIcon,
+  Button,
+  ButtonLink,
+  Callout,
+  Card,
+  Checkbox,
+  ChevronDownIcon,
+  CloudIcon,
+  CompassIcon,
+  Field,
+  FolderIcon,
+  Input,
+  LinkIcon,
+  PageHeader,
+  ProgressBar,
+  Segmented,
+  Select,
+  SlidersIcon,
+  SparklesIcon,
+  UploadIcon,
+  cx,
+} from '../ui'
+
+type SourceTab = 'link' | 'file' | 'drive'
+
+/** Short labels on phones so the three choices fit on one row. */
+const SOURCE_TABS = [
+  { value: 'link', label: <Short full="Paste a link" short="Link" /> },
+  { value: 'file', label: <Short full="Upload a file" short="Upload" /> },
+  { value: 'drive', label: <Short full="Google Drive folder" short="Drive folder" /> },
+] as const
+
+function Short({ full, short }: { full: string; short: string }) {
+  return (
+    <>
+      <span className="sm:hidden">{short}</span>
+      <span className="hidden sm:inline">{full}</span>
+    </>
+  )
+}
 
 export function Ingest() {
   const navigate = useNavigate()
   // Explore's "Clip this video" lands here as /?url=…, prefilled.
   const [searchParams] = useSearchParams()
   const [url, setUrl] = useState(() => searchParams.get('url') ?? '')
+  const [tab, setTab] = useState<SourceTab>('link')
   const [busy, setBusy] = useState<'url' | 'file' | null>(null)
   const [error, setError] = useState<ApiError | Error | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -194,119 +236,158 @@ export function Ingest() {
   const submitFile = (file: File) => void start('file', () => api.uploadSource(file))
 
   const usableProvider = providers.find((p) => p.available)
+  const isFolder = linkKind === 'gdrive_folder'
 
   return (
-    <div className="pt-14">
-      {/* Masthead. Left-aligned and asymmetric — the field is the subject, not
-          a centred hero card. */}
-      <div className="rise max-w-3xl">
-        <p className="eyebrow">Local · No accounts · No watermarks</p>
-        <h1 className="mt-5 font-display text-[clamp(2.75rem,7vw,5.5rem)] leading-[0.95] text-ink-100">
-          Long video in.
-          <br />
-          <span className="italic text-sodium-500">Shorts</span> out.
-        </h1>
-      </div>
+    <div>
+      <PageHeader
+        title="Make new clips"
+        description="Paste a link or upload a long video. AutoClip finds the moments worth sharing and turns them into captioned vertical clips."
+      />
 
-      <div className="mt-16 grid gap-x-16 gap-y-12 lg:grid-cols-[1.35fr_1fr]">
-        {/* URL */}
-        <section className="rise" style={{ animationDelay: '90ms' }}>
-          <form onSubmit={submitUrl}>
-            <label htmlFor="url" className="eyebrow">
-              Paste a link
-            </label>
-            <div className="mt-3 flex items-end gap-4">
-              <input
-                id="url"
-                className="field font-display text-xl md:text-2xl"
-                placeholder="YouTube, Google Drive, Dropbox, OneDrive or .mp4 link"
-                value={url}
-                onChange={(e) => {
-                  setUrl(e.target.value)
-                  setFolder(null)
-                }}
-                autoComplete="off"
-                spellCheck={false}
-                disabled={busy !== null}
-              />
-              <button
-                type="submit"
-                className="btn btn-primary shrink-0"
-                disabled={busy !== null || !url.trim()}
-              >
-                {busy === 'url' ? 'Fetching…' : linkKind === 'gdrive_folder' ? 'List' : 'Start'}
-              </button>
-            </div>
-          </form>
+      {providers.length > 0 && !usableProvider && (
+        <Callout
+          tone="warn"
+          title="No AI provider is set up yet"
+          className="mb-6"
+          action={
+            <ButtonLink to="/settings" size="sm" variant="secondary">
+              Open Settings
+            </ButtonLink>
+          }
+        >
+          Clip picking needs one. Add an API key or start Ollama in Settings → General &amp; AI.
+        </Callout>
+      )}
 
-          {linkKind && <LinkBadge kind={linkKind} />}
-          {busy === 'url' && linkProgress && <DownloadProgress progress={linkProgress} />}
-          {folder && (
-            <FolderPicker
-              folder={folder}
-              picked={picked}
-              onChange={setPicked}
-              onClip={() => void clipFolder()}
-              busy={busy !== null}
-            />
-          )}
-          {notice && <p className="mt-3 text-xs text-ink-300">{notice}</p>}
-
-          <p className="mt-3 text-xs leading-relaxed text-ink-500">
-            Only download video you own or have the rights to process.
-          </p>
-
-          <AdvancedOptions
-            open={advancedOpen}
-            onToggle={() => setAdvancedOpen((v) => !v)}
-            overrides={overrides}
-            onChange={setOverrides}
-            providers={providers}
-            defaults={defaults}
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_19rem]">
+        {/* The start card. Dropping a file anywhere on it uploads that file. */}
+        <Card
+          padding="lg"
+          className={cx('relative', dragging && 'ring-2 ring-accent')}
+          onDragOver={(e) => {
+            e.preventDefault()
+            setDragging(true)
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false)
+          }}
+          onDrop={(e) => {
+            e.preventDefault()
+            setDragging(false)
+            const file = e.dataTransfer.files[0]
+            if (file) submitFile(file)
+          }}
+        >
+          <Segmented
+            label="Where is your video?"
+            options={SOURCE_TABS}
+            value={tab}
+            onChange={(next) => {
+              setTab(next)
+              setError(null)
+            }}
           />
-        </section>
 
-        {/* Upload */}
-        <section className="rise" style={{ animationDelay: '160ms' }}>
-          <p className="eyebrow">Or drop a file</p>
-          <div
-            onDragOver={(e) => {
-              e.preventDefault()
-              setDragging(true)
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault()
-              setDragging(false)
-              const file = e.dataTransfer.files[0]
-              if (file) submitFile(file)
-            }}
-            className={[
-              'mt-3 flex min-h-52 cursor-pointer flex-col items-center justify-center gap-2 border border-dashed px-6 text-center transition-colors duration-200',
-              dragging
-                ? 'border-sodium-500 bg-sodium-700/10'
-                : 'border-ink-700 hover:border-ink-600',
-            ].join(' ')}
-            onClick={() => {
-              if (busy === null) fileInput.current?.click()
-            }}
-            role="button"
-            tabIndex={0}
-            aria-disabled={busy !== null}
-            aria-label="Choose a video or audio file to upload"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                // Space would otherwise scroll the page as well.
-                e.preventDefault()
-                if (busy === null) fileInput.current?.click()
-              }
-            }}
-          >
-            <span className="font-display text-2xl text-ink-200">
-              {busy === 'file' ? 'Uploading…' : 'Drop video or audio'}
-            </span>
-            <span className="text-xs text-ink-500">mp4 · mov · mkv · webm · mp3 · wav · m4a</span>
-          </div>
+          {tab !== 'file' ? (
+            <form onSubmit={submitUrl} className="mt-6">
+              <label htmlFor="url" className="text-sm font-medium text-fg">
+                {tab === 'drive' ? 'Google Drive folder link' : 'Video link'}
+              </label>
+              <div className="mt-2 flex flex-col gap-3 sm:flex-row">
+                <div className="relative min-w-0 flex-1">
+                  <span className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-fg-subtle">
+                    {tab === 'drive' ? <FolderIcon size={18} /> : <LinkIcon size={18} />}
+                  </span>
+                  <Input
+                    id="url"
+                    className="py-3 pl-11 text-base"
+                    placeholder={
+                      tab === 'drive'
+                        ? 'https://drive.google.com/drive/folders/…'
+                        : 'https://www.youtube.com/watch?v=…'
+                    }
+                    value={url}
+                    onChange={(e) => {
+                      setUrl(e.target.value)
+                      setFolder(null)
+                    }}
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={busy !== null}
+                  />
+                </div>
+                <Button
+                  type="submit"
+                  variant="primary"
+                  size="lg"
+                  icon={isFolder ? FolderIcon : SparklesIcon}
+                  loading={busy === 'url'}
+                  disabled={busy !== null || !url.trim()}
+                >
+                  {busy === 'url' ? 'Fetching…' : isFolder ? 'List videos' : 'Find clips'}
+                </Button>
+              </div>
+              <p className="mt-2 text-xs text-fg-muted">
+                {linkKind ? (
+                  <span className="inline-flex items-center gap-1.5 font-medium text-accent-text">
+                    <LinkKindIcon kind={linkKind} />
+                    {LINK_LABELS[linkKind]}
+                    {isFolder && ' · pick the videos to clip'}
+                  </span>
+                ) : tab === 'drive' ? (
+                  'Share the folder as "Anyone with the link". You can pick which videos to clip.'
+                ) : (
+                  'Works with YouTube, Google Drive, Dropbox, OneDrive and direct .mp4 links.'
+                )}
+              </p>
+
+              {busy === 'url' && linkProgress && <DownloadProgress progress={linkProgress} />}
+              {folder && (
+                <FolderPicker
+                  folder={folder}
+                  picked={picked}
+                  onChange={setPicked}
+                  onClip={() => void clipFolder()}
+                  busy={busy !== null}
+                />
+              )}
+            </form>
+          ) : (
+            <div className="mt-6">
+              <div
+                onClick={() => {
+                  if (busy === null) fileInput.current?.click()
+                }}
+                role="button"
+                tabIndex={0}
+                aria-disabled={busy !== null}
+                aria-label="Choose a video or audio file to upload"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    // Space would otherwise scroll the page as well.
+                    e.preventDefault()
+                    if (busy === null) fileInput.current?.click()
+                  }
+                }}
+                className={cx(
+                  'flex min-h-48 cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-8 text-center transition-colors duration-200',
+                  dragging ? 'border-accent bg-accent-soft' : 'border-line-strong hover:border-accent hover:bg-subtle',
+                )}
+              >
+                <span className="mb-1 grid size-12 place-items-center rounded-2xl bg-accent-soft text-accent-text">
+                  <UploadIcon size={22} />
+                </span>
+                <span className="text-base font-semibold text-fg">
+                  {busy === 'file' ? 'Uploading…' : 'Drop a video or audio file here'}
+                </span>
+                <span className="text-sm text-fg-muted">
+                  or <span className="font-medium text-accent-text">browse your computer</span>
+                </span>
+                <span className="mt-1 text-xs text-fg-subtle">mp4 · mov · mkv · webm · mp3 · wav · m4a</span>
+              </div>
+            </div>
+          )}
           <input
             ref={fileInput}
             type="file"
@@ -318,27 +399,77 @@ export function Ingest() {
               e.target.value = ''
             }}
           />
-        </section>
+
+          {notice && <p className="mt-4 text-sm text-fg-muted">{notice}</p>}
+
+          {error && (
+            <div className="mt-5">
+              <ErrorNote error={error} onDismiss={() => setError(null)} />
+            </div>
+          )}
+
+          <AdvancedOptions
+            open={advancedOpen}
+            onToggle={() => setAdvancedOpen((v) => !v)}
+            overrides={overrides}
+            onChange={setOverrides}
+            providers={providers}
+            defaults={defaults}
+          />
+
+          <p className="mt-6 border-t border-line pt-4 text-xs leading-relaxed text-fg-subtle">
+            Only download video you own or have the rights to process. Everything runs on this computer.
+          </p>
+        </Card>
+
+        <div className="grid gap-6 sm:grid-cols-2 xl:flex xl:flex-col">
+          <Card padding="md" title="Not sure what to clip?" icon={CompassIcon}>
+            <p className="-mt-2 text-sm leading-relaxed text-fg-muted">
+              Search YouTube and Twitch, peek at where viewers rewatch, then send a video here.
+            </p>
+            <ButtonLink to="/explore" variant="secondary" className="mt-4" block iconRight={ArrowRightIcon}>
+              Open Explore
+            </ButtonLink>
+          </Card>
+          <Card padding="md" title="How it works">
+            <ol className="-mt-1 space-y-3 text-sm">
+              {[
+                ['Add a video', 'A link, a file or a whole Drive folder.'],
+                ['AutoClip finds the moments', 'It transcribes, picks highlights and reframes to 9:16.'],
+                ['Review and export', 'Trim, edit captions, then download your clips.'],
+              ].map(([title, text], i) => (
+                <li key={title} className="flex gap-3">
+                  <span className="numeric grid size-6 shrink-0 place-items-center rounded-full bg-accent-soft text-xs font-semibold text-accent-text">
+                    {i + 1}
+                  </span>
+                  <span>
+                    <span className="font-medium text-fg">{title}</span>
+                    <span className="block text-fg-muted">{text}</span>
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </Card>
+        </div>
       </div>
 
-      {error && (
-        <div className="mt-10 max-w-3xl">
-          <ErrorNote error={error} onDismiss={() => setError(null)} />
-        </div>
+      {jobs.length > 0 && (
+        <Card
+          padding="none"
+          className="mt-8 overflow-hidden"
+          title="Recent projects"
+          description="Open one to review its clips."
+          actions={
+            <Link to="/projects" className="text-sm font-medium text-accent-text hover:underline">
+              View all
+            </Link>
+          }
+        >
+          <div className="border-t border-line">
+            <JobList jobs={jobs} retentionDays={defaults?.housekeeping?.retention_days ?? 0} />
+          </div>
+        </Card>
       )}
-
-      {providers.length > 0 && !usableProvider && (
-        <p className="mt-10 max-w-3xl border-l-2 border-sodium-600 pl-4 text-sm text-ink-300">
-          No AI provider is reachable yet, so clip selection will fail. Add an API key or
-          start Ollama in{' '}
-          <a href="/settings" className="text-sodium-500 underline underline-offset-4">
-            Settings
-          </a>
-          .
-        </p>
-      )}
-
-      <RecentJobs jobs={jobs} retentionDays={defaults?.housekeeping?.retention_days ?? 0} />
     </div>
   )
 }
@@ -360,30 +491,27 @@ function AdvancedOptions({
 }) {
   const set = <K extends keyof JobSettingsOverrides>(key: K, value: JobSettingsOverrides[K]) =>
     onChange({ ...overrides, [key]: value })
+  const changed = Object.values(overrides).filter((v) => v !== undefined).length
 
   return (
-    <div className="mt-8">
+    <div className="mt-6">
       <button
         type="button"
         onClick={onToggle}
-        className="btn btn-quiet -ml-1"
+        className="inline-flex items-center gap-2 rounded-lg px-1 py-1 text-sm font-medium text-fg-muted transition-colors hover:text-fg"
         aria-expanded={open}
         aria-controls="job-options"
       >
-        <span
-          className="inline-block transition-transform duration-300"
-          style={{ transform: open ? 'rotate(90deg)' : 'none' }}
-          aria-hidden
-        >
-          ›
-        </span>
-        {open ? 'Hide options' : 'Options'}
+        <SlidersIcon size={16} />
+        Advanced options
+        {changed > 0 && <span className="rounded-full bg-accent-soft px-1.5 text-xs text-accent-text">{changed} changed</span>}
+        <ChevronDownIcon size={16} className={cx('transition-transform duration-200', open && 'rotate-180')} />
       </button>
 
       {/* grid-template-rows rather than height, so the reveal animates without
           touching layout properties. */}
       <div
-        className="grid transition-[grid-template-rows] duration-400 ease-[cubic-bezier(0.16,1,0.3,1)]"
+        className="grid transition-[grid-template-rows] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]"
         style={{ gridTemplateRows: open ? '1fr' : '0fr' }}
       >
         {/* `inert` while collapsed: the 0fr row hides the fields visually,
@@ -394,91 +522,93 @@ function AdvancedOptions({
           // React 18 has no typed `inert` prop; an empty string sets the attribute.
           {...(open ? {} : { inert: '' })}
         >
-          <div className="grid gap-x-8 gap-y-5 pt-5 sm:grid-cols-2">
-            <Selector
-              label="Provider"
-              value={overrides.provider ?? ''}
-              onChange={(v) => set('provider', v || undefined)}
-              options={[
-                { value: '', label: 'Use default' },
-                ...providers.map((p) => ({
-                  value: p.name,
-                  label: p.available ? p.name : `${p.name} — unavailable`,
-                  disabled: !p.available,
-                })),
-              ]}
-            />
-            <Selector
-              label="Whisper model"
-              value={overrides.whisper_model ?? ''}
-              onChange={(v) => set('whisper_model', v || undefined)}
-              options={[
-                { value: '', label: 'Use default' },
-                { value: 'tiny', label: 'tiny — fastest, roughest' },
-                { value: 'base', label: 'base' },
-                { value: 'small', label: 'small — balanced' },
-                { value: 'medium', label: 'medium' },
-                { value: 'large-v3', label: 'large-v3 — slowest, best' },
-              ]}
-            />
+          <p className="pt-3 text-xs text-fg-muted">
+            Just for this video. Leave anything on “Use default” to use your Settings.
+          </p>
+          <div className="grid gap-x-6 gap-y-5 pt-4 pb-1 sm:grid-cols-2">
+            <Field label="AI provider" hint="Which AI picks the clips.">
+              <Select
+                value={overrides.provider ?? ''}
+                onChange={(e) => set('provider', e.target.value || undefined)}
+                options={[
+                  { value: '', label: 'Use default' },
+                  ...providers.map((p) => ({
+                    value: p.name,
+                    label: p.available ? p.name : `${p.name} — unavailable`,
+                    disabled: !p.available,
+                  })),
+                ]}
+              />
+            </Field>
+            <Field label="Transcription quality" hint="Bigger models are slower but more accurate.">
+              <Select
+                value={overrides.whisper_model ?? ''}
+                onChange={(e) => set('whisper_model', e.target.value || undefined)}
+                options={[
+                  { value: '', label: 'Use default' },
+                  { value: 'tiny', label: 'tiny — fastest, roughest' },
+                  { value: 'base', label: 'base' },
+                  { value: 'small', label: 'small — balanced' },
+                  { value: 'medium', label: 'medium' },
+                  { value: 'large-v3', label: 'large-v3 — slowest, best' },
+                ]}
+              />
+            </Field>
             {/* Streams with a facecam overlay: stack the cam above the
                 gameplay instead of cropping it out of the 9:16 frame. */}
-            <Selector
-              label="Layout (9:16)"
-              value={overrides.layout ?? ''}
-              onChange={(v) => set('layout', (v || undefined) as Layout | undefined)}
-              options={[
-                {
-                  value: '',
-                  label: `Use default${
-                    defaults
-                      ? ` — ${LAYOUTS.find((l) => l.value === defaults.export.layout)?.label ?? defaults.export.layout}`
-                      : ''
-                  }`,
-                },
-                { value: 'auto', label: 'Auto — facecam + gameplay when a cam is found' },
-                { value: 'split', label: 'Facecam + gameplay' },
-                { value: 'crop', label: 'Crop — follow the speaker' },
-              ]}
-            />
+            <Field label="Layout (9:16)" hint="Gameplay streams: stack the facecam above the game.">
+              <Select
+                value={overrides.layout ?? ''}
+                onChange={(e) => set('layout', (e.target.value || undefined) as Layout | undefined)}
+                options={[
+                  {
+                    value: '',
+                    label: `Use default${
+                      defaults
+                        ? ` — ${LAYOUTS.find((l) => l.value === defaults.export.layout)?.label ?? defaults.export.layout}`
+                        : ''
+                    }`,
+                  },
+                  { value: 'auto', label: 'Auto — facecam + gameplay when a cam is found' },
+                  { value: 'split', label: 'Facecam + gameplay' },
+                  { value: 'crop', label: 'Crop — follow the speaker' },
+                ]}
+              />
+            </Field>
             <NumberField
-              label="Max clips"
+              label="How many clips (at most)"
               value={overrides.max_clips}
               placeholder={String(defaults?.clips.max_clips ?? 10)}
               min={1}
               max={50}
               onChange={(v) => set('max_clips', v)}
             />
-            <div className="grid grid-cols-2 gap-4">
-              <NumberField
-                label="Min length (s)"
-                value={overrides.min_duration_s}
-                placeholder={String(defaults?.clips.min_duration_s ?? 20)}
-                min={5}
-                max={300}
-                onChange={(v) => set('min_duration_s', v)}
-              />
-              <NumberField
-                label="Max length (s)"
-                value={overrides.max_duration_s}
-                placeholder={String(defaults?.clips.max_duration_s ?? 90)}
-                min={5}
-                max={300}
-                onChange={(v) => set('max_duration_s', v)}
-              />
-            </div>
+            <NumberField
+              label="Shortest clip (seconds)"
+              value={overrides.min_duration_s}
+              placeholder={String(defaults?.clips.min_duration_s ?? 20)}
+              min={5}
+              max={300}
+              onChange={(v) => set('min_duration_s', v)}
+            />
+            <NumberField
+              label="Longest clip (seconds)"
+              value={overrides.max_duration_s}
+              placeholder={String(defaults?.clips.max_duration_s ?? 90)}
+              min={5}
+              max={300}
+              onChange={(v) => set('max_duration_s', v)}
+            />
             {/* Shows the saved default until touched, and sends an explicit
                 true/false once it is: "unchecked" used to mean "use the
                 default", so a job could not opt out when the default was on. */}
-            <label className="flex items-center gap-3 text-sm text-ink-200 sm:col-span-2">
-              <input
-                type="checkbox"
-                checked={overrides.diarization ?? defaults?.whisper.diarization ?? false}
-                onChange={(e) => set('diarization', e.target.checked)}
-                className="size-4 accent-sodium-500"
-              />
-              Multiple speakers — label who is talking, and cut to them
-            </label>
+            <Checkbox
+              className="sm:col-span-2"
+              label="Multiple speakers"
+              hint="Label who is talking, and cut to them."
+              checked={overrides.diarization ?? defaults?.whisper.diarization ?? false}
+              onChange={(checked) => set('diarization', checked)}
+            />
           </div>
         </div>
       </div>
@@ -513,40 +643,6 @@ function validateOverrides(
   return null
 }
 
-function Selector({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string
-  value: string
-  onChange: (value: string) => void
-  options: { value: string; label: string; disabled?: boolean }[]
-}) {
-  return (
-    <label className="block">
-      <span className="eyebrow">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="field mt-1 cursor-pointer text-sm"
-      >
-        {options.map((option) => (
-          <option
-            key={option.value}
-            value={option.value}
-            disabled={option.disabled}
-            className="bg-ink-850"
-          >
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
-  )
-}
-
 function NumberField({
   label,
   value,
@@ -563,71 +659,33 @@ function NumberField({
   onChange: (value: number | undefined) => void
 }) {
   return (
-    <label className="block">
-      <span className="eyebrow">{label}</span>
-      <input
+    <Field label={label} hint={`Default: ${placeholder}`}>
+      <Input
         type="number"
-        className="field numeric mt-1 text-sm"
         placeholder={placeholder}
         value={value ?? ''}
         min={min}
         max={max}
         onChange={(e) => onChange(e.target.value ? Number(e.target.value) : undefined)}
       />
-    </label>
+    </Field>
   )
 }
 
-function LinkIcon({ kind }: { kind: LinkKind }) {
-  // Tiny monochrome glyphs: a play button, a cloud, a folder, a chain link.
-  const path =
-    kind === 'youtube'
-      ? 'M2 4.5A2.5 2.5 0 0 1 4.5 2h7A2.5 2.5 0 0 1 14 4.5v7a2.5 2.5 0 0 1-2.5 2.5h-7A2.5 2.5 0 0 1 2 11.5zM6.5 5.5v5l4-2.5z'
-      : kind === 'gdrive_folder'
-        ? 'M1.5 4A1.5 1.5 0 0 1 3 2.5h3l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5.5v6A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5z'
-        : kind === 'direct'
-          ? 'M6.5 9.5l3-3M5 7.5 3.8 8.7a2.3 2.3 0 0 0 3.3 3.3L8.5 11M11 8.5l1.2-1.2a2.3 2.3 0 0 0-3.3-3.3L7.5 5'
-          : 'M4.5 12.5a3 3 0 0 1-.4-6 4 4 0 0 1 7.7-1A3.3 3.3 0 0 1 11.5 12.5z'
-  const stroke = kind === 'direct'
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      className="size-3.5 shrink-0"
-      aria-hidden
-      fill={stroke ? 'none' : 'currentColor'}
-      stroke={stroke ? 'currentColor' : 'none'}
-      strokeWidth={stroke ? 1.6 : 0}
-      strokeLinecap="round"
-    >
-      <path d={path} />
-    </svg>
-  )
-}
-
-function LinkBadge({ kind }: { kind: LinkKind }) {
-  return (
-    <p className="mt-3 flex items-center gap-2 text-xs text-ink-400">
-      <LinkIcon kind={kind} />
-      <span>
-        {LINK_LABELS[kind]}
-        {kind === 'gdrive_folder' && ' · pick the videos to clip'}
-      </span>
-    </p>
-  )
+function LinkKindIcon({ kind }: { kind: LinkKind }) {
+  if (kind === 'gdrive_folder') return <FolderIcon size={14} />
+  if (kind === 'direct') return <LinkIcon size={14} />
+  if (kind === 'youtube') return <SparklesIcon size={14} />
+  return <CloudIcon size={14} />
 }
 
 function DownloadProgress({ progress }: { progress: LinkProgress }) {
   const { done_bytes: done, total_bytes: total } = progress
   const fraction = total ? Math.min(1, done / total) : null
   return (
-    <div className="mt-3 max-w-md" aria-live="polite">
-      <div className="h-1 bg-ink-800">
-        <div
-          className="h-1 bg-sodium-500 transition-[width] duration-500"
-          style={{ width: `${Math.round((fraction ?? 0) * 100)}%` }}
-        />
-      </div>
-      <p className="numeric mt-1.5 text-xs text-ink-500">
+    <div className="mt-4 max-w-md" aria-live="polite">
+      <ProgressBar value={fraction ?? 0} label="Download progress" />
+      <p className="numeric mt-1.5 text-xs text-fg-muted">
         {fraction !== null
           ? `${Math.round(fraction * 100)}% of ${formatBytes(total ?? 0)}`
           : done > 0
@@ -660,42 +718,43 @@ function FolderPicker({
   const all = folder.files.length > 0 && picked.size === folder.files.length
 
   return (
-    <div className="mt-6 border border-ink-800 p-4">
+    <div className="mt-5 rounded-xl border border-line bg-subtle/60 p-4">
       <div className="flex items-baseline justify-between gap-4">
-        <p className="truncate text-sm text-ink-100">{folder.name}</p>
-        <span className="numeric shrink-0 text-xs text-ink-500">
+        <p className="flex min-w-0 items-center gap-2 text-sm font-semibold text-fg">
+          <FolderIcon size={16} className="text-fg-subtle" />
+          <span className="truncate">{folder.name}</span>
+        </p>
+        <span className="numeric shrink-0 text-xs text-fg-muted">
           {folder.files.length} video{folder.files.length === 1 ? '' : 's'}
         </span>
       </div>
       {folder.files.length === 0 ? (
-        <p className="mt-3 text-xs text-ink-500">No video or audio files in this folder.</p>
+        <p className="mt-3 text-sm text-fg-muted">No video or audio files in this folder.</p>
       ) : (
         <>
-          <label className="mt-3 flex items-center gap-3 text-xs text-ink-400">
+          <label className="mt-3 flex items-center gap-3 text-sm font-medium text-fg-muted">
             <input
               type="checkbox"
               checked={all}
               onChange={() => onChange(all ? new Set() : new Set(folder.files.map((f) => f.id)))}
-              className="size-4 accent-sodium-500"
+              className="size-4"
               disabled={busy}
             />
             Select all
           </label>
-          <ul className="mt-2 max-h-64 overflow-y-auto">
+          <ul className="mt-2 max-h-64 overflow-y-auto rounded-lg border border-line bg-surface">
             {folder.files.map((file) => (
-              <li key={file.id}>
-                <label className="flex items-center gap-3 border-b border-ink-850 py-2 text-sm text-ink-200">
+              <li key={file.id} className="border-b border-line last:border-b-0">
+                <label className="flex items-center gap-3 px-3 py-2 text-sm text-fg">
                   <input
                     type="checkbox"
                     checked={picked.has(file.id)}
                     onChange={() => toggle(file.id)}
-                    className="size-4 shrink-0 accent-sodium-500"
+                    className="size-4 shrink-0"
                     disabled={busy}
                   />
                   <span className="truncate">{file.name}</span>
-                  {file.folder && (
-                    <span className="ml-auto shrink-0 text-xs text-ink-600">{file.folder}</span>
-                  )}
+                  {file.folder && <span className="ml-auto shrink-0 text-xs text-fg-subtle">{file.folder}</span>}
                 </label>
               </li>
             ))}
@@ -703,94 +762,11 @@ function FolderPicker({
         </>
       )}
       {folder.truncated && (
-        <p className="mt-2 text-xs text-ink-500">
-          The folder is large; only the first part of it is listed.
-        </p>
+        <p className="mt-2 text-xs text-fg-muted">The folder is large; only the first part of it is listed.</p>
       )}
-      <button
-        type="button"
-        className="btn btn-primary mt-4"
-        disabled={busy || picked.size === 0}
-        onClick={onClip}
-      >
+      <Button variant="primary" className="mt-4" disabled={busy || picked.size === 0} loading={busy} onClick={onClip}>
         {busy ? 'Working…' : `Clip ${picked.size} video${picked.size === 1 ? '' : 's'}`}
-      </button>
+      </Button>
     </div>
-  )
-}
-
-/** "Deletes in 3 days" for a job, given the retention setting (0 = off). */
-function deletesIn(job: Job, retentionDays: number): string | null {
-  if (retentionDays <= 0 || job.status === 'queued' || job.status === 'running') return null
-  const created = Date.parse(job.created_at)
-  if (Number.isNaN(created)) return null
-  const left = Math.ceil((created + retentionDays * 86_400_000 - Date.now()) / 86_400_000)
-  if (left <= 0) return 'Deleting soon'
-  return `Deletes in ${left} day${left === 1 ? '' : 's'}`
-}
-
-function RecentJobs({ jobs, retentionDays }: { jobs: Job[]; retentionDays: number }) {
-  if (jobs.length === 0) return null
-
-  return (
-    <section className="rise mt-24" style={{ animationDelay: '240ms' }}>
-      <div className="flex items-baseline justify-between border-b border-ink-800 pb-3">
-        <h2 className="eyebrow">Recent</h2>
-        <span className="numeric text-xs text-ink-600">{jobs.length}</span>
-      </div>
-
-      <ul>
-        {jobs.map((job) => (
-          <li key={job.id}>
-            <a
-              href={job.status === 'done' ? `/jobs/${job.id}/clips` : `/jobs/${job.id}`}
-              className="group grid grid-cols-[1fr_auto] items-baseline gap-4 border-b border-ink-850 py-4 transition-colors duration-200 hover:bg-ink-850/40 sm:grid-cols-[1fr_7rem_6rem_5rem]"
-            >
-              <span className="min-w-0">
-                <span className="block truncate text-[0.9375rem] text-ink-200 group-hover:text-ink-100">
-                  {job.source?.title || 'Untitled'}
-                </span>
-                {deletesIn(job, retentionDays) && (
-                  <span className="mt-0.5 block text-xs text-ink-600">
-                    {deletesIn(job, retentionDays)}
-                  </span>
-                )}
-              </span>
-              <span className="numeric hidden text-xs text-ink-500 sm:block">
-                {job.source ? formatDuration(job.source.duration_s) : '—'}
-              </span>
-              <span className="hidden text-xs text-ink-500 sm:block">{job.provider}</span>
-              <StatusTag job={job} />
-            </a>
-            {job.status === 'done' && (
-              <a
-                href={`/jobs/${job.id}/pick`}
-                className="-mt-3 block pb-3 text-right text-[0.6875rem] text-ink-500 transition-colors hover:text-sodium-500"
-              >
-                Pick parts on the rewatch graph →
-              </a>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
-  )
-}
-
-function StatusTag({ job }: { job: Job }) {
-  const tone: Record<string, string> = {
-    done: 'text-signal-good',
-    failed: 'text-signal-bad',
-    running: 'text-sodium-500',
-    queued: 'text-ink-400',
-    cancelled: 'text-ink-500',
-  }
-  const label =
-    job.status === 'running' ? `${Math.round(job.progress * 100)}%` : job.status
-
-  return (
-    <span className={`numeric justify-self-end text-xs ${tone[job.status] ?? 'text-ink-400'}`}>
-      {label}
-    </span>
   )
 }

@@ -256,7 +256,7 @@ export function LiveSettingsSection({
     )
   }
 
-  if (!draft) return <p className="max-w-4xl pt-10 text-sm text-ink-500">Loading settings…</p>
+  if (!draft) return <p className="max-w-4xl text-sm text-fg-muted">Loading settings…</p>
 
   const buffer = draft.rolling_buffer
   const retentionS = buffer.retain_minutes * 60
@@ -266,7 +266,7 @@ export function LiveSettingsSection({
 
   return (
     <div className="max-w-4xl">
-      <p className="mt-8 max-w-prose text-sm leading-relaxed text-ink-400">
+      <p className="max-w-prose text-sm leading-relaxed text-fg-muted">
         Changes are staged until you save. Saving applies them to the running watchers right
         away — no restart.
       </p>
@@ -415,7 +415,7 @@ export function LiveSettingsSection({
         />
       </Section>
 
-      <section className="mt-16">
+      <section className="mt-8">
         <button
           type="button"
           onClick={() => setAdvancedOpen((open) => !open)}
@@ -604,7 +604,7 @@ export function LiveSettingsSection({
         </div>
       )}
 
-      <div className="sticky bottom-0 z-10 mt-14 border-t border-ink-800 bg-ink-900/95 py-4 backdrop-blur-[2px]">
+      <div className="sticky bottom-3 z-10 mt-8 rounded-xl border border-line bg-surface/95 px-4 py-3 shadow-[var(--shadow-pop)] backdrop-blur">
         <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
           <p className="min-w-0 text-xs leading-snug" aria-live="polite">
             {blocked ? (
@@ -655,14 +655,14 @@ function Section({
 }) {
   const headingId = useId()
   return (
-    <section ref={sectionRef} aria-labelledby={headingId} className="rise mt-14 scroll-mt-6">
-      <div className="border-b border-ink-800 pb-2">
-        <h2 id={headingId} className="eyebrow">
+    <section ref={sectionRef} aria-labelledby={headingId} className="card rise mt-6 scroll-mt-6 p-5 sm:p-6">
+      <div>
+        <h2 id={headingId} className="text-base font-semibold text-fg">
           {title}
         </h2>
-        {note && <p className="mt-1 text-xs leading-relaxed text-ink-500">{note}</p>}
+        {note && <p className="mt-0.5 text-sm leading-relaxed text-fg-muted">{note}</p>}
       </div>
-      <div className="mt-6">{children}</div>
+      <div className="mt-5">{children}</div>
     </section>
   )
 }

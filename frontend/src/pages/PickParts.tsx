@@ -5,6 +5,21 @@ import { api, formatDuration, FRAMINGS, type Framing, type Job } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 import { COMPONENT_STYLE, RewatchGraph } from '../components/RewatchGraph'
 import { MAX_PICK_S, MAX_PICKS, MIN_PICK_S, picksApi, type Audience, type PickTask, type TimeRange } from '../picks/api'
+import {
+  Button,
+  Callout,
+  Card,
+  Field,
+  IconButton,
+  PageHeader,
+  PageSkeleton,
+  PlayIcon,
+  ProgressBar,
+  ScissorsIcon,
+  Select,
+  XIcon,
+} from '../ui'
+
 
 type Component = keyof typeof COMPONENT_STYLE
 
@@ -65,13 +80,14 @@ export function PickParts() {
 
   if (loadError) {
     return (
-      <div className="max-w-3xl pt-14">
+      <div className="max-w-3xl">
+        <PageHeader back={{ to: `/jobs/${jobId}/clips`, label: 'Back to clips' }} title="Pick your own parts" />
         <ErrorNote error={loadError} />
       </div>
     )
   }
   if (!job || !audience) {
-    return <p className="pt-24 text-sm text-ink-500">Loading…</p>
+    return <PageSkeleton cards={2} />
   }
 
   const duration = audience.duration_s || job.source?.duration_s || 0
@@ -114,120 +130,120 @@ export function PickParts() {
   )
 
   return (
-    <div className="pt-14">
-      <div className="rise flex flex-wrap items-baseline justify-between gap-6 border-b border-ink-800 pb-6">
-        <div className="min-w-0">
-          <Link to={`/jobs/${jobId}/clips`} className="eyebrow transition-colors hover:text-sodium-500">
-            ← Clips
-          </Link>
-          <h1 className="mt-2 max-w-3xl truncate font-display text-[clamp(1.75rem,4vw,3rem)] leading-tight text-ink-100">
-            Pick your own parts
-          </h1>
-          <p className="mt-2 truncate text-sm text-ink-400">{job.source?.title || 'Untitled'}</p>
-        </div>
-        <p className="max-w-sm text-xs leading-relaxed text-ink-500">
-          Drag across the graph to pick a part; drag a part's edges to adjust it. Click to jump the
-          preview there. Edges snap to the nearest sentence when the clip is made.
-        </p>
-      </div>
+    <div>
+      <PageHeader
+        back={{ to: `/jobs/${jobId}/clips`, label: 'Back to clips' }}
+        title="Pick your own parts"
+        description={
+          <>
+            <span className="font-medium text-fg">{job.source?.title || 'Untitled'}</span> — drag across the graph to
+            pick a part, drag its edges to adjust, click to jump the preview there.
+          </>
+        }
+      />
 
       {job.status !== 'done' && (
-        <p className="mt-8 text-sm text-signal-bad">
+        <Callout tone="warn" className="mb-6">
           Parts can be picked once the job has finished (it is {job.status}).
-        </p>
+        </Callout>
       )}
 
-      <div className="mt-10 grid gap-10 lg:grid-cols-[1fr_20rem]">
-        <section className="min-w-0">
-          <div className="mb-6 flex flex-wrap items-baseline justify-between gap-4">
-            <h2 className="eyebrow">
-              {audience.kind === 'audience'
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        <div className="min-w-0 space-y-6">
+          <Card
+            title={
+              audience.kind === 'audience'
                 ? 'Where viewers rewatch'
                 : audience.kind === 'energy'
-                  ? 'Audio energy (no viewer data for this video)'
-                  : 'Timeline (no viewer data for this video)'}
-            </h2>
-            <div className="flex flex-wrap items-baseline gap-4 text-xs">
-              <span className="flex items-center gap-1.5 text-ink-300">
-                <span className="inline-block h-0.5 w-4 bg-sodium-500" />
-                Blend
-              </span>
-              {available.map((name) => (
-                <label key={name} className="flex cursor-pointer items-center gap-1.5 text-ink-400">
-                  <input
-                    type="checkbox"
-                    checked={visible[name]}
-                    onChange={(e) => setVisible({ ...visible, [name]: e.target.checked })}
-                  />
-                  <span
-                    className="inline-block h-0.5 w-4"
-                    style={{ background: COMPONENT_STYLE[name].color }}
-                  />
-                  {COMPONENT_STYLE[name].label}
-                </label>
-              ))}
+                  ? 'Audio energy'
+                  : 'Timeline'
+            }
+            description={
+              audience.kind === 'audience'
+                ? 'Peaks are the moments people replay most.'
+                : 'No viewer data for this video, so this shows the timeline.'
+            }
+            actions={
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                <span className="flex items-center gap-1.5 font-medium text-fg-muted">
+                  <span className="inline-block h-0.5 w-4 rounded bg-accent" />
+                  Blend
+                </span>
+                {available.map((name) => (
+                  <label key={name} className="flex cursor-pointer items-center gap-1.5 text-fg-muted">
+                    <input
+                      type="checkbox"
+                      checked={visible[name]}
+                      onChange={(e) => setVisible({ ...visible, [name]: e.target.checked })}
+                    />
+                    <span className="inline-block h-0.5 w-4" style={{ background: COMPONENT_STYLE[name].color }} />
+                    {COMPONENT_STYLE[name].label}
+                  </label>
+                ))}
+              </div>
+            }
+          >
+            <div className="pt-2">
+              <RewatchGraph
+                curve={audience.curve}
+                components={audience.components}
+                visible={visible}
+                stepS={audience.step_s}
+                duration={duration}
+                bands={audience.clips}
+                hotspots={audience.hotspots}
+                picks={picks}
+                onPicksChange={canPick ? setPicks : () => undefined}
+                onSeek={seek}
+                playhead={playhead}
+              />
             </div>
-          </div>
-
-          <div className="pt-5">
-            <RewatchGraph
-              curve={audience.curve}
-              components={audience.components}
-              visible={visible}
-              stepS={audience.step_s}
-              duration={duration}
-              bands={audience.clips}
-              hotspots={audience.hotspots}
-              picks={picks}
-              onPicksChange={canPick ? setPicks : () => undefined}
-              onSeek={seek}
-              playhead={playhead}
-            />
-          </div>
-          <p className="mt-2 text-[0.6875rem] text-ink-600">
-            Grey strip: clips already made from this video. Dots: the hottest moments.
-          </p>
+            <p className="mt-3 text-xs text-fg-muted">
+              Grey strip: clips already made from this video. Dots: the hottest moments. Edges snap to the nearest
+              sentence when the clip is made.
+            </p>
+          </Card>
 
           {job.source?.has_video !== false && (
-            <video
-              ref={video}
-              src={api.mediaUrl(jobId)}
-              controls
-              preload="metadata"
-              className="mt-8 aspect-video w-full max-w-2xl bg-ink-850"
-              onTimeUpdate={(e) => setPlayhead(e.currentTarget.currentTime)}
-            />
+            <Card padding="sm" title="Preview">
+              <video
+                ref={video}
+                src={api.mediaUrl(jobId)}
+                controls
+                preload="metadata"
+                className="aspect-video w-full rounded-lg bg-media"
+                onTimeUpdate={(e) => setPlayhead(e.currentTarget.currentTime)}
+              />
+            </Card>
           )}
-        </section>
+        </div>
 
-        <aside>
-          <h2 className="eyebrow border-b border-ink-800 pb-3">
-            Picked · <span className="numeric">{picks.length}</span>
-          </h2>
+        <Card as="aside" className="lg:sticky lg:top-6" title={`Picked parts (${picks.length})`}>
           {picks.length === 0 ? (
-            <p className="mt-4 text-sm text-ink-500">Nothing picked yet.</p>
+            <p className="rounded-lg border border-dashed border-line-strong px-4 py-6 text-center text-sm text-fg-muted">
+              Nothing picked yet. Drag across the graph to pick a part.
+            </p>
           ) : (
-            <ol className="mt-1">
+            <ol className="-mx-1 divide-y divide-line">
               {picks.map((p, i) => (
-                <li key={i} className="grid grid-cols-[1.5rem_1fr_auto] items-center gap-3 border-b border-ink-850 py-3">
-                  <span className="numeric text-xs text-sodium-500">{i + 1}</span>
-                  <div className="flex items-center gap-2 text-xs text-ink-300">
+                <li key={i} className="grid grid-cols-[1.5rem_1fr_auto] items-center gap-2 px-1 py-2.5">
+                  <span className="numeric grid size-6 place-items-center rounded-full bg-accent-soft text-xs font-semibold text-accent-text">
+                    {i + 1}
+                  </span>
+                  <div className="flex items-center gap-1.5 text-xs text-fg-muted">
                     <EdgeInput label={`Part ${i + 1} start`} value={p.start} onCommit={(v) => updatePick(i, 'start', v)} />
-                    <span className="text-ink-600">–</span>
+                    <span className="text-fg-subtle">–</span>
                     <EdgeInput label={`Part ${i + 1} end`} value={p.end} onCommit={(v) => updatePick(i, 'end', v)} />
-                    <span className="numeric text-ink-500">{(p.end - p.start).toFixed(1)} s</span>
+                    <span className="numeric whitespace-nowrap">{(p.end - p.start).toFixed(1)} s</span>
                   </div>
-                  <div className="flex items-center gap-1">
-                    <button className="btn btn-quiet px-1.5 py-0.5 text-xs" onClick={() => seek(p.start)} title="Play from here">
-                      ▶
-                    </button>
-                    <button
-                      className="btn btn-quiet px-1.5 py-0.5 text-xs"
+                  <div className="flex items-center">
+                    <IconButton icon={PlayIcon} label={`Play part ${i + 1}`} size="sm" onClick={() => seek(p.start)} />
+                    <IconButton
+                      icon={XIcon}
+                      label={`Remove part ${i + 1}`}
+                      size="sm"
                       onClick={() => setPicks(picks.filter((_, k) => k !== i))}
-                      aria-label={`Remove part ${i + 1}`}
-                    >
-                      ✕
-                    </button>
+                    />
                   </div>
                 </li>
               ))}
@@ -235,55 +251,53 @@ export function PickParts() {
           )}
 
           {picks.length > 0 && (
-            <p className="numeric mt-3 text-xs text-ink-500">
+            <p className="numeric mt-3 text-xs text-fg-muted">
               {formatDuration(total)} in total
               {picks.length > 1 && total > MAX_PICK_S && ' · a joined clip stops at 3:00'}
             </p>
           )}
-          {tooMany && <p className="mt-2 text-xs text-signal-bad">Pick at most {MAX_PICKS} parts at a time.</p>}
+          {tooMany && <p className="mt-2 text-xs text-danger">Pick at most {MAX_PICKS} parts at a time.</p>}
 
-          <label className="mt-6 block text-xs text-ink-400">
-            Framing
-            <select
-              className="field mt-1 w-full text-sm"
-              value={framing}
-              onChange={(e) => setFraming(e.target.value as Framing | '')}
-            >
+          <Field label="Framing" className="mt-5" hint="How the picture is fitted into the vertical frame.">
+            <Select value={framing} onChange={(e) => setFraming(e.target.value as Framing | '')}>
               <option value="">From settings</option>
               {FRAMINGS.map((f) => (
                 <option key={f.value} value={f.value}>
                   {f.label}
                 </option>
               ))}
-            </select>
-          </label>
+            </Select>
+          </Field>
 
-          <div className="mt-6 flex flex-col gap-3">
-            <button
-              className="btn btn-primary"
+          <div className="mt-5 flex flex-col gap-2">
+            <Button
+              variant="primary"
+              icon={ScissorsIcon}
+              loading={submitting}
               disabled={!canPick || picks.length === 0 || tooMany}
               onClick={() => submit(false)}
             >
-              {submitting ? 'Starting…' : `Make ${picks.length || ''} clip${picks.length === 1 ? '' : 's'}`.replace('  ', ' ')}
-            </button>
-            <button
-              className="btn btn-ghost"
+              {submitting
+                ? 'Starting…'
+                : `Make ${picks.length || ''} clip${picks.length === 1 ? '' : 's'}`.replace('  ', ' ')}
+            </Button>
+            <Button
               disabled={!canPick || picks.length < 2 || tooMany}
               onClick={() => submit(true)}
               title="One clip of all the parts, back to back in time order"
             >
               Join into 1 clip
-            </button>
+            </Button>
           </div>
 
           {actionError && (
-            <div className="mt-6">
+            <div className="mt-5">
               <ErrorNote error={actionError} onDismiss={() => setActionError(null)} />
             </div>
           )}
 
           {task && <TaskStatus task={task} jobId={jobId} />}
-        </aside>
+        </Card>
       </div>
     </div>
   )
@@ -292,31 +306,24 @@ export function PickParts() {
 function TaskStatus({ task, jobId }: { task: PickTask; jobId: string }) {
   const count = task.clip_ids.length
   return (
-    <div className="mt-8 border-t border-ink-800 pt-5" aria-live="polite">
+    <div className="mt-5 border-t border-line pt-4" aria-live="polite">
       {task.state === 'running' && (
         <>
-          <p className="text-sm text-ink-200">
-            Making {count} clip{count === 1 ? '' : 's'}… <span className="text-ink-500">{task.message}</span>
+          <p className="text-sm text-fg">
+            Making {count} clip{count === 1 ? '' : 's'}… <span className="text-fg-muted">{task.message}</span>
           </p>
-          <div className="mt-3 h-px w-full bg-ink-800">
-            <div
-              className="h-px origin-left bg-sodium-500 transition-transform duration-500"
-              style={{ transform: `scaleX(${task.progress})` }}
-            />
-          </div>
+          <ProgressBar value={task.progress} className="mt-3" label="Making clips" />
         </>
       )}
       {task.state === 'done' && (
-        <p className="text-sm text-signal-good">
+        <Callout tone="success">
           {count} clip{count === 1 ? '' : 's'} ready.{' '}
-          <Link to={`/jobs/${jobId}/clips`} className="text-sodium-500 underline-offset-4 hover:underline">
+          <Link to={`/jobs/${jobId}/clips`} className="link font-medium">
             Review clips
           </Link>
-        </p>
+        </Callout>
       )}
-      {task.state === 'failed' && (
-        <ErrorNote error={new Error(task.error || 'Rendering the picked clips failed.')} />
-      )}
+      {task.state === 'failed' && <ErrorNote error={new Error(task.error || 'Rendering the picked clips failed.')} />}
     </div>
   )
 }
@@ -334,7 +341,7 @@ function EdgeInput({ label, value, onCommit }: { label: string; value: number; o
     <input
       aria-label={label}
       title={formatDuration(value)}
-      className="field numeric w-16 py-0.5 text-xs"
+      className="field numeric w-16 px-1.5 py-1 text-xs"
       value={text}
       onChange={(e) => setText(e.target.value)}
       onBlur={commit}

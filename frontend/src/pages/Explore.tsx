@@ -1,6 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import { ErrorNote } from '../components/ErrorNote'
+import {
+  ArrowLeftIcon,
+  Button,
+  Card,
+  CompassIcon,
+  EmptyState,
+  Field,
+  Input,
+  PageHeader,
+  SearchIcon,
+  Segmented,
+  Select,
+  Skeleton,
+  Tabs,
+} from '../ui'
 import { Avatar, ResultGrid } from '../explore/Cards'
 import { PeekPanel, type PeekTarget } from '../explore/PeekPanel'
 import {
@@ -171,96 +186,93 @@ export function Explore() {
   }, [])
 
   return (
-    <div className="pt-14">
-      <div className="rise max-w-3xl">
-        <p className="eyebrow">Explore · YouTube & Twitch · No API key</p>
-        <h1 className="mt-5 font-display text-[clamp(2.5rem,6vw,4.75rem)] leading-[0.95] text-ink-100">
-          Find something
-          <br />
-          worth <span className="italic text-sodium-500">clipping</span>.
-        </h1>
-      </div>
+    <div>
+      <PageHeader
+        title="Explore"
+        description="Find something worth clipping on YouTube or Twitch. Click a result to see where viewers rewatch before you clip it."
+      />
 
-      {/* Source switch */}
-      <div className="rise mt-12 flex items-baseline gap-6 border-b border-ink-800" style={{ animationDelay: '60ms' }}>
-        {(['youtube', 'twitch'] as const).map((s) => (
-          <TabButton key={s} active={source === s} onClick={() => switchSource(s)} large>
-            {s === 'youtube' ? 'YouTube' : 'Twitch'}
-          </TabButton>
-        ))}
-      </div>
+      <Card padding="md">
+        <Tabs
+          label="Where to search"
+          variant="pill"
+          items={[
+            { key: 'youtube', label: 'YouTube' },
+            { key: 'twitch', label: 'Twitch' },
+          ]}
+          value={source}
+          onChange={switchSource}
+        />
 
-      <section className="rise mt-8" style={{ animationDelay: '120ms' }}>
         <form
           onSubmit={(e) => {
             e.preventDefault()
             submit(input)
           }}
-          className="flex max-w-3xl items-end gap-4"
+          className="mt-4 flex flex-col gap-3 sm:flex-row"
         >
           <label htmlFor="explore-q" className="sr-only">
             Search
           </label>
-          <input
-            id="explore-q"
-            className="field font-display text-xl md:text-2xl"
-            placeholder={
-              source === 'youtube'
-                ? 'Search YouTube, or paste a video or channel link'
-                : twitchSearch
-                  ? 'Search Twitch channels'
-                  : 'Twitch channel name, e.g. shroud'
-            }
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <button type="submit" className="btn btn-primary shrink-0" disabled={!input.trim()}>
+          <div className="relative min-w-0 flex-1">
+            <SearchIcon size={18} className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-fg-subtle" />
+            <Input
+              id="explore-q"
+              className="py-3 pl-11 text-base"
+              placeholder={
+                source === 'youtube'
+                  ? 'Search YouTube, or paste a video or channel link'
+                  : twitchSearch
+                    ? 'Search Twitch channels'
+                    : 'Twitch channel name, e.g. shroud'
+              }
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <Button type="submit" variant="primary" size="lg" icon={SearchIcon} loading={loading} disabled={!input.trim()}>
             {loading ? 'Searching…' : 'Search'}
-          </button>
+          </Button>
         </form>
 
         {source === 'youtube' ? (
-          <div className="mt-6 flex flex-wrap items-end gap-x-8 gap-y-4">
-            <div className="flex items-baseline gap-5">
-              {YT_TYPES.map((t) => (
-                <TabButton
-                  key={t.value}
-                  active={ytType === t.value}
-                  onClick={() => {
-                    setYtType(t.value)
-                    setChannel(null)
-                  }}
-                >
-                  {t.label}
-                </TabButton>
-              ))}
+          <div className="mt-4 flex flex-wrap items-end gap-x-6 gap-y-4">
+            <div>
+              <p className="mb-1.5 text-sm font-medium text-fg">Show</p>
+              <Segmented
+                label="Result type"
+                options={YT_TYPES}
+                value={ytType}
+                onChange={(value) => {
+                  setYtType(value)
+                  setChannel(null)
+                }}
+              />
             </div>
-            <div className="flex flex-wrap items-end gap-6">
-              {ytType === 'videos' && (
-                <FilterSelect label="Length" value={duration} options={DURATIONS} onChange={setDuration} />
-              )}
-              {ytType !== 'channels' && (
-                <>
-                  <FilterSelect label="Sort" value={sort} options={SORTS} onChange={setSort} />
-                  <FilterSelect label="Uploaded" value={uploaded} options={UPLOADED} onChange={setUploaded} />
-                </>
-              )}
-            </div>
+            {ytType === 'videos' && (
+              <FilterSelect label="Length" value={duration} options={DURATIONS} onChange={setDuration} />
+            )}
+            {ytType !== 'channels' && (
+              <>
+                <FilterSelect label="Sort by" value={sort} options={SORTS} onChange={setSort} />
+                <FilterSelect label="Uploaded" value={uploaded} options={UPLOADED} onChange={setUploaded} />
+              </>
+            )}
           </div>
         ) : (
           !twitchSearch && (
-            <p className="mt-3 max-w-3xl text-xs leading-relaxed text-ink-500">
-              Type a channel name to see its past broadcasts and top clips. Keyword search for
-              channels needs Twitch app credentials (Client ID and secret), saved in GTA Mode
-              settings. Live broadcasts are hidden until they end.
+            <p className="mt-3 max-w-3xl text-xs leading-relaxed text-fg-muted">
+              Type a channel name to see its past broadcasts and top clips. Keyword search for channels needs Twitch
+              app credentials (Client ID and secret), saved in GTA Mode → Settings. Live broadcasts are hidden until
+              they end.
             </p>
           )
         )}
-      </section>
+      </Card>
 
-      <div className="mt-10">
+      <div className="mt-8">
         {error && (
           <div className="mb-8 max-w-3xl">
             <ErrorNote error={error} onDismiss={() => setError(null)} />
@@ -278,40 +290,40 @@ export function Explore() {
           <SkeletonGrid />
         ) : items ? (
           <div className={loading ? 'opacity-50 transition-opacity' : 'transition-opacity'}>
-            {note && <p className="mb-6 text-xs text-ink-500">{note}</p>}
+            {note && <p className="mb-6 text-xs text-fg-muted">{note}</p>}
             {items.length === 0 ? (
-              <p className="text-sm text-ink-400">Nothing found. Try other words or loosen the filters.</p>
+              <EmptyState
+                compact
+                icon={SearchIcon}
+                title="Nothing found"
+                description="Try other words or loosen the filters."
+              />
             ) : (
               <ResultGrid items={items} onOpen={openItem} onChannel={openChannelOf} />
             )}
           </div>
         ) : (
           source === 'youtube' && (
-            <div className="max-w-3xl">
-              <p className="eyebrow">Try</p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {SUGGESTIONS.map((s) => (
-                  <button
-                    key={s}
-                    type="button"
-                    className="btn btn-ghost"
-                    onClick={() => {
-                      setInput(s)
-                      setDuration('long')
-                      setSort('views')
-                      setYtType('videos')
-                      submit(s)
-                    }}
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-4 text-xs leading-relaxed text-ink-500">
-                Long, well-watched videos give the clipper the most to work with. Click any result to
-                see its "Most replayed" graph before you clip it.
-              </p>
-            </div>
+            <EmptyState
+              icon={CompassIcon}
+              title="Start with a search"
+              description="Long, well-watched videos give the clipper the most to work with. Try one of these:"
+              action={SUGGESTIONS.map((s) => (
+                <Button
+                  key={s}
+                  size="sm"
+                  onClick={() => {
+                    setInput(s)
+                    setDuration('long')
+                    setSort('views')
+                    setYtType('videos')
+                    submit(s)
+                  }}
+                >
+                  {s}
+                </Button>
+              ))}
+            />
           )
         )}
       </div>
@@ -367,55 +379,50 @@ function ChannelBrowser({
   return (
     <div>
       {onBack && (
-        <button type="button" onClick={onBack} className="btn btn-quiet -ml-1 mb-6">
-          ← Back to results
-        </button>
+        <Button variant="ghost" icon={ArrowLeftIcon} onClick={onBack} className="-ml-2 mb-4">
+          Back to results
+        </Button>
       )}
 
-      {info?.banner && (
-        <div className="mb-6 h-24 overflow-hidden rounded-[2px] border border-ink-800 md:h-32">
-          <img src={info.banner} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" />
-        </div>
-      )}
-      <div className="flex items-center gap-5">
-        <Avatar src={info?.avatar ?? null} name={info?.title ?? view.title} size={64} />
-        <div className="min-w-0">
-          <h2 className="truncate font-display text-3xl text-ink-100 md:text-4xl">{info?.title ?? view.title}</h2>
-          <p className="numeric mt-1 text-xs text-ink-500">
-            {info?.subscribers != null && `${compactNumber(info.subscribers)} subscribers · `}
-            <a href={info?.url ?? view.url} target="_blank" rel="noreferrer" className="hover:text-sodium-400">
-              {view.source === 'twitch' ? 'twitch.tv' : 'youtube.com'} ↗
-            </a>
-          </p>
-        </div>
-      </div>
-
-      <div className="mt-8 flex flex-wrap items-end justify-between gap-4 border-b border-ink-800">
-        <div className="flex items-baseline gap-6">
-          {tabs.map((t) => (
-            <TabButton key={t.value} active={tab === t.value} onClick={() => setTab(t.value)}>
-              {t.label}
-            </TabButton>
-          ))}
-        </div>
-        {view.source === 'twitch' && (
-          <div className="mb-2">
-            {tab === 'clips' ? (
-              <FilterSelect label="Range" value={range} options={CLIP_RANGES} onChange={setRange} />
-            ) : (
-              <FilterSelect
-                label="Sort"
-                value={twitchSort}
-                options={[
-                  { value: 'time', label: 'Newest' },
-                  { value: 'views', label: 'Most viewed' },
-                ]}
-                onChange={setTwitchSort}
-              />
-            )}
+      <Card padding="none" className="overflow-hidden">
+        {info?.banner && (
+          <div className="h-24 overflow-hidden md:h-32">
+            <img src={info.banner} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" />
           </div>
         )}
-      </div>
+        <div className="flex items-center gap-4 p-5 sm:p-6">
+          <Avatar src={info?.avatar ?? null} name={info?.title ?? view.title} size={56} />
+          <div className="min-w-0">
+            <h2 className="truncate text-xl font-bold text-fg md:text-2xl">{info?.title ?? view.title}</h2>
+            <p className="numeric mt-1 text-sm text-fg-muted">
+              {info?.subscribers != null && `${compactNumber(info.subscribers)} subscribers · `}
+              <a href={info?.url ?? view.url} target="_blank" rel="noreferrer" className="link">
+                {view.source === 'twitch' ? 'twitch.tv' : 'youtube.com'} ↗
+              </a>
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-end justify-between gap-4 px-5 sm:px-6">
+          <Tabs label="Channel content" items={tabs.map((t) => ({ key: t.value, label: t.label }))} value={tab} onChange={setTab} className="border-b-0" />
+          {view.source === 'twitch' && (
+            <div className="mb-3">
+              {tab === 'clips' ? (
+                <FilterSelect label="Range" value={range} options={CLIP_RANGES} onChange={setRange} />
+              ) : (
+                <FilterSelect
+                  label="Sort by"
+                  value={twitchSort}
+                  options={[
+                    { value: 'time', label: 'Newest' },
+                    { value: 'views', label: 'Most viewed' },
+                  ]}
+                  onChange={setTwitchSort}
+                />
+              )}
+            </div>
+          )}
+        </div>
+      </Card>
 
       <div className="mt-8">
         {error ? (
@@ -425,7 +432,7 @@ function ChannelBrowser({
         ) : loading && !page ? (
           <SkeletonGrid />
         ) : page && page.items.length === 0 ? (
-          <p className="text-sm text-ink-400">Nothing on this tab.</p>
+          <EmptyState compact title="Nothing on this tab" />
         ) : (
           page && (
             <div className={loading ? 'opacity-50 transition-opacity' : 'transition-opacity'}>
@@ -435,33 +442,6 @@ function ChannelBrowser({
         )}
       </div>
     </div>
-  )
-}
-
-function TabButton({
-  active,
-  onClick,
-  large,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  large?: boolean
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        '-mb-px border-b-2 pb-2 font-medium transition-colors duration-200',
-        large ? 'text-base' : 'text-sm',
-        active ? 'border-sodium-500 text-sodium-500' : 'border-transparent text-ink-400 hover:text-ink-200',
-      ].join(' ')}
-    >
-      {children}
-    </button>
   )
 }
 
@@ -477,20 +457,9 @@ function FilterSelect<T extends string>({
   onChange: (value: T) => void
 }) {
   return (
-    <label className="block min-w-36">
-      <span className="eyebrow">{label}</span>
-      <select
-        className="field mt-1 cursor-pointer text-sm"
-        value={value}
-        onChange={(e) => onChange(e.target.value as T)}
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </label>
+    <Field label={label} className="min-w-40">
+      <Select value={value} onChange={(e) => onChange(e.target.value as T)} options={options} />
+    </Field>
   )
 }
 
@@ -499,9 +468,9 @@ function SkeletonGrid() {
     <ul className="grid grid-cols-1 gap-x-6 gap-y-8 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4" aria-hidden>
       {Array.from({ length: 8 }, (_, i) => (
         <li key={i}>
-          <div className="aspect-video animate-pulse bg-ink-850" />
-          <div className="mt-3 h-3 w-4/5 animate-pulse bg-ink-850" />
-          <div className="mt-2 h-3 w-2/5 animate-pulse bg-ink-850" />
+          <Skeleton className="aspect-video h-auto w-full rounded-xl" />
+          <Skeleton className="mt-3 h-3 w-4/5" />
+          <Skeleton className="mt-2 h-3 w-2/5" />
         </li>
       ))}
     </ul>

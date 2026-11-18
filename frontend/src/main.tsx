@@ -4,29 +4,14 @@ import { createBrowserRouter, RouterProvider } from 'react-router-dom'
 
 import { App } from './App'
 import './index.css'
-import { Explore } from './pages/Explore'
-import { GtaMode } from './pages/GtaMode'
-import { Ingest } from './pages/Ingest'
-import { JobProgress } from './pages/JobProgress'
-import { LiveWatch } from './pages/LiveWatch'
-import { PickParts } from './pages/PickParts'
-import { Review } from './pages/Review'
-import { Settings } from './pages/Settings'
+import { pageRoutes } from './routes'
 
+// Page routes live in routes.tsx; navigation entries in nav.tsx.
 const router = createBrowserRouter([
   {
     path: '/',
     element: <App />,
-    children: [
-      { index: true, element: <Ingest /> },
-      { path: 'jobs/:jobId', element: <JobProgress /> },
-      { path: 'jobs/:jobId/clips', element: <Review /> },
-      { path: 'explore', element: <Explore /> },
-      { path: 'jobs/:jobId/pick', element: <PickParts /> },
-      { path: 'live', element: <LiveWatch /> },
-      { path: 'gta', element: <GtaMode /> },
-      { path: 'settings', element: <Settings /> },
-    ],
+    children: pageRoutes,
   },
 ])
 
