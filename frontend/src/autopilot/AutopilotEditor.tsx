@@ -1,13 +1,24 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 
+import { autopilotApi, errorText, type AutopilotInput, type AutopilotSource, type Platform } from '../publishing/api'
 import {
-  autopilotApi,
-  errorText,
-  type AutopilotInput,
-  type AutopilotSource,
-  type Platform,
-} from '../publishing/api'
+  Button,
+  ButtonLink,
+  Callout,
+  Card,
+  Checkbox,
+  Field,
+  IconButton,
+  Input,
+  PageHeader,
+  PageSkeleton,
+  PlusIcon,
+  Select,
+  Toggle,
+  TrashIcon,
+  cx,
+} from '../ui'
 
 const EMPTY: AutopilotInput = {
   name: '',
@@ -38,18 +49,15 @@ function NumberField({
   hint?: string
 }) {
   return (
-    <label className="block">
-      <span className="eyebrow">{label}</span>
-      <input
+    <Field label={label} hint={hint}>
+      <Input
         type="number"
-        className="field numeric"
         min={min}
         step={step}
         value={Number.isFinite(value) ? value : ''}
         onChange={(e) => onChange(Number(e.target.value))}
       />
-      {hint && <span className="mt-1 block text-xs text-ink-500">{hint}</span>}
-    </label>
+    </Field>
   )
 }
 
@@ -97,10 +105,7 @@ export function AutopilotEditor() {
       sources: f.sources.map((s, j) => (j === i ? { ...s, ...change } : s)),
     }))
   const togglePlatform = (p: Platform) =>
-    set(
-      'platforms',
-      form.platforms.includes(p) ? form.platforms.filter((x) => x !== p) : [...form.platforms, p],
-    )
+    set('platforms', form.platforms.includes(p) ? form.platforms.filter((x) => x !== p) : [...form.platforms, p])
 
   async function save() {
     setBusy(true)
@@ -114,9 +119,7 @@ export function AutopilotEditor() {
         .filter(Boolean),
     }
     try {
-      const saved = autopilotId
-        ? await autopilotApi.update(autopilotId, input)
-        : await autopilotApi.create(input)
+      const saved = autopilotId ? await autopilotApi.update(autopilotId, input) : await autopilotApi.create(input)
       navigate(`/autopilot/${saved.id}`)
     } catch (err) {
       setError(errorText(err))
@@ -125,199 +128,182 @@ export function AutopilotEditor() {
     }
   }
 
-  if (!loaded) return <p className="pt-10 text-sm text-ink-400">{error || 'Loading…'}</p>
+  const back = autopilotId ? `/autopilot/${autopilotId}` : '/autopilot'
+
+  if (!loaded) {
+    return error ? (
+      <div className="max-w-3xl">
+        <PageHeader back={{ to: '/autopilot', label: 'All autopilots' }} title="Edit autopilot" />
+        <Callout tone="danger">{error}</Callout>
+      </div>
+    ) : (
+      <PageSkeleton cards={3} />
+    )
+  }
 
   return (
-    <div className="rise max-w-3xl space-y-10 pt-10">
-      <header>
-        <p className="eyebrow">
-          <Link to="/autopilot" className="hover:text-ink-200">
-            Autopilot
-          </Link>
-        </p>
-        <h1 className="font-display text-5xl text-ink-100">
-          {autopilotId ? 'Edit autopilot' : 'New autopilot'}
-        </h1>
-      </header>
+    <div className="max-w-3xl">
+      <PageHeader
+        back={{ to: back, label: autopilotId ? 'Back to autopilot' : 'All autopilots' }}
+        title={autopilotId ? 'Edit autopilot' : 'New autopilot'}
+        description="Tell it where to look, which videos are worth clipping, and when to post."
+      />
 
-      <label className="block">
-        <span className="eyebrow">Name</span>
-        <input
-          className="field"
-          maxLength={80}
-          value={form.name}
-          placeholder="Podcast highlights"
-          onChange={(e) => set('name', e.target.value)}
-        />
-      </label>
+      <div className="grid gap-6">
+        <Card title="Name">
+          <Field label="What to call it" hint="Only you see this.">
+            <Input
+              maxLength={80}
+              value={form.name}
+              placeholder="Podcast highlights"
+              onChange={(e) => set('name', e.target.value)}
+            />
+          </Field>
+        </Card>
 
-      <section className="space-y-4">
-        <h2 className="eyebrow border-b border-ink-800 pb-2">Where to look</h2>
-        {form.sources.map((source, i) => (
-          <div key={i} className="grid gap-3 sm:grid-cols-[8rem_1fr_5rem_5rem_auto] sm:items-end">
-            <select
-              className="field"
-              value={source.kind}
-              onChange={(e) => setSource(i, { kind: e.target.value as AutopilotSource['kind'] })}
-            >
-              <option value="channel">Channel</option>
-              <option value="topic">Topic search</option>
-            </select>
-            <input
-              className="field"
-              value={source.value}
-              placeholder={source.kind === 'channel' ? '@handle or channel link' : 'e.g. chess blunders'}
-              onChange={(e) => setSource(i, { value: e.target.value })}
-            />
-            <input
-              className="field uppercase"
-              maxLength={2}
-              value={source.country}
-              placeholder="US"
-              title="Country (optional)"
-              disabled={source.kind === 'channel'}
-              onChange={(e) => setSource(i, { country: e.target.value })}
-            />
-            <input
-              className="field lowercase"
-              maxLength={3}
-              value={source.language}
-              placeholder="en"
-              title="Spoken language (optional)"
-              onChange={(e) => setSource(i, { language: e.target.value })}
-            />
-            <button
-              type="button"
-              className="btn btn-quiet"
-              disabled={form.sources.length === 1}
-              onClick={() => set('sources', form.sources.filter((_, j) => j !== i))}
-            >
-              Remove
-            </button>
-          </div>
-        ))}
-        <button
-          type="button"
-          className="btn btn-ghost"
-          onClick={() =>
-            set('sources', [...form.sources, { kind: 'topic', value: '', country: '', language: '' }])
-          }
+        <Card
+          title="Where to look"
+          description="YouTube channels to follow, or topics to search. Country and language are optional."
         >
-          Add source
-        </button>
-        <p className="text-xs text-ink-500">
-          Country and language are optional. A language keeps only videos YouTube reports in that
-          language; a country alone implies its main language.
-        </p>
-      </section>
+          <div className="space-y-4">
+            {form.sources.map((source, i) => (
+              <div key={i} className="rounded-xl border border-line p-3 sm:p-4">
+                <div className="grid gap-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto] sm:items-end">
+                  <Field label="Type">
+                    <Select
+                      value={source.kind}
+                      onChange={(e) => setSource(i, { kind: e.target.value as AutopilotSource['kind'] })}
+                      options={[
+                        { value: 'channel', label: 'Channel' },
+                        { value: 'topic', label: 'Topic search' },
+                      ]}
+                    />
+                  </Field>
+                  <Field label={source.kind === 'channel' ? 'Channel' : 'Search words'}>
+                    <Input
+                      value={source.value}
+                      placeholder={source.kind === 'channel' ? '@handle or channel link' : 'e.g. chess blunders'}
+                      onChange={(e) => setSource(i, { value: e.target.value })}
+                    />
+                  </Field>
+                  <IconButton
+                    icon={TrashIcon}
+                    label="Remove this source"
+                    variant="secondary"
+                    disabled={form.sources.length === 1}
+                    onClick={() => set('sources', form.sources.filter((_, j) => j !== i))}
+                    className="justify-self-end"
+                  />
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-3 sm:w-80">
+                  <Field label="Country" optional>
+                    <Input
+                      className="uppercase"
+                      maxLength={2}
+                      value={source.country}
+                      placeholder="US"
+                      disabled={source.kind === 'channel'}
+                      title={source.kind === 'channel' ? 'Only for topic searches' : undefined}
+                      onChange={(e) => setSource(i, { country: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Language" optional>
+                    <Input
+                      className="lowercase"
+                      maxLength={3}
+                      value={source.language}
+                      placeholder="en"
+                      onChange={(e) => setSource(i, { language: e.target.value })}
+                    />
+                  </Field>
+                </div>
+              </div>
+            ))}
+            <Button
+              icon={PlusIcon}
+              onClick={() => set('sources', [...form.sources, { kind: 'topic', value: '', country: '', language: '' }])}
+            >
+              Add another source
+            </Button>
+            <p className="text-xs leading-relaxed text-fg-muted">
+              A language keeps only videos YouTube reports in that language; a country alone implies its main
+              language.
+            </p>
+          </div>
+        </Card>
 
-      <section className="space-y-4">
-        <h2 className="eyebrow border-b border-ink-800 pb-2">Which videos</h2>
-        <div className="grid gap-6 sm:grid-cols-2">
-          <NumberField
-            label="Minimum views"
-            value={form.filters.min_views}
-            min={0}
-            step={1000}
-            onChange={(n) => setFilter('min_views', n)}
-          />
-          <NumberField
-            label="Not older than (days)"
-            value={form.filters.max_age_days}
-            min={1}
-            onChange={(n) => setFilter('max_age_days', n)}
-          />
-          <NumberField
-            label="Minimum length (minutes)"
-            value={form.filters.min_minutes}
-            min={0}
-            onChange={(n) => setFilter('min_minutes', n)}
-          />
-          <NumberField
-            label="Maximum length (minutes)"
-            value={form.filters.max_minutes}
-            min={1}
-            onChange={(n) => setFilter('max_minutes', n)}
-          />
-          <NumberField
-            label="Wait for “Most replayed” (hours)"
-            value={form.heatmap_wait_hours}
-            min={0}
-            onChange={(n) => set('heatmap_wait_hours', n)}
-            hint="New videos wait for YouTube's rewatch graph; after this the AI picks from audio and comments."
-          />
-          <NumberField
-            label="Clips per video"
-            value={form.clips_per_video}
-            min={1}
-            onChange={(n) => set('clips_per_video', n)}
-          />
-        </div>
-      </section>
-
-      <section className="space-y-4">
-        <h2 className="eyebrow border-b border-ink-800 pb-2">When and where to post</h2>
-        <div className="grid gap-6 sm:grid-cols-2">
-          <label className="block">
-            <span className="eyebrow">Daily posting times</span>
-            <input
-              className="field numeric"
-              value={slotsText}
-              placeholder="12:00, 18:00"
-              onChange={(e) => setSlotsText(e.target.value)}
+        <Card title="Which videos" description="Only videos that pass all of these get clipped.">
+          <div className="grid gap-5 sm:grid-cols-2">
+            <NumberField label="Minimum views" value={form.filters.min_views} min={0} step={1000} onChange={(n) => setFilter('min_views', n)} />
+            <NumberField label="Not older than (days)" value={form.filters.max_age_days} min={1} onChange={(n) => setFilter('max_age_days', n)} />
+            <NumberField label="Shortest video (minutes)" value={form.filters.min_minutes} min={0} onChange={(n) => setFilter('min_minutes', n)} />
+            <NumberField label="Longest video (minutes)" value={form.filters.max_minutes} min={1} onChange={(n) => setFilter('max_minutes', n)} />
+            <NumberField
+              label="Wait for “Most replayed” (hours)"
+              value={form.heatmap_wait_hours}
+              min={0}
+              onChange={(n) => set('heatmap_wait_hours', n)}
+              hint="New videos wait for YouTube's rewatch graph; after this the AI picks from audio and comments."
             />
-          </label>
-          <label className="block">
-            <span className="eyebrow">Time zone</span>
-            <input
-              className="field"
-              value={form.timezone}
-              placeholder="This PC's time (or e.g. Europe/Berlin)"
-              onChange={(e) => set('timezone', e.target.value)}
-            />
-          </label>
-        </div>
-        <div className="flex flex-wrap gap-6 text-sm text-ink-200">
-          {(['youtube', 'instagram'] as Platform[]).map((p) => (
-            <label key={p} className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.platforms.includes(p)}
-                onChange={() => togglePlatform(p)}
-              />
-              {p === 'youtube' ? 'YouTube Shorts' : 'Instagram Reels'}
-            </label>
-          ))}
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={form.approve_before_posting}
-              onChange={(e) => set('approve_before_posting', e.target.checked)}
-            />
-            Let me approve each clip before it is booked
-          </label>
-        </div>
-      </section>
+            <NumberField label="Clips per video" value={form.clips_per_video} min={1} onChange={(n) => set('clips_per_video', n)} />
+          </div>
+        </Card>
 
-      <label className="flex items-start gap-3 text-sm text-ink-200">
-        <input
-          type="checkbox"
-          className="mt-1"
-          checked={form.rights_confirmed}
-          onChange={(e) => set('rights_confirmed', e.target.checked)}
-        />
-        I have the rights (or the creators' permission) to clip and repost videos from these
-        sources.
-      </label>
+        <Card title="When and where to post">
+          <div className="grid gap-5 sm:grid-cols-2">
+            <Field label="Daily posting times" hint="24-hour times, separated by commas.">
+              <Input className="numeric" value={slotsText} placeholder="12:00, 18:00" onChange={(e) => setSlotsText(e.target.value)} />
+            </Field>
+            <Field label="Time zone" optional hint="Empty uses this computer's time zone.">
+              <Input value={form.timezone} placeholder="e.g. Europe/Berlin" onChange={(e) => set('timezone', e.target.value)} />
+            </Field>
+          </div>
+          <p className="mt-5 mb-2 text-sm font-medium text-fg">Post to</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(['youtube', 'instagram'] as Platform[]).map((p) => {
+              const on = form.platforms.includes(p)
+              return (
+                <label
+                  key={p}
+                  className={cx(
+                    'flex cursor-pointer items-center gap-3 rounded-xl border px-3.5 py-3 text-sm font-medium text-fg transition-colors',
+                    on ? 'border-accent bg-accent-soft ring-1 ring-accent' : 'border-line hover:bg-subtle',
+                  )}
+                >
+                  <input type="checkbox" className="size-4" checked={on} onChange={() => togglePlatform(p)} />
+                  {p === 'youtube' ? 'YouTube Shorts' : 'Instagram Reels'}
+                </label>
+              )
+            })}
+          </div>
+          <Toggle
+            className="mt-5"
+            label="Let me approve each clip before it's booked"
+            hint="Recommended. Clips wait on the autopilot's page until you approve them."
+            checked={form.approve_before_posting}
+            onChange={(on) => set('approve_before_posting', on)}
+          />
+        </Card>
 
-      {error && <p className="whitespace-pre-line text-sm text-signal-bad">{error}</p>}
-      <div className="flex gap-3">
-        <button type="button" className="btn btn-primary" disabled={busy} onClick={save}>
-          {busy ? 'Saving…' : autopilotId ? 'Save' : 'Create autopilot'}
-        </button>
-        <Link to={autopilotId ? `/autopilot/${autopilotId}` : '/autopilot'} className="btn btn-ghost">
-          Cancel
-        </Link>
+        <Card>
+          <Checkbox
+            label="I have the rights (or the creators' permission) to clip and repost videos from these sources."
+            checked={form.rights_confirmed}
+            onChange={(on) => set('rights_confirmed', on)}
+          />
+        </Card>
+
+        {error && (
+          <Callout tone="danger">
+            <span className="whitespace-pre-line">{error}</span>
+          </Callout>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Button variant="primary" loading={busy} onClick={save}>
+            {busy ? 'Saving…' : autopilotId ? 'Save changes' : 'Create autopilot'}
+          </Button>
+          <ButtonLink to={back}>Cancel</ButtonLink>
+        </div>
       </div>
     </div>
   )

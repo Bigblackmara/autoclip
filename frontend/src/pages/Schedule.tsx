@@ -7,16 +7,37 @@ import {
   PLATFORM_NAME,
   publishingApi,
   STATUS_LABEL,
-  statusTone,
   type Platform,
   type PostableClip,
   type PublishingStatus,
   type ScheduleItem,
   type ScheduleOut,
 } from '../publishing/api'
+import { PlatformTag, PostStatusBadge } from '../publishing/ui'
+import {
+  ActivityIcon,
+  Button,
+  ButtonLink,
+  CalendarIcon,
+  Callout,
+  Card,
+  ChevronDownIcon,
+  Dialog,
+  EmptyState,
+  ExternalIcon,
+  PageHeader,
+  RocketIcon,
+  Segmented,
+  SendIcon,
+  Skeleton,
+  Tabs,
+  cx,
+  tabPanelProps,
+  useToast,
+} from '../ui'
 
 const SOURCE_LABEL: Record<ScheduleItem['source'], string> = {
-  normal: 'You',
+  normal: 'Posted by you',
   autopilot: 'Autopilot',
   gta: 'GTA Mode',
 }
@@ -31,6 +52,8 @@ function dayOf(iso: string | null): string {
   return d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })
 }
 
+type Pending = { item: ScheduleItem; what: 'cancel' | 'retry'; option?: 'private' | 'delete' }
+
 /** Every post going out (or gone out): clips you post, Autopilot, and GTA Mode. */
 export function Schedule() {
   const [data, setData] = useState<ScheduleOut | null>(null)
@@ -38,9 +61,11 @@ export function Schedule() {
   const [tab, setTab] = useState<'upcoming' | 'past'>('upcoming')
   const [only, setOnly] = useState<'all' | Platform>('all')
   const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
   const [busyKey, setBusyKey] = useState('')
   const [showPost, setShowPost] = useState(false)
+  const [confirm, setConfirm] = useState<Pending | null>(null)
+  const toast = useToast()
+  const tabsId = 'schedule-tabs'
 
   const reload = useCallback(async () => {
     try {
@@ -70,140 +95,198 @@ export function Schedule() {
     return [...map.entries()]
   }, [items])
 
-  async function act(item: ScheduleItem, what: 'cancel' | 'retry', option?: 'private' | 'delete') {
-    if (what === 'retry' && item.retry_confirm) {
-      const where = item.platform === 'youtube' ? 'YouTube Studio' : 'Zernio and Instagram'
-      if (!window.confirm(`Check ${where} first: is this post really not there? Retry sends it again.`))
-        return
+  /** Retries that might double-post, and YouTube deletes, ask first. */
+  function request(item: ScheduleItem, what: 'cancel' | 'retry', option?: 'private' | 'delete') {
+    if ((what === 'retry' && item.retry_confirm) || (what === 'cancel' && option === 'delete')) {
+      setConfirm({ item, what, option })
+      return
     }
-    if (what === 'cancel' && option === 'delete') {
-      if (!window.confirm('Delete this video from your YouTube channel? This cannot be undone.')) return
-    }
+    void act({ item, what, option })
+  }
+
+  async function act({ item, what, option }: Pending) {
+    setConfirm(null)
     setBusyKey(item.key)
-    setNotice('')
     try {
       if (what === 'cancel') {
         const post = await publishingApi.cancel(item.id, option)
-        setNotice(post.error || 'Cancelled.')
+        if (post.error) toast.error('Cancel did not go through', post.error)
+        else toast.success('Post cancelled')
       } else if (item.source === 'gta') {
         await publishingApi.retryGta(item.id)
-        setNotice('Back in GTA Mode’s line; its schedule picks it up.')
+        toast.success('Back in line', 'GTA Mode’s schedule picks it up.')
       } else {
         await publishingApi.retry(item.id)
-        setNotice('Back in line; it goes out on the next pass.')
+        toast.success('Back in line', 'It goes out on the next pass.')
       }
       await reload()
     } catch (err) {
-      setNotice(errorText(err))
+      toast.error('That didn’t work', errorText(err))
     } finally {
       setBusyKey('')
     }
   }
 
   const problems = status
-    ? (['youtube', 'instagram'] as Platform[])
-        .filter((p) => status.ready[p])
-        .map((p) => `${PLATFORM_NAME[p]}: ${status.ready[p]}`)
+    ? (['youtube', 'instagram'] as Platform[]).filter((p) => status.ready[p]).map((p) => ({ p, text: status.ready[p] }))
     : []
 
   return (
-    <div className="rise space-y-10 pt-10">
-      <header className="flex flex-wrap items-end gap-6">
-        <div>
-          <p className="eyebrow">Posting</p>
-          <h1 className="font-display text-5xl text-ink-100">Schedule</h1>
-          <p className="mt-2 max-w-2xl text-sm text-ink-400">
-            Every post going out to YouTube and Instagram: clips you post, Autopilot and GTA Mode.
-          </p>
-        </div>
-        <div className="ml-auto flex gap-3">
-          <button type="button" className="btn btn-primary" onClick={() => setShowPost((v) => !v)}>
-            {showPost ? 'Close' : 'Post a clip'}
-          </button>
-          <Link to="/autopilot" className="btn btn-ghost">
-            Autopilot
-          </Link>
-          <Link to="/health" className="btn btn-ghost">
-            Health
-          </Link>
-        </div>
-      </header>
+    <div>
+      <PageHeader
+        title="Schedule"
+        description="Every post going out to YouTube and Instagram — clips you post, Autopilot and GTA Mode — in one list."
+        actions={
+          <>
+            <Button variant="primary" icon={SendIcon} onClick={() => setShowPost((v) => !v)} aria-expanded={showPost}>
+              {showPost ? 'Close' : 'Post a clip'}
+            </Button>
+            <ButtonLink to="/autopilot" icon={RocketIcon}>
+              Autopilot
+            </ButtonLink>
+            <ButtonLink to="/health" icon={ActivityIcon}>
+              Health check
+            </ButtonLink>
+          </>
+        }
+      />
 
       {problems.length > 0 && (
-        <div className="border-l-2 border-signal-bad pl-4 text-sm text-ink-200">
-          {problems.map((p) => (
-            <p key={p}>{p}</p>
+        <Callout
+          tone="warn"
+          title="Posting isn't fully set up"
+          className="mb-6"
+          action={
+            <ButtonLink to="/posting" size="sm">
+              Open Posting & accounts
+            </ButtonLink>
+          }
+        >
+          {problems.map(({ p, text }) => (
+            <span key={p} className="block">
+              {PLATFORM_NAME[p]}: {text}
+            </span>
           ))}
-          <p className="mt-1 text-ink-500">
-            Connections are shared with GTA Mode: set them up in its Posting tab.
-          </p>
-        </div>
+        </Callout>
       )}
 
       {showPost && <PostPicker onPosted={reload} />}
 
-      <div className="grid grid-cols-3 gap-6 border-y border-ink-800 py-5">
-        <Stat label="Upcoming" value={data?.counts.upcoming ?? 0} />
-        <Stat label="Posted" value={data?.counts.posted ?? 0} />
-        <Stat label="Failed" value={data?.counts.failed ?? 0} bad={!!data?.counts.failed} />
+      <div className="mb-6 grid grid-cols-3 gap-3 sm:gap-4">
+        <Stat label="Upcoming" value={data?.counts.upcoming} />
+        <Stat label="Posted" value={data?.counts.posted} />
+        <Stat label="Failed" value={data?.counts.failed} bad={!!data?.counts.failed} />
       </div>
 
-      <div className="flex flex-wrap items-center gap-6">
-        {(['upcoming', 'past'] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            className={`text-sm font-medium ${tab === t ? 'text-sodium-500' : 'text-ink-400 hover:text-ink-200'}`}
-            onClick={() => setTab(t)}
-          >
-            {t === 'upcoming' ? `Upcoming (${data?.upcoming.length ?? 0})` : `History (${data?.past.length ?? 0})`}
-          </button>
-        ))}
-        <div className="ml-auto flex gap-3 text-xs">
-          {(['all', 'youtube', 'instagram'] as const).map((p) => (
-            <button
-              key={p}
-              type="button"
-              className={only === p ? 'text-sodium-500' : 'text-ink-400 hover:text-ink-200'}
-              onClick={() => setOnly(p)}
-            >
-              {p === 'all' ? 'All' : PLATFORM_NAME[p]}
-            </button>
+      <Card padding="none">
+        <div className="flex flex-col gap-3 px-5 pt-4 sm:flex-row sm:items-end sm:justify-between sm:px-6">
+          <Tabs
+            label="Posts"
+            idBase={tabsId}
+            className="border-b-0"
+            items={[
+              { key: 'upcoming', label: `Upcoming (${data?.upcoming.length ?? 0})` },
+              { key: 'past', label: `History (${data?.past.length ?? 0})` },
+            ]}
+            value={tab}
+            onChange={setTab}
+          />
+          <Segmented
+            className="mb-2"
+            label="Platform"
+            size="sm"
+            options={[
+              { value: 'all', label: 'All' },
+              { value: 'youtube', label: 'YouTube' },
+              { value: 'instagram', label: 'Instagram' },
+            ]}
+            value={only}
+            onChange={setOnly}
+          />
+        </div>
+        <div className="border-t border-line" {...tabPanelProps(tabsId, tab)}>
+          {error && (
+            <div className="p-5">
+              <Callout tone="danger">{error}</Callout>
+            </div>
+          )}
+          {!data && !error && (
+            <div className="space-y-3 p-5 sm:px-6" aria-label="Loading">
+              <Skeleton className="h-4 w-1/3" />
+              <Skeleton className="h-10 w-full" />
+              <Skeleton className="h-10 w-full" />
+            </div>
+          )}
+          {data && items.length === 0 && (
+            <div className="p-5 sm:p-6">
+              <EmptyState
+                compact
+                icon={CalendarIcon}
+                title={tab === 'upcoming' ? 'Nothing is scheduled' : 'Nothing has been posted yet'}
+                description={
+                  tab === 'upcoming'
+                    ? 'Post an exported clip, or let an Autopilot fill your posting times.'
+                    : 'Posts show up here once they go out.'
+                }
+                action={
+                  tab === 'upcoming' && (
+                    <Button variant="primary" icon={SendIcon} onClick={() => setShowPost(true)}>
+                      Post a clip
+                    </Button>
+                  )
+                }
+              />
+            </div>
+          )}
+          {days.map(([day, list]) => (
+            <section key={day}>
+              <h2 className="bg-subtle px-5 py-2 text-xs font-semibold text-fg-muted sm:px-6">{day}</h2>
+              <ul className="divide-y divide-line">
+                {list.map((item) => (
+                  <ScheduleRow key={item.key} item={item} busy={busyKey === item.key} onAct={request} />
+                ))}
+              </ul>
+            </section>
           ))}
         </div>
-      </div>
+      </Card>
 
-      {error && <p className="text-sm text-signal-bad">{error}</p>}
-      {notice && (
-        <p className="text-sm text-ink-200" role="status">
-          {notice}
-        </p>
-      )}
-      {data && items.length === 0 && (
-        <p className="text-sm text-ink-500">
-          {tab === 'upcoming' ? 'Nothing is scheduled.' : 'Nothing has been posted yet.'}
-        </p>
-      )}
-
-      {days.map(([day, list]) => (
-        <section key={day}>
-          <h2 className="eyebrow border-b border-ink-800 pb-2">{day}</h2>
-          <ul className="divide-y divide-ink-800">
-            {list.map((item) => (
-              <ScheduleRow key={item.key} item={item} busy={busyKey === item.key} onAct={act} />
-            ))}
-          </ul>
-        </section>
-      ))}
+      <Dialog
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        size="sm"
+        title={confirm?.what === 'retry' ? 'Send it again?' : 'Delete from YouTube?'}
+        description={
+          confirm?.what === 'retry'
+            ? `First check ${confirm.item.platform === 'youtube' ? 'YouTube Studio' : 'Zernio and Instagram'}: is this post really not there? Retrying sends it again.`
+            : 'This deletes the video from your YouTube channel. It cannot be undone.'
+        }
+        footer={
+          <>
+            <Button onClick={() => setConfirm(null)}>Keep it</Button>
+            <Button
+              variant={confirm?.what === 'retry' ? 'primary' : 'danger'}
+              data-autofocus
+              onClick={() => confirm && void act(confirm)}
+            >
+              {confirm?.what === 'retry' ? 'Retry' : 'Delete'}
+            </Button>
+          </>
+        }
+      />
     </div>
   )
 }
 
-function Stat({ label, value, bad }: { label: string; value: number; bad?: boolean }) {
+function Stat({ label, value, bad }: { label: string; value: number | undefined; bad?: boolean }) {
   return (
-    <div>
-      <p className={`numeric font-display text-4xl ${bad ? 'text-signal-bad' : 'text-ink-100'}`}>{value}</p>
-      <p className="eyebrow mt-1">{label}</p>
+    <div className="card p-4">
+      <p className="text-xs font-medium text-fg-muted">{label}</p>
+      {value === undefined ? (
+        <Skeleton className="mt-2 h-6 w-10" />
+      ) : (
+        <p className={cx('numeric mt-1 text-2xl font-bold', bad ? 'text-danger' : 'text-fg')}>{value}</p>
+      )}
     </div>
   )
 }
@@ -219,54 +302,43 @@ function ScheduleRow({
 }) {
   const time = item.when
     ? new Date(item.when).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-    : 'now'
+    : 'Now'
   return (
-    <li className="grid grid-cols-[4.5rem_1fr] gap-x-4 gap-y-1 py-3 md:grid-cols-[4.5rem_7rem_1fr_auto]">
-      <span className="numeric text-sm text-ink-200">{time}</span>
-      <span className="text-sm text-ink-300">
-        {PLATFORM_NAME[item.platform]}
-        <span className="block text-xs text-ink-500">{SOURCE_LABEL[item.source]}</span>
-      </span>
-      <div className="col-start-2 min-w-0 md:col-start-3">
-        <p className="truncate text-sm text-ink-100">{item.title || 'Untitled clip'}</p>
-        <p className="text-xs">
-          <span className={statusTone(item.status)}>{STATUS_LABEL[item.status] ?? item.status}</span>
+    <li className="grid grid-cols-[3.5rem_minmax(0,1fr)] gap-x-4 gap-y-2 px-5 py-3 sm:px-6 md:grid-cols-[4rem_minmax(0,1fr)_auto] md:items-center">
+      <span className="numeric pt-0.5 text-sm font-semibold text-fg">{time}</span>
+      <div className="min-w-0">
+        <p className="truncate text-sm font-medium text-fg">{item.title || 'Untitled clip'}</p>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-muted">
+          <PostStatusBadge status={item.status} />
+          <PlatformTag platform={item.platform} />
+          <span>{SOURCE_LABEL[item.source]}</span>
           {item.url && (
-            <>
-              {' · '}
-              <a className="text-ink-300 underline hover:text-sodium-400" href={item.url} target="_blank" rel="noreferrer">
-                open
-              </a>
-            </>
+            <a className="inline-flex items-center gap-1 font-medium text-accent-text hover:underline" href={item.url} target="_blank" rel="noreferrer">
+              Open <ExternalIcon size={12} />
+            </a>
           )}
-          {item.error && <span className="text-ink-400"> · {item.error}</span>}
-        </p>
+        </div>
+        {item.error && <p className="mt-1 text-xs text-danger [overflow-wrap:anywhere]">{item.error}</p>}
         {!item.can_cancel && item.cancel_note && item.upcoming && item.source !== 'gta' && (
-          <p className="mt-1 text-xs text-ink-500">{item.cancel_note}</p>
+          <p className="mt-1 text-xs text-fg-muted">{item.cancel_note}</p>
         )}
       </div>
-      <div className="col-start-2 flex flex-wrap gap-2 md:col-start-4 md:justify-end">
+      <div className="col-start-2 flex flex-wrap gap-2 md:col-start-3 md:justify-end">
         {item.can_cancel && item.cancel_options.length === 0 && (
-          <button type="button" className="btn btn-quiet" disabled={busy} onClick={() => onAct(item, 'cancel')}>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => onAct(item, 'cancel')}>
             Cancel
-          </button>
+          </Button>
         )}
         {item.can_cancel &&
           item.cancel_options.map((option) => (
-            <button
-              key={option}
-              type="button"
-              className="btn btn-quiet"
-              disabled={busy}
-              onClick={() => onAct(item, 'cancel', option)}
-            >
+            <Button key={option} size="sm" variant="ghost" disabled={busy} onClick={() => onAct(item, 'cancel', option)}>
               {option === 'private' ? 'Unschedule (keep private)' : 'Delete from YouTube'}
-            </button>
+            </Button>
           ))}
         {item.can_retry && (
-          <button type="button" className="btn btn-quiet" disabled={busy} onClick={() => onAct(item, 'retry')}>
+          <Button size="sm" disabled={busy} onClick={() => onAct(item, 'retry')}>
             Retry
-          </button>
+          </Button>
         )}
       </div>
     </li>
@@ -289,44 +361,70 @@ function PostPicker({ onPosted }: { onPosted: () => void }) {
   useEffect(load, [load])
 
   return (
-    <section className="space-y-3">
-      <h2 className="eyebrow border-b border-ink-800 pb-2">Exported clips</h2>
-      {error && <p className="text-sm text-signal-bad">{error}</p>}
-      {clips && clips.length === 0 && (
-        <p className="text-sm text-ink-500">No exported clips yet. Clip a video first.</p>
-      )}
-      <ul className="divide-y divide-ink-800">
-        {(clips ?? []).map((clip) => (
-          <li key={clip.clip_id} className="py-3">
-            <button
-              type="button"
-              className="flex w-full items-baseline gap-4 text-left"
-              onClick={() => setOpen(open === clip.clip_id ? '' : clip.clip_id)}
-            >
-              <span className="text-sm text-ink-100">{clip.title || 'Untitled clip'}</span>
-              <span className="truncate text-xs text-ink-500">{clip.source_title}</span>
-              <span className="ml-auto text-xs text-ink-400">
-                {(['youtube', 'instagram'] as Platform[])
-                  .filter((p) => clip.active[p])
-                  .map((p) => `${PLATFORM_NAME[p]}: ${STATUS_LABEL[clip.active[p]!.status]}`)
-                  .join(' · ')}
-              </span>
-            </button>
-            {open === clip.clip_id && (
-              <div className="mt-3">
-                <PostClipPanel
-                  clip={clip}
-                  onPosted={() => {
-                    load()
-                    onPosted()
-                  }}
-                />
-              </div>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
+    <Card
+      padding="none"
+      className="mb-6 overflow-hidden"
+      title="Post a clip"
+      description="Your recently exported clips. Open one to post it now or at a set time."
+    >
+      <div className="border-t border-line">
+        {error && (
+          <div className="p-5">
+            <Callout tone="danger">{error}</Callout>
+          </div>
+        )}
+        {!clips && !error && (
+          <div className="space-y-3 p-5 sm:px-6">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        )}
+        {clips && clips.length === 0 && (
+          <p className="px-5 py-8 text-center text-sm text-fg-muted sm:px-6">
+            No exported clips yet. Export a clip on its project's Review page, then post it here.{' '}
+            <Link to="/projects" className="link">
+              Open Projects
+            </Link>
+          </p>
+        )}
+        <ul className="divide-y divide-line">
+          {(clips ?? []).map((clip) => {
+            const isOpen = open === clip.clip_id
+            const booked = (['youtube', 'instagram'] as Platform[]).filter((p) => clip.active[p])
+            return (
+              <li key={clip.clip_id}>
+                <button
+                  type="button"
+                  aria-expanded={isOpen}
+                  className="flex w-full items-center gap-3 px-5 py-3 text-left transition-colors hover:bg-subtle sm:px-6"
+                  onClick={() => setOpen(isOpen ? '' : clip.clip_id)}
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-fg">{clip.title || 'Untitled clip'}</span>
+                    <span className="block truncate text-xs text-fg-muted">
+                      {clip.source_title}
+                      {booked.length > 0 &&
+                        ` · ${booked.map((p) => `${PLATFORM_NAME[p]}: ${STATUS_LABEL[clip.active[p]!.status]}`).join(' · ')}`}
+                    </span>
+                  </span>
+                  <ChevronDownIcon size={16} className={cx('text-fg-subtle transition-transform', isOpen && 'rotate-180')} />
+                </button>
+                {isOpen && (
+                  <div className="border-t border-line bg-subtle/50 px-5 py-5 sm:px-6">
+                    <PostClipPanel
+                      clip={clip}
+                      onPosted={() => {
+                        load()
+                        onPosted()
+                      }}
+                    />
+                  </div>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      </div>
+    </Card>
   )
 }
-

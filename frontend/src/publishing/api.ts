@@ -85,6 +85,21 @@ export interface PostableClip {
   active: Record<Platform, PostRecord | null>
 }
 
+/** GET /api/publishing/clips/{clip_id}: one clip's post text and its posts. */
+export interface ClipPosting {
+  clip_id: string
+  title: string
+  text: string
+  hashtags: string[]
+  /** False until the clip has an exported file to upload. */
+  exported: boolean
+  posts: PostRecord[]
+  active: Record<Platform, PostRecord | null>
+}
+
+/** What the Post panel needs about a clip (a PostableClip or a ClipPosting both fit). */
+export type PostTarget = Pick<PostableClip, 'clip_id' | 'title' | 'text' | 'hashtags' | 'active'>
+
 export interface PublishSettings {
   category_id: string
   shorts_tag: boolean
@@ -249,6 +264,7 @@ export const publishingApi = {
       body: JSON.stringify(settings),
     }),
   clips: (limit = 40) => request<PostableClip[]>(`/api/publishing/clips?limit=${limit}`),
+  clip: (clipId: string) => request<ClipPosting>(`/api/publishing/clips/${clipId}`),
   createPosts: (post: NewPost) =>
     request<{ posts: PostRecord[]; warnings: string[] }>('/api/publishing/posts', json(post)),
   cancel: (id: string, action: 'private' | 'delete' = 'private') =>

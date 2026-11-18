@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router-dom'
 
 import {
   api,
@@ -18,13 +18,17 @@ import { CaptionEditor } from '../components/CaptionEditor'
 import { ClipTextEditor } from '../components/ClipTextEditor'
 import { ClipPlayer } from '../components/ClipPlayer'
 import { ErrorNote } from '../components/ErrorNote'
+import { PostClipPanel } from '../components/PostClipPanel'
 import { TrimBar } from '../components/TrimBar'
+import { publishingApi, type ClipPosting } from '../publishing/api'
 import {
   Badge,
   Button,
   ButtonLink,
+  Callout,
   Card,
   CheckIcon,
+  Dialog,
   DownloadIcon,
   EmptyState,
   FilmIcon,
@@ -33,6 +37,8 @@ import {
   RefreshIcon,
   ScissorsIcon,
   Segmented,
+  SendIcon,
+  Skeleton,
   SparklesIcon,
   Tabs,
   TrashIcon,
@@ -67,6 +73,7 @@ export function Review() {
   const [makingVariant, setMakingVariant] = useState<string | null>(null)
   const [error, setError] = useState<Error | null>(null)
   const [editorTab, setEditorTab] = useState<EditorTab>('text')
+  const [postingId, setPostingId] = useState<string | null>(null)
   const editorTabs = useId()
 
 
@@ -336,6 +343,20 @@ export function Review() {
                 <div className="flex flex-wrap gap-2">
                   <Button
                     size="sm"
+                    variant="secondary"
+                    icon={SendIcon}
+                    disabled={selected.exports.length === 0}
+                    title={
+                      selected.exports.length === 0
+                        ? 'Export this clip first — posting uploads the exported file'
+                        : 'Post to YouTube or Instagram, now or later'
+                    }
+                    onClick={() => setPostingId(selected.id)}
+                  >
+                    Post
+                  </Button>
+                  <Button
+                    size="sm"
                     icon={CheckIcon}
                     variant={selected.status === 'kept' ? 'primary' : 'secondary'}
                     aria-pressed={selected.status === 'kept'}
@@ -400,6 +421,11 @@ export function Review() {
                     <p className="mt-2 text-xs leading-snug text-fg-muted">
                       A variant is the same moment with a different look, so you can post it again.
                     </p>
+                    {selected.exports.length === 0 && (
+                      <p className="mt-2 text-xs leading-snug text-fg-muted">
+                        Export the clip to post it to YouTube or Instagram.
+                      </p>
+                    )}
 
                     {selected.exports.length > 0 && (
                       <div className="mt-4 border-t border-line pt-3">
@@ -532,7 +558,72 @@ export function Review() {
           )}
         </div>
       )}
+
+      <PostDialog clipId={postingId} onClose={() => setPostingId(null)} />
     </div>
+  )
+}
+
+/** The Post panel for one clip, loaded from GET /api/publishing/clips/{id}. */
+function PostDialog({ clipId, onClose }: { clipId: string | null; onClose: () => void }) {
+  const [data, setData] = useState<ClipPosting | null>(null)
+  const [error, setError] = useState('')
+  const [version, setVersion] = useState(0)
+
+  useEffect(() => {
+    if (!clipId) return
+    let stale = false
+    setError('')
+    publishingApi
+      .clip(clipId)
+      .then((d) => !stale && setData(d))
+      .catch((err) => !stale && setError(err instanceof Error ? err.message : String(err)))
+    return () => {
+      stale = true
+    }
+  }, [clipId, version])
+
+  useEffect(() => {
+    if (!clipId) setData(null)
+  }, [clipId])
+
+  return (
+    <Dialog
+      open={clipId !== null}
+      onClose={onClose}
+      size="lg"
+      title="Post this clip"
+      description="Send it to YouTube Shorts and/or Instagram Reels, now or at a set time."
+    >
+      {error ? (
+        <Callout tone="danger">{error}</Callout>
+      ) : !data || data.clip_id !== clipId ? (
+        <div className="space-y-3" aria-label="Loading">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-10 w-2/3" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      ) : !data.exported ? (
+        <Callout tone="warn" title="Export it first">
+          Posting uploads the exported video file. Close this, press “Export this clip”, then post.
+        </Callout>
+      ) : (
+        <div className="max-h-[70vh] overflow-y-auto pr-1">
+          <PostClipPanel key={`${data.clip_id}-${version}`} clip={data} onPosted={() => setVersion((v) => v + 1)} />
+          <p className="mt-4 text-xs text-fg-muted">
+            Accounts not connected yet? Set them up in{' '}
+            <Link to="/posting" className="link" onClick={onClose}>
+              Posting &amp; accounts
+            </Link>
+            . Everything booked shows on the{' '}
+            <Link to="/schedule" className="link" onClick={onClose}>
+              Schedule
+            </Link>
+            .
+          </p>
+        </div>
+      )}
+    </Dialog>
   )
 }
 

@@ -18,6 +18,7 @@ import {
 } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 import {
+  ActivityIcon,
   Badge,
   Button,
   ButtonLink,
@@ -71,7 +72,7 @@ const SECTIONS: readonly (TabItem<Section> & { description: string })[] = [
   { key: 'sources', label: 'Sources & downloads', icon: CloudIcon, description: 'How videos are downloaded from YouTube and file links.' },
   { key: 'storage', label: 'Storage', icon: HardDriveIcon, description: 'Clean up old work automatically.' },
   { key: 'accounts', label: 'Accounts & posting', icon: UsersIcon, description: 'Where to connect YouTube, Instagram and Twitch.' },
-  { key: 'system', label: 'This machine', icon: CpuIcon, description: 'What AutoClip found on this computer.' },
+  { key: 'system', label: 'This machine', icon: CpuIcon, description: 'What AutoClip found on this computer. The Health check goes deeper, with a fix for each problem.' },
 ]
 
 export function Settings() {
@@ -682,9 +683,14 @@ export function Settings() {
               <Card
                 title="This machine"
                 actions={
-                  <Badge tone={system.ready ? 'success' : 'danger'} dot>
-                    {system.ready ? 'Ready' : 'Not ready'}
-                  </Badge>
+                  <>
+                    <Badge tone={system.ready ? 'success' : 'danger'} dot>
+                      {system.ready ? 'Ready' : 'Not ready'}
+                    </Badge>
+                    <ButtonLink to="/health" size="sm" icon={ActivityIcon}>
+                      Run a health check
+                    </ButtonLink>
+                  </>
                 }
                 description={
                   system.ready
@@ -708,6 +714,9 @@ export function Settings() {
             ) : (
               <Card title="This machine">
                 <p className="text-sm text-fg-muted">Couldn't read the system status.</p>
+                <ButtonLink to="/health" size="sm" icon={ActivityIcon} className="mt-4">
+                  Run a health check
+                </ButtonLink>
               </Card>
             ))}
         </div>

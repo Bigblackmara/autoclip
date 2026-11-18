@@ -1,17 +1,19 @@
 import { HealthPanel } from '../components/HealthPanel'
+import { PageHeader } from '../ui'
 
 /** The Health panel as a page (same checks as `autoclip doctor`). */
 export function Health() {
   return (
-    <div className="rise max-w-4xl space-y-8 pt-10">
-      <header>
-        <p className="eyebrow">System</p>
-        <h1 className="font-display text-5xl text-ink-100">Health</h1>
-        <p className="mt-2 text-sm text-ink-400">
-          Everything AutoClip needs, each with a plain fix. The terminal version is{' '}
-          <code className="text-ink-200">autoclip doctor</code>.
-        </p>
-      </header>
+    <div className="max-w-4xl">
+      <PageHeader
+        title="Health check"
+        description={
+          <>
+            Everything AutoClip needs to work, each with a plain fix. The terminal version is{' '}
+            <code className="rounded bg-subtle px-1.5 py-0.5 font-mono text-sm text-fg">autoclip doctor</code>.
+          </>
+        }
+      />
       <HealthPanel />
     </div>
   )
