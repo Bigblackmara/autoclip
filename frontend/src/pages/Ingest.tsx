@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 
 import {
   ApiError,
@@ -22,7 +22,9 @@ import { ErrorNote } from '../components/ErrorNote'
 
 export function Ingest() {
   const navigate = useNavigate()
-  const [url, setUrl] = useState('')
+  // Explore's "Clip this video" lands here as /?url=…, prefilled.
+  const [searchParams] = useSearchParams()
+  const [url, setUrl] = useState(() => searchParams.get('url') ?? '')
   const [busy, setBusy] = useState<'url' | 'file' | null>(null)
   const [error, setError] = useState<ApiError | Error | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
