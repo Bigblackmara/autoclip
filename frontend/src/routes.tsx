@@ -5,8 +5,11 @@
 
 import { matchRoutes, type RouteObject } from 'react-router-dom'
 
+import { AutopilotEditor } from './autopilot/AutopilotEditor'
+import { AutopilotDetail, AutopilotList } from './pages/Autopilot'
 import { Explore } from './pages/Explore'
 import { GtaMode } from './pages/GtaMode'
+import { Health } from './pages/Health'
 import { Ingest } from './pages/Ingest'
 import { JobProgress } from './pages/JobProgress'
 import { LiveWatch } from './pages/LiveWatch'
@@ -15,6 +18,7 @@ import { PickParts } from './pages/PickParts'
 import { Posting } from './pages/Posting'
 import { Projects } from './pages/Projects'
 import { Review } from './pages/Review'
+import { Schedule } from './pages/Schedule'
 import { Settings } from './pages/Settings'
 
 export const pageRoutes: RouteObject[] = [
@@ -27,7 +31,13 @@ export const pageRoutes: RouteObject[] = [
   { path: 'live', element: <LiveWatch /> },
   { path: 'gta', element: <GtaMode /> },
   { path: 'posting', element: <Posting /> },
+  { path: 'schedule', element: <Schedule /> },
+  { path: 'autopilot', element: <AutopilotList /> },
+  { path: 'autopilot/new', element: <AutopilotEditor /> },
+  { path: 'autopilot/:autopilotId', element: <AutopilotDetail /> },
+  { path: 'autopilot/:autopilotId/edit', element: <AutopilotEditor /> },
   { path: 'settings', element: <Settings /> },
+  { path: 'health', element: <Health /> },
   // Keep last: anything unknown gets a friendly "not found".
   { path: '*', element: <NotFound /> },
 ]

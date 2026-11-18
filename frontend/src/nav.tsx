@@ -11,6 +11,7 @@ import {
   CalendarIcon,
   CompassIcon,
   FolderIcon,
+  ActivityIcon,
   GamepadIcon,
   PlusIcon,
   RadioIcon,
@@ -38,4 +39,5 @@ export const NAV_ITEMS: NavItem[] = [
   { label: 'Autopilot', path: '/autopilot', icon: RocketIcon, section: 'Publish' },
   { label: 'Posting & accounts', path: '/posting', icon: SendIcon, section: 'Publish' },
   { label: 'Settings', path: '/settings', icon: SettingsIcon, section: 'System' },
+  { label: 'Health check', path: '/health', icon: ActivityIcon, section: 'System' },
 ]

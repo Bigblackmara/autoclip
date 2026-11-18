@@ -68,10 +68,23 @@ def version() -> None:
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    live: bool = typer.Option(
+        False, "--live", help="Also contact the AI provider and Zernio (free calls, no posts)."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print every check as JSON."),
+) -> None:
     """Check that this machine can run the pipeline, and explain anything missing."""
+    from . import doctor as health
+
     report = system.refresh()
     settings = config.load()
+    if as_json:
+        import json
+
+        result = health.doctor_report(live=live)
+        typer.echo(json.dumps(result, indent=2))
+        raise typer.Exit(1 if result["summary"]["fail"] or not report.ready else 0)
 
     console.print()
     console.print(
@@ -315,6 +328,30 @@ def doctor() -> None:
     console.print()
     console.print(store_table)
 
+    # --- Downloads, posting, database, disk ---------------------------------
+    extra = [
+        c
+        for c in health.run_checks(live=live)
+        if c.group in {"Downloads", "AI", "Posting", "Storage"}
+    ]
+    extra_table = Table(
+        title="Downloads, AI, posting, storage",
+        show_header=True,
+        header_style="bold",
+        title_justify="left",
+    )
+    extra_table.add_column("Check")
+    extra_table.add_column("Status", width=6)
+    extra_table.add_column("Detail")
+    badge = {"ok": OK, "warn": WARN, "fail": FAIL}
+    for check in extra:
+        extra_table.add_row(check.label, badge[check.status], check.detail)
+        if check.fix and check.status != "ok":
+            remediation.append(f"{check.label}: {check.fix}")
+    console.print()
+    console.print(extra_table)
+    failed_extra = any(c.status == "fail" for c in extra)
+
     # --- Verdict -----------------------------------------------------------
     console.print()
     if report.ready:
@@ -340,7 +377,7 @@ def doctor() -> None:
             console.print(f"  [bold]{i}.[/bold] {item}")
         console.print()
 
-    raise typer.Exit(0 if report.ready else 1)
+    raise typer.Exit(0 if report.ready and not failed_extra else 1)
 
 
 config_app = typer.Typer(help="Inspect and modify AutoClip settings.", no_args_is_help=True)
