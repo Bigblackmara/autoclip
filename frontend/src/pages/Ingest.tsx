@@ -4,9 +4,15 @@ import { useNavigate } from 'react-router-dom'
 import {
   ApiError,
   api,
+  detectLink,
+  formatBytes,
   formatDuration,
   LAYOUTS,
+  LINK_LABELS,
+  type DriveFolderListing,
   type Job,
+  type LinkKind,
+  type LinkProgress,
   type JobSettingsOverrides,
   type Layout,
   type ProviderStatus,
@@ -25,7 +31,14 @@ export function Ingest() {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [defaults, setDefaults] = useState<Settings | null>(null)
+  // A pasted Drive folder: its videos, and which of them to clip.
+  const [folder, setFolder] = useState<DriveFolderListing | null>(null)
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [linkProgress, setLinkProgress] = useState<LinkProgress | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [jobsVersion, setJobsVersion] = useState(0)
   const fileInput = useRef<HTMLInputElement>(null)
+  const linkKind = detectLink(url)
   // A ref, not the `busy` state: a file dropped while a URL fetch is in
   // flight must be refused even if the drop handler closed over a stale value.
   const busyRef = useRef(false)
@@ -58,7 +71,7 @@ export function Ingest() {
       stopped = true
       window.clearTimeout(timer)
     }
-  }, [])
+  }, [jobsVersion])
 
   const start = useCallback(
     async (kind: 'url' | 'file', run: () => Promise<{ id: string }>) => {
@@ -88,10 +101,92 @@ export function Ingest() {
     [navigate, overrides, defaults],
   )
 
-  const submitUrl = (event: React.FormEvent) => {
+  /**
+   * Download a file link, polling the server for byte progress meanwhile
+   * (the POST itself only answers once the file is in).
+   */
+  const ingestLinkWithProgress = useCallback(async (link: string) => {
+    const progressId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    setLinkProgress(null)
+    const timer = window.setInterval(() => {
+      api.linkProgress(progressId).then(setLinkProgress).catch(() => undefined)
+    }, 700)
+    try {
+      return await api.ingestLink(link, progressId)
+    } finally {
+      window.clearInterval(timer)
+      setLinkProgress(null)
+    }
+  }, [])
+
+  const submitUrl = async (event: React.FormEvent) => {
     event.preventDefault()
-    if (!url.trim()) return
-    void start('url', () => api.ingestYouTube(url.trim()))
+    const link = url.trim()
+    if (!link) return
+    setNotice(null)
+    if (linkKind === 'gdrive_folder') {
+      if (busyRef.current) return
+      busyRef.current = true
+      setBusy('url')
+      setError(null)
+      try {
+        const listing = await api.driveFolder(link)
+        setFolder(listing)
+        setPicked(new Set(listing.files.map((f) => f.id)))
+      } catch (err) {
+        setError(err as Error)
+      } finally {
+        busyRef.current = false
+        setBusy(null)
+      }
+      return
+    }
+    if (linkKind && linkKind !== 'youtube') {
+      void start('url', () => ingestLinkWithProgress(link))
+      return
+    }
+    void start('url', () => api.ingestYouTube(link))
+  }
+
+  /** Ingest the picked folder videos one by one, queueing a job for each. */
+  const clipFolder = async () => {
+    if (!folder || busyRef.current) return
+    const files = folder.files.filter((f) => picked.has(f.id))
+    if (files.length === 0) return
+    const invalid = validateOverrides(overrides, defaults)
+    if (invalid) {
+      setError(new Error(invalid))
+      setAdvancedOpen(true)
+      return
+    }
+    busyRef.current = true
+    setBusy('url')
+    setError(null)
+    let firstJob: string | null = null
+    let queued = 0
+    try {
+      for (const file of files) {
+        setNotice(`Downloading ${file.name} (${queued + 1} of ${files.length})…`)
+        const source = await ingestLinkWithProgress(file.url)
+        const job = await api.createJob(source.id, overrides)
+        firstJob ??= job.id
+        queued += 1
+        setJobsVersion((v) => v + 1)
+      }
+      if (files.length === 1 && firstJob) {
+        navigate(`/jobs/${firstJob}`)
+        return
+      }
+      setNotice(`Queued ${queued} video${queued === 1 ? '' : 's'} from “${folder.name}”.`)
+      setFolder(null)
+      setUrl('')
+    } catch (err) {
+      setNotice(queued ? `Queued ${queued} of ${files.length} before the error below.` : null)
+      setError(err as Error)
+    } finally {
+      busyRef.current = false
+      setBusy(null)
+    }
   }
 
   const submitFile = (file: File) => void start('file', () => api.uploadSource(file))
@@ -122,9 +217,12 @@ export function Ingest() {
               <input
                 id="url"
                 className="field font-display text-xl md:text-2xl"
-                placeholder="https://youtube.com/watch?v=…"
+                placeholder="YouTube, Google Drive, Dropbox, OneDrive or .mp4 link"
                 value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                onChange={(e) => {
+                  setUrl(e.target.value)
+                  setFolder(null)
+                }}
                 autoComplete="off"
                 spellCheck={false}
                 disabled={busy !== null}
@@ -134,10 +232,23 @@ export function Ingest() {
                 className="btn btn-primary shrink-0"
                 disabled={busy !== null || !url.trim()}
               >
-                {busy === 'url' ? 'Fetching…' : 'Start'}
+                {busy === 'url' ? 'Fetching…' : linkKind === 'gdrive_folder' ? 'List' : 'Start'}
               </button>
             </div>
           </form>
+
+          {linkKind && <LinkBadge kind={linkKind} />}
+          {busy === 'url' && linkProgress && <DownloadProgress progress={linkProgress} />}
+          {folder && (
+            <FolderPicker
+              folder={folder}
+              picked={picked}
+              onChange={setPicked}
+              onClip={() => void clipFolder()}
+              busy={busy !== null}
+            />
+          )}
+          {notice && <p className="mt-3 text-xs text-ink-300">{notice}</p>}
 
           <p className="mt-3 text-xs leading-relaxed text-ink-500">
             Only download video you own or have the rights to process.
@@ -225,7 +336,7 @@ export function Ingest() {
         </p>
       )}
 
-      <RecentJobs jobs={jobs} />
+      <RecentJobs jobs={jobs} retentionDays={defaults?.housekeeping?.retention_days ?? 0} />
     </div>
   )
 }
@@ -465,7 +576,158 @@ function NumberField({
   )
 }
 
-function RecentJobs({ jobs }: { jobs: Job[] }) {
+function LinkIcon({ kind }: { kind: LinkKind }) {
+  // Tiny monochrome glyphs: a play button, a cloud, a folder, a chain link.
+  const path =
+    kind === 'youtube'
+      ? 'M2 4.5A2.5 2.5 0 0 1 4.5 2h7A2.5 2.5 0 0 1 14 4.5v7a2.5 2.5 0 0 1-2.5 2.5h-7A2.5 2.5 0 0 1 2 11.5zM6.5 5.5v5l4-2.5z'
+      : kind === 'gdrive_folder'
+        ? 'M1.5 4A1.5 1.5 0 0 1 3 2.5h3l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5.5v6A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5z'
+        : kind === 'direct'
+          ? 'M6.5 9.5l3-3M5 7.5 3.8 8.7a2.3 2.3 0 0 0 3.3 3.3L8.5 11M11 8.5l1.2-1.2a2.3 2.3 0 0 0-3.3-3.3L7.5 5'
+          : 'M4.5 12.5a3 3 0 0 1-.4-6 4 4 0 0 1 7.7-1A3.3 3.3 0 0 1 11.5 12.5z'
+  const stroke = kind === 'direct'
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className="size-3.5 shrink-0"
+      aria-hidden
+      fill={stroke ? 'none' : 'currentColor'}
+      stroke={stroke ? 'currentColor' : 'none'}
+      strokeWidth={stroke ? 1.6 : 0}
+      strokeLinecap="round"
+    >
+      <path d={path} />
+    </svg>
+  )
+}
+
+function LinkBadge({ kind }: { kind: LinkKind }) {
+  return (
+    <p className="mt-3 flex items-center gap-2 text-xs text-ink-400">
+      <LinkIcon kind={kind} />
+      <span>
+        {LINK_LABELS[kind]}
+        {kind === 'gdrive_folder' && ' · pick the videos to clip'}
+      </span>
+    </p>
+  )
+}
+
+function DownloadProgress({ progress }: { progress: LinkProgress }) {
+  const { done_bytes: done, total_bytes: total } = progress
+  const fraction = total ? Math.min(1, done / total) : null
+  return (
+    <div className="mt-3 max-w-md" aria-live="polite">
+      <div className="h-1 bg-ink-800">
+        <div
+          className="h-1 bg-sodium-500 transition-[width] duration-500"
+          style={{ width: `${Math.round((fraction ?? 0) * 100)}%` }}
+        />
+      </div>
+      <p className="numeric mt-1.5 text-xs text-ink-500">
+        {fraction !== null
+          ? `${Math.round(fraction * 100)}% of ${formatBytes(total ?? 0)}`
+          : done > 0
+            ? `${formatBytes(done)} downloaded`
+            : 'Connecting…'}
+      </p>
+    </div>
+  )
+}
+
+function FolderPicker({
+  folder,
+  picked,
+  onChange,
+  onClip,
+  busy,
+}: {
+  folder: DriveFolderListing
+  picked: Set<string>
+  onChange: (next: Set<string>) => void
+  onClip: () => void
+  busy: boolean
+}) {
+  const toggle = (id: string) => {
+    const next = new Set(picked)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    onChange(next)
+  }
+  const all = folder.files.length > 0 && picked.size === folder.files.length
+
+  return (
+    <div className="mt-6 border border-ink-800 p-4">
+      <div className="flex items-baseline justify-between gap-4">
+        <p className="truncate text-sm text-ink-100">{folder.name}</p>
+        <span className="numeric shrink-0 text-xs text-ink-500">
+          {folder.files.length} video{folder.files.length === 1 ? '' : 's'}
+        </span>
+      </div>
+      {folder.files.length === 0 ? (
+        <p className="mt-3 text-xs text-ink-500">No video or audio files in this folder.</p>
+      ) : (
+        <>
+          <label className="mt-3 flex items-center gap-3 text-xs text-ink-400">
+            <input
+              type="checkbox"
+              checked={all}
+              onChange={() => onChange(all ? new Set() : new Set(folder.files.map((f) => f.id)))}
+              className="size-4 accent-sodium-500"
+              disabled={busy}
+            />
+            Select all
+          </label>
+          <ul className="mt-2 max-h-64 overflow-y-auto">
+            {folder.files.map((file) => (
+              <li key={file.id}>
+                <label className="flex items-center gap-3 border-b border-ink-850 py-2 text-sm text-ink-200">
+                  <input
+                    type="checkbox"
+                    checked={picked.has(file.id)}
+                    onChange={() => toggle(file.id)}
+                    className="size-4 shrink-0 accent-sodium-500"
+                    disabled={busy}
+                  />
+                  <span className="truncate">{file.name}</span>
+                  {file.folder && (
+                    <span className="ml-auto shrink-0 text-xs text-ink-600">{file.folder}</span>
+                  )}
+                </label>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {folder.truncated && (
+        <p className="mt-2 text-xs text-ink-500">
+          The folder is large; only the first part of it is listed.
+        </p>
+      )}
+      <button
+        type="button"
+        className="btn btn-primary mt-4"
+        disabled={busy || picked.size === 0}
+        onClick={onClip}
+      >
+        {busy ? 'Working…' : `Clip ${picked.size} video${picked.size === 1 ? '' : 's'}`}
+      </button>
+    </div>
+  )
+}
+
+/** "Deletes in 3 days" for a job, given the retention setting (0 = off). */
+function deletesIn(job: Job, retentionDays: number): string | null {
+  if (retentionDays <= 0 || job.status === 'queued' || job.status === 'running') return null
+  const created = Date.parse(job.created_at)
+  if (Number.isNaN(created)) return null
+  const left = Math.ceil((created + retentionDays * 86_400_000 - Date.now()) / 86_400_000)
+  if (left <= 0) return 'Deleting soon'
+  return `Deletes in ${left} day${left === 1 ? '' : 's'}`
+}
+
+function RecentJobs({ jobs, retentionDays }: { jobs: Job[]; retentionDays: number }) {
   if (jobs.length === 0) return null
 
   return (
@@ -482,8 +744,15 @@ function RecentJobs({ jobs }: { jobs: Job[] }) {
               href={job.status === 'done' ? `/jobs/${job.id}/clips` : `/jobs/${job.id}`}
               className="group grid grid-cols-[1fr_auto] items-baseline gap-4 border-b border-ink-850 py-4 transition-colors duration-200 hover:bg-ink-850/40 sm:grid-cols-[1fr_7rem_6rem_5rem]"
             >
-              <span className="truncate text-[0.9375rem] text-ink-200 group-hover:text-ink-100">
-                {job.source?.title || 'Untitled'}
+              <span className="min-w-0">
+                <span className="block truncate text-[0.9375rem] text-ink-200 group-hover:text-ink-100">
+                  {job.source?.title || 'Untitled'}
+                </span>
+                {deletesIn(job, retentionDays) && (
+                  <span className="mt-0.5 block text-xs text-ink-600">
+                    {deletesIn(job, retentionDays)}
+                  </span>
+                )}
               </span>
               <span className="numeric hidden text-xs text-ink-500 sm:block">
                 {job.source ? formatDuration(job.source.duration_s) : '—'}

@@ -1,7 +1,10 @@
-"""Ingestion — YouTube URLs and local file uploads become source records.
+"""Ingestion — YouTube URLs, file links and local uploads become source records.
 
-Both paths converge on a validated :class:`~autoclip.db.models.Source` with a
-file on disk and probed metadata.
+File links (Google Drive, Dropbox, OneDrive, direct video URLs; see
+:mod:`autoclip.pipeline.filelink`) are downloaded over plain HTTP and then
+take exactly the upload path, :func:`ingest_file`. All paths converge on a
+validated :class:`~autoclip.db.models.Source` with a file on disk and probed
+metadata.
 
 A note on YouTube: as of 2026 most anonymous downloads hit a bot check, and
 proof-of-origin tokens no longer clear it reliably — browser cookies do. So
@@ -11,10 +14,14 @@ to fix it, rather than surfacing a raw yt-dlp traceback.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -111,24 +118,94 @@ def ingest_youtube(
 ) -> Source:
     """Download a YouTube video and return a validated source record.
 
+    When the download fails with an error that usually means yt-dlp is
+    outdated (and ``settings.ytdlp_auto_update`` is on), yt-dlp is upgraded
+    once and the download retried once, in a fresh interpreter so the new
+    version is the one that runs (see :mod:`autoclip.ytdlp_update`).
+
     Preconditions:
         url points at content the user owns or has the rights to process.
     """
-    import yt_dlp
+    from .. import ytdlp_update
 
     settings = settings or IngestSettings()
     source_id = new_id()
     target_dir = paths.source_media_dir(source_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    def hook(status: dict) -> None:
-        if not on_progress or status.get("status") != "downloading":
-            return
-        total = status.get("total_bytes") or status.get("total_bytes_estimate")
-        done = status.get("downloaded_bytes")
-        if total and done:
-            on_progress(min(1.0, done / total))
+    # After an upgrade this process still holds the old yt_dlp in memory;
+    # a subprocess imports the new one from disk.
+    in_subprocess = ytdlp_update.stale_in_process()
+    try:
+        try:
+            metadata = _download(url, settings, target_dir, on_progress, in_subprocess)
+        except YtdlpFailure as exc:
+            failed_version = (
+                ytdlp_update.installed_version()
+                if in_subprocess
+                else ytdlp_update.loaded_version() or ytdlp_update.installed_version()
+            )
+            if not (
+                settings.ytdlp_auto_update
+                and ytdlp_update.updater.update_for_failure(str(exc), failed_version)
+            ):
+                raise
+            log.warning(
+                "Retrying the download once with yt-dlp %s (was %s).",
+                ytdlp_update.installed_version(),
+                failed_version,
+            )
+            shutil.rmtree(target_dir, ignore_errors=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            metadata = _download(url, settings, target_dir, on_progress, True)
+    except YtdlpFailure as exc:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        if exc.download_error:
+            raise _translate_ytdlp_error(exc, settings) from exc
+        raise IngestError(f"Could not download {url}: {exc}") from exc
+    except BaseException:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise
 
+    downloaded = _find_downloaded_file(target_dir)
+    if downloaded is None:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise IngestError("yt-dlp reported success but produced no media file.")
+
+    info = _probe_and_validate(downloaded)
+
+    return Source(
+        id=source_id,
+        type="youtube",
+        url=url,
+        path=str(downloaded),
+        filename=downloaded.name,
+        title=metadata.get("title") or downloaded.stem,
+        channel=metadata.get("uploader") or metadata.get("channel"),
+        duration_s=info.duration_s or float(metadata.get("duration") or 0.0),
+        width=info.width,
+        height=info.height,
+        fps=info.fps,
+        has_audio=info.has_audio,
+        has_video=info.has_video,
+    )
+
+
+class YtdlpFailure(Exception):
+    """A yt-dlp download failed (in this process or in the worker).
+
+    ``download_error`` is True for yt-dlp's own ``DownloadError`` (which
+    :func:`_translate_ytdlp_error` explains), False for anything else.
+    """
+
+    def __init__(self, message: str, *, download_error: bool) -> None:
+        super().__init__(message)
+        self.download_error = download_error
+
+
+def youtube_options(
+    settings: IngestSettings, target_dir: Path, hook: Callable[[dict], None]
+) -> dict:
     options: dict = {
         "format": settings.ytdlp_format,
         "outtmpl": str(target_dir / "source.%(ext)s"),
@@ -144,42 +221,142 @@ def ingest_youtube(
     if settings.cookies_from_browser:
         # yt-dlp expects a tuple; only the browser name is required.
         options["cookiesfrombrowser"] = (settings.cookies_from_browser,)
+    return options
+
+
+def _metadata_summary(metadata: Any) -> dict[str, Any]:
+    """The few info fields the Source record needs (JSON-safe, for the worker)."""
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        key: metadata.get(key)
+        for key in ("title", "uploader", "channel", "duration")
+        if isinstance(metadata.get(key), str | int | float)
+    }
+
+
+def download_in_process(
+    url: str,
+    settings: IngestSettings,
+    target_dir: Path,
+    on_progress: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    """Run yt-dlp here. Raises :class:`YtdlpFailure`. Returns metadata."""
+    import yt_dlp
+
+    def hook(status: dict) -> None:
+        if not on_progress or status.get("status") != "downloading":
+            return
+        total = status.get("total_bytes") or status.get("total_bytes_estimate")
+        done = status.get("downloaded_bytes")
+        if total and done:
+            on_progress(min(1.0, done / total))
 
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
+        with yt_dlp.YoutubeDL(youtube_options(settings, target_dir, hook)) as ydl:
             metadata = ydl.extract_info(url, download=True)
             # Sidecars for the audience signals and the captions-first
             # transcript. Best effort: they never fail an ingest.
             save_sidecars(ydl, metadata, target_dir, captions=settings.prefer_youtube_captions)
     except yt_dlp.utils.DownloadError as exc:
-        shutil.rmtree(target_dir, ignore_errors=True)
-        raise _translate_ytdlp_error(exc, settings) from exc
+        raise YtdlpFailure(str(exc), download_error=True) from exc
     except Exception as exc:
-        shutil.rmtree(target_dir, ignore_errors=True)
-        raise IngestError(f"Could not download {url}: {exc}") from exc
+        raise YtdlpFailure(str(exc), download_error=False) from exc
+    return _metadata_summary(metadata)
 
-    downloaded = _find_downloaded_file(target_dir)
-    if downloaded is None:
-        shutil.rmtree(target_dir, ignore_errors=True)
-        raise IngestError("yt-dlp reported success but produced no media file.")
 
-    info = _probe_and_validate(downloaded)
+#: Lines the worker prints; everything else on its output is yt-dlp chatter.
+WORKER_PROGRESS = "AUTOCLIP-PROGRESS "
+WORKER_RESULT = "AUTOCLIP-RESULT "
 
-    return Source(
-        id=source_id,
-        type="youtube",
-        url=url,
-        path=str(downloaded),
-        filename=downloaded.name,
-        title=(metadata or {}).get("title") or downloaded.stem,
-        channel=(metadata or {}).get("uploader") or (metadata or {}).get("channel"),
-        duration_s=info.duration_s or float((metadata or {}).get("duration") or 0.0),
-        width=info.width,
-        height=info.height,
-        fps=info.fps,
-        has_audio=info.has_audio,
-        has_video=info.has_video,
+#: Seam for tests: how the worker process is started.
+_popen = subprocess.Popen
+
+
+def _worker_env() -> dict[str, str]:
+    """The environment for the worker, with this autoclip package importable."""
+    env = dict(os.environ)
+    package_root = str(Path(__file__).resolve().parents[2])
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else package_root
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def download_in_subprocess(
+    url: str,
+    settings: IngestSettings,
+    target_dir: Path,
+    on_progress: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    """Run yt-dlp in a fresh interpreter (:mod:`autoclip.pipeline.ytdlp_worker`).
+
+    Same code path as :func:`download_in_process`, but the worker imports
+    yt_dlp from disk, so an upgrade made after this process started is the
+    version that runs. Raises :class:`YtdlpFailure`.
+    """
+    payload = json.dumps(
+        {"url": url, "target_dir": str(target_dir), "settings": settings.model_dump(mode="json")}
     )
+    kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        process = _popen(
+            [sys.executable, "-m", "autoclip.pipeline.ytdlp_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_worker_env(),
+            **kwargs,
+        )
+    except OSError as exc:
+        raise YtdlpFailure(
+            f"Could not start the download worker: {exc}", download_error=False
+        ) from exc
+
+    assert process.stdin is not None and process.stdout is not None
+    process.stdin.write(payload)
+    process.stdin.close()
+    result: dict[str, Any] | None = None
+    chatter: list[str] = []
+    for raw_line in process.stdout:
+        line = raw_line.rstrip("\n")
+        if line.startswith(WORKER_PROGRESS):
+            if on_progress:
+                with contextlib.suppress(ValueError):
+                    on_progress(float(line[len(WORKER_PROGRESS) :]))
+        elif line.startswith(WORKER_RESULT):
+            with contextlib.suppress(ValueError):
+                result = json.loads(line[len(WORKER_RESULT) :])
+        elif line.strip():
+            chatter = [*chatter[-19:], line]
+    process.wait()
+
+    if not isinstance(result, dict):
+        detail = "\n".join(chatter[-8:]) or f"exit code {process.returncode}"
+        raise YtdlpFailure(f"The download worker crashed: {detail}", download_error=False)
+    if not result.get("ok"):
+        raise YtdlpFailure(
+            str(result.get("message") or "unknown error"),
+            download_error=bool(result.get("download_error")),
+        )
+    metadata = result.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _download(
+    url: str,
+    settings: IngestSettings,
+    target_dir: Path,
+    on_progress: Callable[[float], None] | None,
+    in_subprocess: bool,
+) -> dict[str, Any]:
+    runner = download_in_subprocess if in_subprocess else download_in_process
+    return runner(url, settings, target_dir, on_progress)
 
 
 #: Info-json keys dropped before saving: large and useless after the download.
@@ -353,6 +530,57 @@ def ingest_file(path: Path, *, move: bool = False, title: str | None = None) -> 
         has_audio=info.has_audio,
         has_video=info.has_video,
     )
+
+
+# --------------------------------------------------------------------------
+# File links (Google Drive, Dropbox, OneDrive, direct URLs)
+# --------------------------------------------------------------------------
+
+
+def is_file_link(url: str) -> bool:
+    """True for a Drive/Dropbox/OneDrive share link or a direct video URL."""
+    from . import drivefolder, filelink
+
+    return drivefolder.folder_id(url) is not None or filelink.is_file_link(url)
+
+
+def ingest_link(
+    url: str,
+    settings: IngestSettings | None = None,
+    *,
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> Source:
+    """Download a file link and register it exactly like an upload.
+
+    ``on_progress(done_bytes, total_bytes_or_None)`` is called while the file
+    streams in. The download lands in a staging folder inside the media store
+    (same disk, so handing it to :func:`ingest_file` is a rename) that is
+    removed whatever happens.
+    """
+    from . import filelink
+
+    settings = settings or IngestSettings()
+    link = filelink.classify(url)
+    if link is None:
+        raise IngestError(
+            "That link is not a supported video file link.",
+            hint="Paste a YouTube link, a Google Drive / Dropbox / OneDrive share link, "
+            "or a direct link ending in .mp4, .mov, .mkv or .webm.",
+        )
+    staging = paths.media_dir() / ".incoming" / new_id()
+    try:
+        downloaded, name = filelink.download(
+            link,
+            staging,
+            max_bytes=settings.link_max_mb * 1024 * 1024,
+            on_progress=on_progress,
+        )
+        source = ingest_file(downloaded, move=True, title=Path(name).stem or link.label)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    source.url = link.url
+    source.filename = name
+    return source
 
 
 def _probe_and_validate(path: Path) -> ffmpeg.MediaInfo:

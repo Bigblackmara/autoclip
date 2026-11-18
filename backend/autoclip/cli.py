@@ -464,6 +464,8 @@ def clip(
         with console.status("[cyan]Fetching source...", spinner="dots"):
             if ingest.is_youtube_url(target):
                 source = ingest.ingest_youtube(target, settings.ingest)
+            elif ingest.is_file_link(target):
+                source = ingest.ingest_link(target, settings.ingest)
             else:
                 source = ingest.ingest_file(Path(target))
     except ingest.IngestError as exc:
@@ -621,34 +623,14 @@ def fetch_models() -> None:
 @app.command("update-ytdlp")
 def update_ytdlp() -> None:
     """Update yt-dlp, which YouTube changes force often."""
-    import shutil
-    import subprocess
-    import sys
+    from . import ytdlp_update
 
     console.print("[cyan]Updating yt-dlp...[/cyan]")
     # The `default` extra carries yt-dlp-ejs, the solver YouTube's player
-    # challenge needs. Environments made by uv have no pip, so use uv there.
-    package = "yt-dlp[default]"
-    has_pip = (
-        subprocess.run(
-            [sys.executable, "-m", "pip", "--version"], capture_output=True, check=False
-        ).returncode
-        == 0
-    )
-    uv = shutil.which("uv")
-    if has_pip:
-        command = [sys.executable, "-m", "pip", "install", "--upgrade", package]
-    elif uv:
-        command = [uv, "pip", "install", "--python", sys.executable, "--upgrade", package]
-    else:
-        console.print(
-            "[red]Update failed.[/red] This environment has neither pip nor uv. "
-            f"Install uv, or run: {sys.executable} -m ensurepip"
-        )
-        raise typer.Exit(1)
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        console.print(f"[red]Update failed.[/red]\n{result.stderr}")
+    # challenge needs. Environments made by uv have no pip, so uv is used there.
+    ok, output = ytdlp_update.run_upgrade()
+    if not ok:
+        console.print(f"[red]Update failed.[/red]\n{output}")
         raise typer.Exit(1)
 
     import importlib.metadata

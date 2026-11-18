@@ -27,6 +27,7 @@ def _settings_out(settings: config.Settings) -> SettingsOut:
         ingest=payload["ingest"],
         export=payload["export"],
         detection=payload["detection"],
+        housekeeping=payload["housekeeping"],
         insecure_secret_storage=payload["insecure_secret_storage"],
         keys_present={
             name: config.get_secret(name, settings) is not None for name in config.KEYED_PROVIDERS
@@ -54,7 +55,7 @@ async def put_settings(payload: SettingsIn) -> SettingsOut:
             )
         settings.active_provider = updates["active_provider"]
 
-    for section in ("whisper", "clips", "ingest", "export", "detection"):
+    for section in ("whisper", "clips", "ingest", "export", "detection", "housekeeping"):
         if section in updates:
             current = getattr(settings, section)
             try:

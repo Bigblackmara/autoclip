@@ -11,6 +11,7 @@ import {
   type SystemStatus,
   type WatermarkCorner,
   type WatermarkMode,
+  type YtdlpStatus,
 } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 
@@ -25,6 +26,8 @@ export function Settings() {
   const [settings, setSettings] = useState<SettingsData | null>(null)
   const [providers, setProviders] = useState<ProviderStatus[]>([])
   const [system, setSystem] = useState<SystemStatus | null>(null)
+  const [ytdlp, setYtdlp] = useState<YtdlpStatus | null>(null)
+  const [checking, setChecking] = useState(false)
   const [error, setError] = useState<Error | null>(null)
   const [saved, setSaved] = useState(false)
 
@@ -32,6 +35,19 @@ export function Settings() {
     void api.getSettings().then(setSettings).catch((e) => setError(e as Error))
     void api.providerStatus().then(setProviders).catch(() => undefined)
     void api.system().then(setSystem).catch(() => undefined)
+    void api.ytdlpStatus().then(setYtdlp).catch(() => undefined)
+  }
+
+  const checkYtdlp = async () => {
+    setChecking(true)
+    setError(null)
+    try {
+      setYtdlp(await api.ytdlpCheck())
+    } catch (err) {
+      setError(err as Error)
+    } finally {
+      setChecking(false)
+    }
   }
 
   useEffect(reload, [])
@@ -237,7 +253,73 @@ export function Settings() {
             ]}
             labels={{ '': 'None' }}
           />
+          <NumberField
+            label="Link size limit (MB)"
+            value={settings.ingest.link_max_mb}
+            integer
+            min={1}
+            onCommit={(value) => patch({ ingest: { link_max_mb: value } })}
+          />
         </div>
+      </Section>
+
+      <Section
+        title="Storage & updates"
+        note="Old work can be cleaned up automatically, and yt-dlp kept current."
+      >
+        <div className="grid gap-5 sm:grid-cols-2">
+          <div>
+            <NumberField
+              label="Delete work after (days)"
+              value={settings.housekeeping.retention_days}
+              integer
+              min={0}
+              onCommit={(value) => patch({ housekeeping: { retention_days: value } })}
+            />
+            <span className="mt-1.5 block text-xs leading-snug text-ink-500">
+              0 keeps everything. Sources, jobs and clips older than this are deleted hourly,
+              files included. Anything still processing, and GTA clips waiting to be posted,
+              are kept.
+            </span>
+          </div>
+        </div>
+
+        <div className="mt-6">
+          <Toggle
+            label="Keep yt-dlp up to date (checks daily; retries a failed YouTube download once after updating)"
+            checked={settings.ingest.ytdlp_auto_update}
+            onChange={(checked) => patch({ ingest: { ytdlp_auto_update: checked } })}
+          />
+        </div>
+        {ytdlp && (
+          <dl className="mt-5 grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+            <Row label="yt-dlp installed" value={ytdlp.installed_version ?? 'not found'} />
+            <Row label="Latest on PyPI" value={ytdlp.latest_version ?? '—'} />
+            <Row
+              label="Last check"
+              value={ytdlp.last_check_at ? new Date(ytdlp.last_check_at).toLocaleString() : 'never'}
+            />
+            <Row label="Result" value={ytdlpResult(ytdlp)} />
+          </dl>
+        )}
+        {ytdlp?.last_message && (
+          <p className="mt-3 text-xs leading-relaxed text-ink-500">{ytdlp.last_message}</p>
+        )}
+        {ytdlp?.restart_pending && (
+          <p className="mt-3 border-l-2 border-sodium-600 pl-4 text-xs leading-relaxed text-ink-300">
+            yt-dlp {ytdlp.installed_version} is installed; this session still runs{' '}
+            {ytdlp.loaded_version}. YouTube downloads already use the new version; restart
+            AutoClip so GTA Mode and Live Watch do too.
+          </p>
+        )}
+        <button
+          type="button"
+          className="btn btn-quiet mt-4 -ml-1"
+          disabled={checking}
+          onClick={() => void checkYtdlp()}
+        >
+          {checking ? 'Checking…' : 'Check for an update now'}
+        </button>
       </Section>
 
       <Section title="Export">
@@ -454,6 +536,19 @@ export function Settings() {
       )}
     </div>
   )
+}
+
+function ytdlpResult(status: YtdlpStatus): string {
+  switch (status.last_result) {
+    case 'up_to_date':
+      return 'up to date'
+    case 'updated':
+      return 'updated'
+    case 'failed':
+      return 'check failed'
+    default:
+      return status.auto_update ? 'not checked yet' : 'auto-update off'
+  }
 }
 
 function Section({

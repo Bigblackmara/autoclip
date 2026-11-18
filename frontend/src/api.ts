@@ -158,6 +158,10 @@ export interface Settings {
     ytdlp_format: string
     cookies_from_browser: string
     prefer_youtube_captions: boolean
+    /** Check PyPI daily and upgrade yt-dlp; retry a failed download once. */
+    ytdlp_auto_update: boolean
+    /** Largest file a Drive / Dropbox / OneDrive / direct link may be. */
+    link_max_mb: number
   }
   export: {
     ratio: string
@@ -184,6 +188,8 @@ export interface Settings {
     fps: number
     two_pass_loudnorm: boolean
   }
+  /** Retention: delete work older than N days (0 = keep everything). */
+  housekeeping: { retention_days: number }
   insecure_secret_storage: boolean
   keys_present: Record<string, boolean>
 }
@@ -200,6 +206,7 @@ export interface SettingsPatch {
   clips?: Partial<Settings['clips']>
   ingest?: Partial<Settings['ingest']>
   export?: Partial<Settings['export']>
+  housekeeping?: Partial<Settings['housekeeping']>
 }
 
 export interface SystemStatus {
@@ -213,6 +220,84 @@ export interface SystemStatus {
   gpu_name: string | null
   compute_type: string
   diarization_available: boolean
+}
+
+/** yt-dlp versions and the last self-update check (GET /api/system/ytdlp). */
+export interface YtdlpStatus {
+  auto_update: boolean
+  installed_version: string | null
+  /** The version this running AutoClip has in memory. */
+  loaded_version: string | null
+  latest_version: string | null
+  last_check_at: string | null
+  last_update_at: string | null
+  last_result: '' | 'up_to_date' | 'updated' | 'failed'
+  last_reason: string
+  last_message: string
+  /** Installed differs from loaded: downloads use a fresh process until restart. */
+  restart_pending: boolean
+  checking: boolean
+}
+
+export interface DriveFolderFile {
+  id: string
+  name: string
+  mime_type: string
+  folder: string
+  url: string
+}
+
+export interface DriveFolderListing {
+  id: string
+  name: string
+  truncated: boolean
+  files: DriveFolderFile[]
+}
+
+export interface LinkProgress {
+  state: 'starting' | 'downloading' | 'done' | 'failed'
+  done_bytes: number
+  total_bytes: number | null
+}
+
+export type LinkKind = 'youtube' | 'gdrive' | 'gdrive_folder' | 'dropbox' | 'onedrive' | 'direct'
+
+export const LINK_LABELS: Record<LinkKind, string> = {
+  youtube: 'YouTube',
+  gdrive: 'Google Drive',
+  gdrive_folder: 'Google Drive folder',
+  dropbox: 'Dropbox',
+  onedrive: 'OneDrive',
+  direct: 'Direct video link',
+}
+
+/**
+ * What kind of link was pasted, for the label under the field. Mirrors the
+ * server's classifier (pipeline/filelink.py), which stays authoritative.
+ */
+export function detectLink(raw: string): LinkKind | null {
+  let url: URL
+  try {
+    url = new URL(raw.trim())
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  const host = url.hostname.toLowerCase().replace(/^www\./, '')
+  const path = url.pathname
+  if (['youtube.com', 'youtu.be', 'm.youtube.com'].includes(host)) return 'youtube'
+  if (host === 'drive.google.com' && (/\/folders\//.test(path) || path === '/embeddedfolderview')) {
+    return 'gdrive_folder'
+  }
+  if (['drive.google.com', 'docs.google.com', 'drive.usercontent.google.com'].includes(host)) {
+    return 'gdrive'
+  }
+  if (['dropbox.com', 'dl.dropboxusercontent.com', 'dl.dropbox.com'].includes(host)) return 'dropbox'
+  if (host === '1drv.ms' || host === 'onedrive.live.com' || host.endsWith('.sharepoint.com')) {
+    return 'onedrive'
+  }
+  if (/\.(mp4|mov|mkv|webm|m4v|avi)$/i.test(path)) return 'direct'
+  return null
 }
 
 export interface JobSettingsOverrides {
@@ -288,6 +373,8 @@ export const api = {
   health: () => request<{ status: string; version: string }>('/api/health'),
   system: () => request<SystemStatus>('/api/system'),
   fetchModels: () => request<void>('/api/system/models', { method: 'POST' }),
+  ytdlpStatus: () => request<YtdlpStatus>('/api/system/ytdlp'),
+  ytdlpCheck: () => request<YtdlpStatus>('/api/system/ytdlp/check', { method: 'POST' }),
 
   listSources: () => request<Source[]>('/api/sources'),
 
@@ -295,6 +382,22 @@ export const api = {
     request<Source>('/api/sources/youtube', {
       method: 'POST',
       body: JSON.stringify({ url, cookies_from_browser: cookiesFromBrowser || null }),
+    }),
+
+  /** A Drive / Dropbox / OneDrive / direct file link; poll progress with the id. */
+  ingestLink: (url: string, progressId?: string) =>
+    request<Source>('/api/sources/link', {
+      method: 'POST',
+      body: JSON.stringify({ url, progress_id: progressId ?? null }),
+    }),
+
+  linkProgress: (progressId: string) =>
+    request<LinkProgress>(`/api/sources/link/progress/${encodeURIComponent(progressId)}`),
+
+  driveFolder: (url: string) =>
+    request<DriveFolderListing>('/api/sources/drive-folder', {
+      method: 'POST',
+      body: JSON.stringify({ url }),
     }),
 
   uploadSource: (file: File) => {
