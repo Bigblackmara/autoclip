@@ -33,9 +33,12 @@ from .gate import gate
 from .pipeline import (
     _model_cache,
     _provider_complete,
+    caption_look,
     clip_destination,
+    localise_clip,
     post_text,
     render_and_qa,
+    wants_flash_forward,
 )
 from .settings import GtaSettings, work_root
 from .settings import load as load_settings
@@ -326,11 +329,22 @@ class GtaLiveWatch:
                 reject_reason=c.reject_reason,
                 caption=c.caption,
                 hashtags=c.hashtags,
+                hook_options=c.hook_options,
+                teaser_start_s=c.teaser_start_s,
+                teaser_end_s=c.teaser_end_s,
             )
             store.create_clip(clip)
             if clip.status != "rendering":
                 continue
-            self._render(clip, window.path, window.start_s, words, settings, triggered_at)
+            self._render(
+                clip,
+                window.path,
+                window.start_s,
+                words,
+                settings,
+                triggered_at,
+                language=piece.language,
+            )
             self._last_clip_end = max(self._last_clip_end, c.end_s)
 
     def _render(
@@ -341,26 +355,42 @@ class GtaLiveWatch:
         words: list[Word],
         settings: GtaSettings,
         triggered_at: float,
+        *,
+        language: str = "",
     ) -> None:
         stream = store.get_stream(self.stream_id)
         if stream is None:
             return
         destination = clip_destination(clip, stream)
         clip_words = [w for w in words if w.end > clip.start_s and w.start < clip.end_s]
+        work_dir = self._root / clip.id / "render"
         try:
+            display_words, hook_title = localise_clip(
+                clip, clip_words, settings, language=language, cache_dir=work_dir / "language"
+            )
+            flash = wants_flash_forward(clip, settings)
+            teaser = (
+                (clip.teaser_start_s, clip.teaser_end_s)
+                if flash and clip.teaser_start_s is not None and clip.teaser_end_s is not None
+                else None
+            )
             qa_dict = render_and_qa(
                 section=source,
                 section_start_s=source_start_s,
                 start_s=clip.start_s,
                 end_s=clip.end_s,
                 words=clip_words,
-                hook_title=clip.hook_title,
+                hook_title=hook_title,
                 destination=destination,
-                work_dir=self._root / clip.id / "render",
+                work_dir=work_dir,
                 settings=settings,
                 cancelled=lambda: False,
                 live=True,
                 reaction_text=str(clip.verdict.get("reaction_text") or ""),
+                display_words=display_words,
+                teaser=teaser,
+                flash_forward=flash,
+                style_key=caption_look(clip, settings),
             )
         except Exception as exc:
             store.update_clip(clip.id, status="failed", error=str(exc)[:2000])

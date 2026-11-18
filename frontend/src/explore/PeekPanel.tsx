@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { formatDuration } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 import { gtaApi } from '../gta/api'
+import { SendToGtaButton } from '../gta/SendToGtaButton'
 import { HeatChart } from './HeatChart'
 import { compactNumber, exploreApi, timeAgo, type ExploreItem, type PeekResult } from './api'
 
@@ -156,6 +157,7 @@ export function PeekPanel({ target, onClose }: { target: PeekTarget; onClose: ()
                   {queued === 'busy' ? 'Queueing…' : queued === 'done' ? 'Queued' : 'Send to GTA Mode'}
                 </button>
               )}
+              {isYouTube && <SendToGtaButton url={url} disabled={isLive} />}
               <a href={url} target="_blank" rel="noreferrer" className="btn btn-ghost">
                 Open on {isYouTube ? 'YouTube' : 'Twitch'} ↗
               </a>

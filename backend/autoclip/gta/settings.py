@@ -63,6 +63,10 @@ CAPTION_STYLES = {
 #: Older saves stored the preset name of the GTA look.
 CAPTION_ALIASES = {"bold_pop": "gta", "": "gta"}
 MOTION_LEVELS = ("off", "subtle", "dynamic")
+#: The order "Make variant" steps through caption looks.
+VARIANT_LOOKS = ("gta", "pop", "neon", "comic", "minimal")
+#: Caption language modes (see :mod:`autoclip.pipeline.language`).
+CAPTION_LANGUAGES = ("as_spoken", "roman", "english")
 
 #: YouTube video categories offered for GTA clips (id -> name).
 YOUTUBE_CATEGORIES = {"20": "Gaming", "22": "People & Blogs", "23": "Comedy", "24": "Entertainment"}
@@ -210,6 +214,17 @@ class GtaSettings(BaseModel):
     punch_in_s: float = 1.5
     reaction_text: bool = True
 
+    #: Flash-forward: open on the clip's peak reaction (the line the judge
+    #: quoted, else the Hype Curve / loudest beat), punched in, for
+    #: ``flash_forward_s`` seconds, then play the clip from its start. Each
+    #: clip can override it. Off by default.
+    flash_forward: bool = False
+    flash_forward_s: float = 2.0
+    #: Language/script of the burned captions, the hook title and the post
+    #: text: ``as_spoken`` (Hindi as Hinglish, everything else as spoken),
+    #: ``roman`` (Latin letters) or ``english`` (translated by the AI).
+    caption_language: str = "as_spoken"
+
     #: Your logo (PNG, ideally with transparency) burned into a top corner.
     #: When set it wins over the text logo below.
     watermark_path: str = ""
@@ -261,6 +276,20 @@ class GtaSettings(BaseModel):
     def _motion(cls, value: str) -> str:
         if value not in MOTION_LEVELS:
             raise ValueError(f"motion must be one of {', '.join(MOTION_LEVELS)}")
+        return value
+
+    @field_validator("flash_forward_s")
+    @classmethod
+    def _tease_length(cls, value: float) -> float:
+        if not 1.0 <= value <= 3.0:
+            raise ValueError("flash_forward_s must be between 1 and 3 seconds")
+        return value
+
+    @field_validator("caption_language")
+    @classmethod
+    def _language(cls, value: str) -> str:
+        if value not in CAPTION_LANGUAGES:
+            raise ValueError(f"caption_language must be one of {', '.join(CAPTION_LANGUAGES)}")
         return value
 
     @field_validator("watermark_corner")

@@ -1,4 +1,8 @@
-"""GTA Mode API: the stream queue, clips, GTA Live, settings, feedback loop."""
+"""GTA Mode API: the stream queue, clips, GTA Live, settings, feedback loop.
+
+Clip edits (hook choice, flash-forward, variants, picks on the Hype Curve)
+live in :mod:`autoclip.gta.edits`; the routes here only translate them.
+"""
 
 from __future__ import annotations
 
@@ -134,6 +138,17 @@ def _clip_out(
         "qa": clip.qa,
         "error": clip.error,
         "uploads": {p: _upload_out(u) for p, u in (uploads or {}).items()},
+        # v8: hook options, flash-forward, variants, caption language.
+        "hook_options": clip.hook_options,
+        "flash_forward": clip.flash_forward,
+        "teaser_start_s": clip.teaser_start_s,
+        "teaser_end_s": clip.teaser_end_s,
+        "variant_of": clip.variant_of,
+        "family_id": clip.family_id,
+        "motion_seed": clip.motion_seed,
+        "caption_style": clip.caption_style,
+        "localised": clip.localised,
+        "source": str(clip.verdict.get("source") or ("variant" if clip.variant_of else "judge")),
     }
 
 
@@ -305,6 +320,87 @@ async def list_clips(status: str | None = None) -> list[dict[str, Any]]:
     clips = await asyncio.to_thread(store.list_clips, None, statuses=statuses, limit=100_000)
     uploads = await asyncio.to_thread(_uploads_by_clip)
     return [_clip_out(c, uploads.get(c.id)) for c in clips]
+
+
+class ClipEditIn(BaseModel):
+    """Change a finished clip and render it again (fields left out are kept)."""
+
+    hook_title: str | None = Field(default=None, max_length=120)
+    #: True/False override the GTA setting; null follows it again.
+    flash_forward: bool | None = None
+
+
+class PickRangeIn(BaseModel):
+    start_s: float = Field(ge=0)
+    end_s: float = Field(gt=0)
+
+
+class PicksIn(BaseModel):
+    ranges: list[PickRangeIn] = Field(min_length=1, max_length=50)
+
+
+def _edit_error(exc: Exception) -> HTTPException:
+    from ..gta.edits import EditError
+
+    status = exc.status if isinstance(exc, EditError) else 400
+    return HTTPException(status_code=status, detail=str(exc))
+
+
+@router.patch("/clips/{clip_id}")
+async def edit_clip(clip_id: str, payload: ClipEditIn) -> dict[str, Any]:
+    """Pick another hook title and/or flip the flash-forward; then re-render."""
+    from ..gta import edits
+
+    sent = payload.model_fields_set
+    if not sent & {"hook_title", "flash_forward"}:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+    try:
+        clip = await asyncio.to_thread(
+            edits.rerender,
+            clip_id,
+            hook_title=payload.hook_title if "hook_title" in sent else None,
+            flash_forward=payload.flash_forward,
+            flash_forward_set="flash_forward" in sent,
+        )
+    except edits.EditError as exc:
+        raise _edit_error(exc) from exc
+    return _clip_out(clip)
+
+
+@router.post("/clips/{clip_id}/variant", status_code=201)
+async def make_variant(clip_id: str) -> dict[str, Any]:
+    """A new clip of the same moment: next caption look, next hook, new motion."""
+    from ..gta import edits
+
+    try:
+        clip = await asyncio.to_thread(edits.make_variant, clip_id)
+    except edits.EditError as exc:
+        raise _edit_error(exc) from exc
+    return _clip_out(clip)
+
+
+@router.get("/streams/{stream_id}/hype")
+async def stream_hype(stream_id: str) -> dict[str, Any]:
+    """The stream's Hype Curve (pooled), its markers and its clips, for picking."""
+    from ..gta import edits
+
+    try:
+        return await asyncio.to_thread(edits.hype_graph, stream_id)
+    except edits.EditError as exc:
+        raise _edit_error(exc) from exc
+
+
+@router.post("/streams/{stream_id}/picks", status_code=201)
+async def make_picks(stream_id: str, payload: PicksIn) -> dict[str, Any]:
+    """Clips from ranges dragged on the Hype Curve (no reject phase)."""
+    from ..gta import edits
+
+    ranges = [(r.start_s, r.end_s) for r in payload.ranges]
+    try:
+        clips = await asyncio.to_thread(edits.make_picks, stream_id, ranges)
+    except edits.EditError as exc:
+        raise _edit_error(exc) from exc
+    return {"clips": [_clip_out(c) for c in clips]}
 
 
 @router.get("/clips/{clip_id}/video")

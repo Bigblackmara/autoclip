@@ -8,11 +8,15 @@ word-by-word captions in the bottom band, so neither ever covers the stream.
 
 Loudness is normalised in two passes (measure, then apply linearly) so every
 clip lands on the Shorts/TikTok target instead of near it.
+
+Flash-forward (optional): the clip opens on its 1-3 s peak reaction, punched
+in, then plays from its start; the hook title follows the tease.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import subprocess
 from collections.abc import Callable, Sequence
@@ -212,12 +216,14 @@ def write_subtitles(
     reaction_text: str = "",
     reaction_window: tuple[float, float] | None = None,
     keywords: Sequence[str] = (),
+    title_start_s: float = 0.0,
 ) -> Path:
     """Captions (bottom band, 1-2 lines), hook title and reaction (top band).
 
     ``style_key`` is a GTA look (``gta``, ``pop``, ``neon``, ``comic``,
     ``minimal``) or a caption preset key; ``keywords`` are drawn bigger in
-    the look's emphasis colour.
+    the look's emphasis colour. ``title_start_s`` delays the hook title (it
+    follows a flash-forward instead of covering it).
     """
     import pysubs2
 
@@ -232,6 +238,10 @@ def write_subtitles(
     )
     title = hook_title.strip()
     text_y = TEXT_CENTRE_Y
+    title_start = max(0.0, min(title_start_s, duration_s))
+    title_end = min(title_start + title_s, duration_s)
+    if title and title_end - title_start < 0.3:
+        title = ""
     if title:
         hook = pysubs2.SSAStyle()
         hook.fontname = "Anton"
@@ -248,8 +258,8 @@ def write_subtitles(
         subs.styles[TITLE_STYLE] = hook
         text = captions.escape_ass_text(title.upper())
         event = pysubs2.SSAEvent(
-            start=0,
-            end=round(min(title_s, duration_s) * 1000),
+            start=round(title_start * 1000),
+            end=round(title_end * 1000),
             style=TITLE_STYLE,
             text=f"{{\\an5\\pos({OUT_W // 2},{text_y})\\fad(80,220)}}{text}",
         )
@@ -258,7 +268,7 @@ def write_subtitles(
     if reaction and reaction_window is not None:
         a, b = reaction_window
         # Never on top of the hook title: start once the title is gone.
-        a = max(a, min(title_s, duration_s) if title else 0.0)
+        a = max(a, title_end if title else 0.0)
         b = min(max(b, a + 1.2), duration_s)
         if b - a >= 0.6:
             style = pysubs2.SSAStyle()
@@ -299,7 +309,7 @@ def build_filtergraph(
     subtitle_name: str | None,
     fonts_name: str,
     audio_filter: str,
-    punch_in: tuple[float, float, float] | None = None,
+    punch_in: tuple[float, float, float] | Sequence[tuple[float, float, float]] | None = None,
     watermark: Watermark | None = None,
     motion: FrameMotion | None = None,
 ) -> str:
@@ -307,7 +317,8 @@ def build_filtergraph(
 
     Keep times are section-local; the input is seeked to ``seek_s`` so the
     trims are relative to that. ``punch_in`` = (start, end, zoom) in OUTPUT
-    seconds: the stream frame cuts to a centred zoom for that span.
+    seconds: the stream frame cuts to a centred zoom for that span; a list of
+    them (same zoom) punches in on several spans (flash-forward + key beat).
     ``watermark`` reads the logo from input 1. ``motion`` zooms the stream
     frame layer only (zoompan in place of its fit-scale): the blurred
     background, the punch-in copy and the text are never moved by it.
@@ -321,7 +332,8 @@ def build_filtergraph(
         parts.append(f"[0:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS[a{i}]")
         labels.append(f"[v{i}][a{i}]")
     parts.append(f"{''.join(labels)}concat=n={len(keeps)}:v=1:a=1[vcat][acat]")
-    if punch_in:
+    spans = _punch_spans(punch_in)
+    if spans:
         parts.append(f"[vcat]fps={FPS},split=3[bgsrc][fgsrc][zsrc]")
     else:
         parts.append(f"[vcat]fps={FPS},split=2[bgsrc][fgsrc]")
@@ -336,8 +348,9 @@ def build_filtergraph(
             f"[fgsrc]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos[fg]"
         )
     current = "[bg][fg]overlay=(W-w)/2:(H-h)/2"
-    if punch_in:
-        a, b, zoom = punch_in
+    if spans:
+        zoom = spans[0][2]
+        enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b, _ in spans)
         # Same aspect as the frame, centred: the zoomed copy fits to the same
         # size and replaces the frame for the punch-in span.
         parts.append(
@@ -345,7 +358,7 @@ def build_filtergraph(
             f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos[fz]"
         )
         parts.append(f"{current}[base]")
-        current = f"[base][fz]overlay=(W-w)/2:(H-h)/2:enable='between(t,{a:.3f},{b:.3f})'"
+        current = f"[base][fz]overlay=(W-w)/2:(H-h)/2:enable='{enable}'"
     if watermark is not None:
         parts.append(f"{current}[pre]")
         parts.append(
@@ -358,6 +371,16 @@ def build_filtergraph(
     parts.append(f"{current},setsar=1,format=yuv420p,{tail}[vout]")
     parts.append(f"[acat]{audio_filter}[aout]")
     return ";".join(parts)
+
+
+def _punch_spans(
+    punch_in: tuple[float, float, float] | Sequence[tuple[float, float, float]] | None,
+) -> list[tuple[float, float, float]]:
+    if not punch_in:
+        return []
+    if isinstance(punch_in[0], int | float):
+        return [punch_in]  # type: ignore[list-item]
+    return [span for span in punch_in if span]  # type: ignore[misc]
 
 
 def _audio_only_graph(keeps: list[Keep], *, seek_s: float, tail: str) -> str:
@@ -419,6 +442,11 @@ class Extras:
     keywords: bool = False
     #: Step zooms on the stream frame: "off" | "subtle" | "dynamic".
     motion: str = "off"
+    #: Open on the peak reaction (punched in), then play from the start.
+    flash_forward: bool = False
+    flash_forward_s: float = 2.0
+    #: A variant's own zoom pattern (0 = the original's).
+    motion_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -455,17 +483,26 @@ def fitted_size(width: int | None, height: int | None) -> tuple[int, int] | None
 
 
 def plan_motion(
-    words: list[Word], duration: float, keeps: list[Keep], level: str, section: Path
+    words: list[Word],
+    duration: float,
+    keeps: list[Keep],
+    level: str,
+    section: Path,
+    seed: int = 0,
+    *,
+    intro_allowed: bool = True,
 ) -> FrameMotion | None:
     """Step zooms through the clip (edit.plan_zooms), or None for no motion.
 
     Jump cuts from the dead-air cut always get a zoom change, which hides
-    the jump. Never fatal: an unreadable section just renders without motion.
+    the jump. ``seed`` > 0 is a variant: its own spacing/depth, and a steady
+    slight punch-in even with motion off, so a re-post is not frame-identical.
+    Never fatal: an unreadable section just renders without motion.
     """
-    if level not in {"subtle", "dynamic"} or duration < 4.0:
+    if (level not in {"subtle", "dynamic"} and seed <= 0) or duration < 4.0:
         return None
-    zooms = shared_edit.plan_zooms(words, duration, level, shared_edit.cut_times(keeps))
-    intro = level == "dynamic"
+    zooms = shared_edit.plan_zooms(words, duration, level, shared_edit.cut_times(keeps), seed)
+    intro = level == "dynamic" and intro_allowed
     if not intro and not any(z.z != 1.0 for z in zooms):
         return None
     try:
@@ -524,6 +561,111 @@ def punch_in_window(moment: float | None, duration: float, length: float) -> tup
     return a, b
 
 
+#: Flash-forward limits (shared with the normal pipeline's cold open).
+TEASER_MIN_S = shared_edit.TEASER_MIN_S
+TEASER_MAX_S = shared_edit.TEASER_MAX_S
+TEASER_LEAD_S = shared_edit.TEASER_LEAD_S
+TEASER_MIN_CLIP_S = shared_edit.TEASER_MIN_CLIP_S
+#: A Hype Curve peak is refined to the loudest beat this close to it (s).
+PEAK_SEARCH_S = 3.0
+
+
+def loudest_time(
+    levels: np.ndarray | None,
+    levels_start: float,
+    a: float,
+    b: float,
+    *,
+    hop_s: float = 0.05,
+    window_s: float = 1.0,
+) -> float | None:
+    """Middle of the loudest ``window_s`` between ``a`` and ``b`` (levels' clock)."""
+    if levels is None or len(levels) == 0:
+        return None
+    width = max(1, int(round(window_s / hop_s)))
+    i = max(0, int(math.ceil((a - levels_start) / hop_s)))
+    j = min(len(levels) - width, int((b - levels_start - window_s) / hop_s))
+    if j < i:
+        return None
+    power = np.power(10.0, levels.astype(np.float64) / 10.0)
+    sums = np.convolve(power, np.ones(width), mode="valid")
+    best = i + int(np.argmax(sums[i : j + 1]))
+    return levels_start + best * hop_s + window_s / 2
+
+
+def plan_teaser(
+    words: Sequence[Word],
+    clip_start: float,
+    clip_end: float,
+    *,
+    levels: np.ndarray | None,
+    length_s: float,
+    span: tuple[float, float] | None = None,
+    peak_s: float | None = None,
+    fps: int = FPS,
+) -> Keep | None:
+    """The flash-forward span (same clock as ``words``/``clip_start``), or None.
+
+    Priority: the judge's quoted peak line (``span``), else ``peak_s`` (the
+    Hype Curve's peak) refined to the loudest beat near it, else the loudest
+    beat of the clip. The tease is ``length_s`` long (a quoted line keeps its
+    own length within 0.8-3.6 s), never cuts a word in half where it can
+    avoid it, starts at least 2.5 s into the clip (else the opening would
+    play twice in a row) and stays inside the clip.
+    """
+    if clip_end - clip_start < TEASER_MIN_CLIP_S:
+        return None
+    earliest = clip_start + TEASER_LEAD_S
+    if span is not None and span[1] > span[0]:
+        a, b = span
+        if b - a > TEASER_MAX_S:
+            a = b - TEASER_MAX_S  # a long line still ends on its payoff
+        if b - a < TEASER_MIN_S:
+            b = a + TEASER_MIN_S
+    else:
+        centre = None
+        if peak_s is not None and clip_start <= peak_s <= clip_end:
+            centre = loudest_time(
+                levels,
+                clip_start,
+                max(earliest, peak_s - PEAK_SEARCH_S),
+                min(clip_end, peak_s + PEAK_SEARCH_S),
+            )
+            centre = centre if centre is not None else peak_s
+        if centre is None:
+            centre = loudest_time(levels, clip_start, earliest, clip_end)
+        if centre is None:
+            return None
+        a = centre - 0.4 * length_s
+        b = a + length_s
+        # Whole words: start on the word in progress, end once it is said.
+        for w in words:
+            if w.start < a < w.end and b - w.start <= TEASER_MAX_S:
+                a = w.start
+            if w.start < b < w.end:
+                b = w.end if w.end - a <= TEASER_MAX_S else w.start
+    if a < earliest:
+        b += earliest - a
+        a = earliest
+    b = min(b, clip_end)
+    if not TEASER_MIN_S <= b - a <= TEASER_MAX_S + 1e-6:
+        return None
+    # On the frame grid, widened (never narrowed) so no word is clipped.
+    a = math.floor(a * fps + 1e-6) / fps
+    b = min(math.ceil(b * fps - 1e-6) / fps, clip_end)
+    return Keep(round(a, 4), round(b, 4)) if b - a >= TEASER_MIN_S - 1e-6 else None
+
+
+def _shift(words: list[Word], by: float) -> list[Word]:
+    if not by:
+        return words
+    return [Word(w.text, w.start + by, w.end + by, w.speaker) for w in words]
+
+
+def _local(words: Sequence[Word], offset: float) -> list[Word]:
+    return [Word(w.text, w.start - offset, w.end - offset, w.speaker) for w in words]
+
+
 @dataclass
 class RenderJob:
     section: Path
@@ -538,6 +680,13 @@ class RenderJob:
     destination: Path
     work_dir: Path
     extras: Extras = field(default_factory=Extras)
+    #: Caption words when they differ from the spoken ones (a caption
+    #: language), STREAM time. Dead air is always planned on ``words``.
+    display_words: list[Word] | None = None
+    #: The judge's quoted peak line (stream time), for the flash-forward.
+    teaser: tuple[float, float] | None = None
+    #: The Hype Curve's peak inside the clip (stream time), if known.
+    peak_s: float | None = None
 
 
 @dataclass
@@ -549,6 +698,8 @@ class RenderResult:
     #: Own-value edits actually applied (QA needs at least one).
     edits: list[str] = field(default_factory=list)
     watermarked: bool = False
+    #: Output length of the flash-forward (0 = none).
+    teaser_s: float = 0.0
 
 
 def render(
@@ -572,15 +723,12 @@ def render(
     local_end = job.end_s - job.section_offset_s - trim_end_s
     if local_end - local_start < 1.0:
         raise RenderError("The clip is too short to render.")
-    local_words = [
-        Word(
-            text=w.text,
-            start=w.start - job.section_offset_s,
-            end=w.end - job.section_offset_s,
-            speaker=w.speaker,
-        )
-        for w in job.words
-    ]
+    local_words = _local(job.words, job.section_offset_s)
+    shown_words = (
+        _local(job.display_words, job.section_offset_s)
+        if job.display_words is not None
+        else local_words
+    )
 
     try:
         levels = section_levels(job.section, local_start, local_end)
@@ -596,24 +744,68 @@ def render(
         keep_s=dead_air_keep_s,
     )
     keeps = [Keep(k.start + local_start, k.end + local_start) for k in keeps]
-    keeps = _cap_duration(keeps, max_duration_s)
-    duration = output_duration(keeps)
+    extras = job.extras
 
-    seek = max(0.0, keeps[0].start - 1.0)
-    span = keeps[-1].end - seek + 0.5
+    teaser: Keep | None = None
+    if extras.flash_forward:
+        teaser = plan_teaser(
+            local_words,
+            local_start,
+            local_end,
+            levels=levels,
+            length_s=extras.flash_forward_s,
+            span=_local_span(job.teaser, job.section_offset_s),
+            peak_s=None if job.peak_s is None else job.peak_s - job.section_offset_s,
+        )
+        if teaser is None:
+            log.info("No flash-forward for %s: no peak past the opening.", job.destination.name)
+    lead = teaser.duration if teaser is not None else 0.0
+    # The tease counts towards the length cap: the whole clip stays under it.
+    keeps = _cap_duration(keeps, max_duration_s - lead)
+    main_duration = output_duration(keeps)
+    played = [teaser, *keeps] if teaser is not None else keeps
+    duration = output_duration(played)
+
+    seek = max(0.0, min(k.start for k in played) - 1.0)
+    span = max(k.end for k in played) - seek + 0.5
 
     workspace = job.work_dir
     workspace.mkdir(parents=True, exist_ok=True)
-    out_words = remap_words(local_words, keeps)
-    extras = job.extras
+    main_words = remap_words(local_words, keeps)
+    out_words = _shift(remap_words(shown_words, keeps), lead)
+    if teaser is not None:
+        out_words = remap_words(shown_words, [teaser]) + out_words
     moment = key_moment(levels, keeps, local_start)
-    window = punch_in_window(moment, duration, extras.punch_in_s)
+    window = punch_in_window(moment, main_duration, extras.punch_in_s)
+    window = (window[0] + lead, window[1] + lead)
     edits: list[str] = []
-    punch = None
-    if extras.punch_in and duration > 3.0:
-        punch = (window[0], window[1], extras.punch_in_zoom)
+    punches: list[tuple[float, float, float]] = []
+    if teaser is not None:
+        # The tease is punched in, so it reads as a flash-forward, not a stutter.
+        punches.append((0.0, round(lead, 3), extras.punch_in_zoom))
+        edits.append("flash-forward")
+    if extras.punch_in and main_duration > 3.0:
+        punches.append((window[0], window[1], extras.punch_in_zoom))
         edits.append("punch-in")
-    motion = plan_motion(out_words, duration, keeps, extras.motion, job.section)
+    motion = plan_motion(
+        main_words,
+        main_duration,
+        keeps,
+        extras.motion,
+        job.section,
+        extras.motion_seed,
+        intro_allowed=teaser is None,
+    )
+    if motion is not None and teaser is not None:
+        shifted = [shared_edit.Zoom(round(z.t + lead, 3), z.z) for z in motion.zooms]
+        if not shifted or shifted[0].t > lead + 1e-6:
+            shifted.insert(0, shared_edit.Zoom(round(lead, 3), 1.0))
+        motion = FrameMotion(
+            zooms=(shared_edit.Zoom(0.0, 1.0), *shifted),
+            intro=False,
+            width=motion.width,
+            height=motion.height,
+        )
     if motion is not None:
         edits.append("motion")
     keywords = gta_captions.clip_keywords(out_words, extras.keywords)
@@ -629,6 +821,7 @@ def render(
         reaction_text=extras.reaction_text,
         reaction_window=window,
         keywords=keywords,
+        title_start_s=lead,
     )
     if extras.reaction_text.strip() and f"{REACTION_STYLE}," in ass.read_text(encoding="utf-8"):
         edits.append("reaction text")
@@ -639,18 +832,18 @@ def render(
     render_cwd, subtitle_name, fonts_name = ffmpeg.relative_filter_workspace(ass, captions.FONT_DIR)
 
     measured = measure_loudnorm(
-        job.section, keeps, seek_s=seek, span_s=span, target=loudness_lufs, true_peak=true_peak_db
+        job.section, played, seek_s=seek, span_s=span, target=loudness_lufs, true_peak=true_peak_db
     )
     audio_filter = (
         loudnorm_filter(measured, target=loudness_lufs, true_peak=true_peak_db) + ",aresample=48000"
     )
     graph = build_filtergraph(
-        keeps,
+        played,
         seek_s=seek,
         subtitle_name=subtitle_name,
         fonts_name=fonts_name,
         audio_filter=audio_filter,
-        punch_in=punch,
+        punch_in=punches or None,
         watermark=watermark,
         motion=motion,
     )
@@ -725,15 +918,22 @@ def render(
             log.warning("Could not remove %s.", partial)
         raise
 
-    cut = (local_end - local_start) - duration
+    cut = (local_end - local_start) - main_duration
     return RenderResult(
         path=job.destination,
         duration_s=duration,
-        keeps=keeps,
+        keeps=played,
         cut_s=cut,
         edits=edits,
         watermarked=watermark is not None,
+        teaser_s=round(lead, 3),
     )
+
+
+def _local_span(span: tuple[float, float] | None, offset: float) -> tuple[float, float] | None:
+    if span is None:
+        return None
+    return span[0] - offset, span[1] - offset
 
 
 def _cap_duration(keeps: list[Keep], max_s: float) -> list[Keep]:

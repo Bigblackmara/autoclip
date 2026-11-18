@@ -367,6 +367,43 @@ def _migration_v7(conn: sqlite3.Connection) -> None:
     _run_in_transaction(conn, statements)
 
 
+#: Columns added to ``gta_clips`` by v8, with their DDL.
+_V8_GTA_CLIP_COLUMNS: tuple[tuple[str, str], ...] = (
+    # The judge's three on-screen hook title options (JSON list, best first).
+    ("hook_options", "TEXT NOT NULL DEFAULT '[]'"),
+    # The peak reaction the judge quoted, in stream seconds (flash-forward).
+    ("teaser_start_s", "REAL"),
+    ("teaser_end_s", "REAL"),
+    # Per-clip flash-forward: NULL follows the GTA setting, 0/1 override it.
+    ("flash_forward", "INTEGER"),
+    # Variants: the original clip this one re-cuts, its zoom-pattern seed and
+    # its caption look ('' = the GTA setting).
+    ("variant_of", "TEXT"),
+    ("motion_seed", "INTEGER NOT NULL DEFAULT 0"),
+    ("caption_style", "TEXT NOT NULL DEFAULT ''"),
+    # Hook + post text as rendered in the caption language (JSON object).
+    ("localised", "TEXT NOT NULL DEFAULT '{}'"),
+)
+
+
+def _migration_v8(conn: sqlite3.Connection) -> None:
+    """GTA Mode: hook options, flash-forward, variants and caption language.
+
+    Additive and idempotent: each column is only added when missing. A
+    database without a ``gta_clips`` table (hand-built in tests) is left alone.
+    """
+    columns = _column_names(conn, "gta_clips")
+    if not columns:
+        _run_in_transaction(conn, [])
+        return
+    statements = [
+        f"ALTER TABLE gta_clips ADD COLUMN {name} {ddl}"
+        for name, ddl in _V8_GTA_CLIP_COLUMNS
+        if name not in columns
+    ]
+    _run_in_transaction(conn, statements)
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
@@ -377,6 +414,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v5,
     _migration_v6,
     _migration_v7,
+    _migration_v8,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

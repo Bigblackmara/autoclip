@@ -128,10 +128,29 @@ class GtaClip:
     error: str | None = None
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
+    #: v8: the judge's hook title options (best first; ``hook_title`` is the
+    #: one rendered), the quoted peak reaction for a flash-forward (stream
+    #: seconds), the per-clip flash-forward override (None = GTA setting),
+    #: variants (``variant_of`` = the original's id), the caption look of
+    #: this clip ('' = GTA setting) and the hook/post text as rendered in the
+    #: caption language.
+    hook_options: list[str] = field(default_factory=list)
+    teaser_start_s: float | None = None
+    teaser_end_s: float | None = None
+    flash_forward: bool | None = None
+    variant_of: str | None = None
+    motion_seed: int = 0
+    caption_style: str = ""
+    localised: dict[str, Any] = field(default_factory=dict)
 
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
+
+    @property
+    def family_id(self) -> str:
+        """The original clip of a variant family (a clip is its own original)."""
+        return self.variant_of or self.id
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> GtaClip:
@@ -158,7 +177,19 @@ class GtaClip:
             error=row["error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            hook_options=_loads(row["hook_options"], []),
+            teaser_start_s=row["teaser_start_s"],
+            teaser_end_s=row["teaser_end_s"],
+            flash_forward=_tri(row["flash_forward"]),
+            variant_of=row["variant_of"],
+            motion_seed=int(row["motion_seed"] or 0),
+            caption_style=row["caption_style"] or "",
+            localised=_loads(row["localised"], {}),
         )
+
+
+def _tri(value: Any) -> bool | None:
+    return None if value is None else bool(value)
 
 
 def _loads(text: str | None, default: Any) -> Any:
@@ -208,14 +239,24 @@ _CLIP_COLUMNS = frozenset(
         "path",
         "qa",
         "error",
+        "hook_options",
+        "teaser_start_s",
+        "teaser_end_s",
+        "flash_forward",
+        "variant_of",
+        "motion_seed",
+        "caption_style",
+        "localised",
     }
 )
-_JSON_COLUMNS = frozenset({"signals", "verdict", "hashtags", "qa"})
+_JSON_COLUMNS = frozenset({"signals", "verdict", "hashtags", "qa", "hook_options", "localised"})
 
 
 def _encode(column: str, value: Any) -> Any:
     if column in _JSON_COLUMNS:
         return json.dumps(value)
+    if column == "flash_forward" and value is not None:
+        return int(bool(value))
     return value
 
 
@@ -316,8 +357,12 @@ def create_clip(clip: GtaClip) -> GtaClip:
                                    hook_title, hook_quote, moment_type, summary,
                                    hype_score, score, rank, verdict, reject_reason,
                                    caption, hashtags, path, qa, error,
-                                   created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   created_at, updated_at,
+                                   hook_options, teaser_start_s, teaser_end_s,
+                                   flash_forward, variant_of, motion_seed,
+                                   caption_style, localised)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clip.id,
@@ -342,6 +387,14 @@ def create_clip(clip: GtaClip) -> GtaClip:
                 clip.error,
                 clip.created_at,
                 clip.updated_at,
+                json.dumps(clip.hook_options),
+                clip.teaser_start_s,
+                clip.teaser_end_s,
+                _encode("flash_forward", clip.flash_forward),
+                clip.variant_of,
+                clip.motion_seed,
+                clip.caption_style,
+                json.dumps(clip.localised),
             ),
         )
     return clip

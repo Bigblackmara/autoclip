@@ -33,6 +33,7 @@ import {
   slotLabel,
   type UploadStatus,
 } from '../gta/api'
+import { ClipTools, GtaEditSettings, GtaPickPanel } from '../gta/extras'
 import { YouTubeTab } from '../gta/YouTubeTab'
 import {
   Badge,
@@ -239,7 +240,7 @@ function QueueTab({
   const byStream = useMemo(() => groupByStream(clips), [clips])
 
   return (
-    <div className="grid gap-6">
+    <div className="grid grid-cols-1 gap-6">
       <AddStreams onAdded={onChange} />
       <Card padding="none" title="Queue" description="Streams being analysed, newest first.">
         <div className="border-t border-line">
@@ -354,7 +355,7 @@ function StreamRow({
   return (
     <li className="px-5 py-4 sm:px-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
+        <div className="min-w-[14rem] flex-1">
           <p className="truncate text-sm font-semibold text-fg">
             {stream.channel || stream.platform || 'Stream'}
             <span className="ml-2 font-normal text-fg-muted">{stream.title || stream.url}</span>
@@ -411,6 +412,7 @@ function StreamRow({
         </div>
       </div>
       {open && <Moments clips={clips} />}
+      <GtaPickPanel stream={stream} />
     </li>
   )
 }
@@ -445,7 +447,7 @@ function ClipWall({ title, clips, streams }: { title: string; clips: GtaClip[]; 
   const names = useMemo(() => new Map(streams.map((s) => [s.id, s.channel || s.platform])), [streams])
   const sorted = [...clips].sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99))
   return (
-    <section>
+    <section className="min-w-0">
       <SectionTitle
         title={`${title} (${clips.length})`}
         description="Each clip comes with a copy-ready caption and hashtags."
@@ -453,7 +455,7 @@ function ClipWall({ title, clips, streams }: { title: string; clips: GtaClip[]; 
       {clips.length === 0 ? (
         <EmptyState compact icon={FilmIcon} title="No finished clips yet" description="Finished clips appear here with their caption and hashtags." />
       ) : (
-        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
           {sorted.map((c) => (
             <ClipCard key={c.id} clip={c} streamer={names.get(c.stream_id) ?? ''} />
           ))}
@@ -637,6 +639,7 @@ function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
       <Button variant="primary" icon={copied ? CheckIcon : CopyIcon} onClick={copy}>
         {copied ? 'Copied' : 'Copy caption + hashtags'}
       </Button>
+      <ClipTools clip={clip} />
       {clip.status === 'ready' && <PostingRow clip={clip} />}
       <p className="truncate px-1 font-mono text-[10px] text-fg-subtle" title={clip.path}>
         {clip.path}
@@ -671,7 +674,7 @@ function LiveTab({
     })
 
   return (
-    <div className="grid gap-6">
+    <div className="grid grid-cols-1 gap-6">
       <Card
         title="Clip a live stream"
         icon={RadioIcon}
@@ -708,7 +711,7 @@ function LiveTab({
                 const rejected = mine.filter((c) => c.status === 'rejected').length
                 return (
                   <li key={s.id} className="flex flex-wrap items-start justify-between gap-4 px-5 py-4 sm:px-6">
-                    <div className="min-w-0 flex-1">
+                    <div className="min-w-[14rem] flex-1">
                       <p className="truncate text-sm font-semibold text-fg">{s.channel || s.url}</p>
                       <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-fg-muted">
                         <Badge tone={running ? 'success' : 'neutral'} dot pulse={running}>
@@ -822,7 +825,7 @@ function WorkingTab() {
   }
 
   return (
-    <div className="grid gap-6">
+    <div className="grid grid-cols-1 gap-6">
       <Card
         title="See what's working"
         icon={TrendingIcon}
@@ -971,7 +974,7 @@ function SettingsTab() {
         <span className="whitespace-pre-line">{message.text}</span>
       </Callout>
     ) : (
-      <div className="grid gap-6">
+      <div className="grid grid-cols-1 gap-6">
         <SkeletonCard lines={4} />
         <SkeletonCard lines={3} />
       </div>
@@ -1046,6 +1049,7 @@ function SettingsTab() {
 
   return (
     <div className="grid max-w-4xl gap-6">
+      <GtaEditSettings />
       {NUMBER_GROUPS.map((group) => (
         <Card key={group.title} title={group.title} description={group.description}>
           <div className="grid gap-5 sm:grid-cols-2">
