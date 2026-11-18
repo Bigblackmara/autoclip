@@ -4,7 +4,19 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from . import clips, explore, gta, housekeeping, jobs, live, picks, settings, sources
+from . import (
+    autopilot,
+    clips,
+    explore,
+    gta,
+    housekeeping,
+    jobs,
+    live,
+    picks,
+    publishing,
+    settings,
+    sources,
+)
 
 __all__ = ["api_router"]
 
@@ -18,3 +30,5 @@ api_router.include_router(live.router)
 api_router.include_router(gta.router)
 api_router.include_router(housekeeping.router)
 api_router.include_router(explore.router)
+api_router.include_router(publishing.router)
+api_router.include_router(autopilot.router)

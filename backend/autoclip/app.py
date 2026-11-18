@@ -81,6 +81,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # YouTube posting schedule; idle until switched on in GTA settings.
         await gta_poster.start()
 
+    # Normal-mode posting (Post on a clip, Schedule page) and Autopilot.
+    from .autopilot.engine import engine as autopilot_engine
+    from .publishing.poster import poster as normal_poster
+
+    if worker_enabled:
+        await normal_poster.start()
+        await autopilot_engine.start()
+
     # Housekeeping: hourly retention sweep (idle at retention_days = 0) and
     # the daily yt-dlp update check (idle while ytdlp_auto_update is off).
     from . import retention, ytdlp_update
@@ -97,6 +105,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if worker_enabled:
             await ytdlp_update.service.stop()
             await retention.service.stop()
+            await autopilot_engine.stop()
+            await normal_poster.stop()
             await gta_poster.stop()
             await asyncio.to_thread(gta_live.shutdown)
             await gta_queue.stop()

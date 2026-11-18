@@ -33,6 +33,7 @@ export function App() {
             <TopLink to="/explore">Explore</TopLink>
             <TopLink to="/live">Live Watch</TopLink>
             <TopLink to="/gta">GTA Mode</TopLink>
+            <TopLink to="/schedule">Schedule</TopLink>
             <TopLink to="/settings">Settings</TopLink>
           </nav>
 
