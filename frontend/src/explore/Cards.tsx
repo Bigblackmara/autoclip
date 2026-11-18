@@ -1,4 +1,5 @@
 import { formatDuration } from '../api'
+import { SendToGtaButton } from '../gta/SendToGtaButton'
 import { compactNumber, timeAgo, type ExploreItem } from './api'
 
 /** Result grid: wide cards for videos / VODs / clips, tall ones for Shorts. */
@@ -121,6 +122,7 @@ function VideoCard({
             {m}
           </span>
         ))}
+        {item.source === 'youtube' && item.kind === 'video' && !item.is_live && <SendToGtaButton url={item.url} compact />}
       </div>
     </div>
   )

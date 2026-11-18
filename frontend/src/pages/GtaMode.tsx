@@ -33,6 +33,7 @@ import {
   slotLabel,
   type UploadStatus,
 } from '../gta/api'
+import { ClipTools, GtaEditSettings, GtaPickPanel } from '../gta/extras'
 import { YouTubeTab } from '../gta/YouTubeTab'
 
 type Tab = 'queue' | 'live' | 'youtube' | 'working' | 'settings'
@@ -402,6 +403,7 @@ function StreamRow({
         </div>
       </div>
       {open && <Moments clips={clips} />}
+      <GtaPickPanel stream={stream} />
     </li>
   )
 }
@@ -628,6 +630,7 @@ function ClipCard({ clip, streamer }: { clip: GtaClip; streamer: string }) {
       <button className="btn btn-primary" onClick={copy}>
         {copied ? 'Copied ✓' : 'Copy caption + hashtags'}
       </button>
+      <ClipTools clip={clip} />
       {clip.status === 'ready' && <PostingRow clip={clip} />}
       <p className="truncate font-mono text-[10px] text-ink-500" title={clip.path}>
         {clip.path}
@@ -982,6 +985,7 @@ function SettingsTab() {
 
   return (
     <div className="mt-8 grid max-w-3xl gap-10">
+      <GtaEditSettings />
       <section className="grid gap-5 sm:grid-cols-2">
         {NUMBER_FIELDS.map((f) => field(f.key, f.label, { type: 'number', step: f.step }))}
         {field('listen_interval_s', 'GTA Live: listen every (s)', { type: 'number', step: 1 })}

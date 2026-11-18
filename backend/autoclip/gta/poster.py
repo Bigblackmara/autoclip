@@ -24,6 +24,9 @@ Safety rules, because a duplicate or a wrong post is worse than a missed one:
 * Instagram: Zernio has no idempotency key, so a create whose answer was
   unclear is ``checking``: AutoClip keeps asking Zernio (by post id or the
   uploaded media URL) and never sends it again on its own.
+* Variants (a re-cut of the same moment) are separate clips, so one can go
+  out on another day or platform, but never two of one family (an original
+  and its variants) on the same platform on the same local day.
 """
 
 from __future__ import annotations
@@ -162,17 +165,55 @@ def is_postable(clip: GtaClip) -> bool:
     )
 
 
+def slot_day(key: str, tz: Any = None) -> str:
+    """The local calendar day (``YYYY-MM-DD``) of a stored slot key."""
+    return parse_slot_key(key).astimezone(tz).date().isoformat()
+
+
+def families_by_day(platform: str, tz: Any = None) -> dict[str, set[str]]:
+    """Local day -> families (original clip ids) already holding a slot there.
+
+    Covers every slot-holding row of ``platform`` (uploading, scheduled,
+    posted, interrupted, checking), so a variant never lands on the same
+    day as its original or a sibling, whichever went first.
+    """
+    rows = store.list_uploads(
+        statuses=store.SLOT_HOLDING_STATUSES, platform=platform, limit=100_000
+    )
+    family: dict[str, str] = {}
+    out: dict[str, set[str]] = {}
+    for row in rows:
+        if not row.slot_at:
+            continue
+        if row.clip_id not in family:
+            clip = store.get_clip(row.clip_id)
+            family[row.clip_id] = clip.family_id if clip is not None else row.clip_id
+        out.setdefault(slot_day(row.slot_at, tz), set()).add(family[row.clip_id])
+    return out
+
+
 def eligible_clips(
-    now: datetime, platform: str = "youtube"
+    now: datetime,
+    platform: str = "youtube",
+    *,
+    slot: datetime | None = None,
+    tz: Any = None,
 ) -> list[tuple[GtaClip, GtaUpload | None]]:
     """Postable clips for ``platform`` in posting order (best first), each
-    with its failed row there, if any. A clip skipped anywhere is skipped."""
+    with its failed row there, if any. A clip skipped anywhere is skipped.
+
+    With ``slot``, a clip whose family (original + variants) already has a
+    post on ``platform`` that local day is left out.
+    """
     rows = store.list_uploads(limit=100_000)
     skipped = {u.clip_id for u in rows if u.status == "skipped"}
     uploads = {u.clip_id: u for u in rows if u.platform == platform}
+    busy: set[str] = set()
+    if slot is not None:
+        busy = families_by_day(platform, tz).get(slot.astimezone(tz).date().isoformat(), set())
     out: list[tuple[GtaClip, GtaUpload | None]] = []
     for clip in store.list_clips(statuses=frozenset({"ready"}), limit=100_000):
-        if clip.id in skipped or not is_postable(clip):
+        if clip.id in skipped or not is_postable(clip) or clip.family_id in busy:
             continue
         row = uploads.get(clip.id)
         if row is not None and not (
@@ -192,7 +233,9 @@ def _clean_text(text: str) -> str:
 
 
 def post_title(clip: GtaClip) -> str:
-    title = _clean_text(clip.hook_title)
+    from .pipeline import shown_hook
+
+    title = _clean_text(shown_hook(clip))
     if not title and clip.caption:
         title = _clean_text(clip.caption.splitlines()[0])
     return (title or "Stream clip")[:100]
@@ -229,7 +272,10 @@ def build_meta(clip: GtaClip, settings: GtaSettings, publish_at: datetime) -> Up
 
 
 def instagram_caption(clip: GtaClip) -> str:
-    """Caption + hashtags for a Reel, within Instagram's 2200 chars / 30 tags."""
+    """Caption + hashtags for a Reel, within Instagram's 2200 chars / 30 tags.
+
+    The caption is the one written in the caption language at render time.
+    """
     tags: list[str] = []
     seen: set[str] = set()
     for tag in clip.hashtags:
@@ -242,7 +288,7 @@ def instagram_caption(clip: GtaClip) -> str:
             break
     tail = " ".join(tags)
     room = IG_CAPTION_MAX - (len(tail) + 2 if tail else 0)
-    text = clip.caption.strip()
+    text = (str(clip.localised.get("caption") or "") or clip.caption).strip()
     if len(text) > room:
         text = text[: max(0, room - 1)].rstrip() + "…"
     return f"{text}\n\n{tail}".strip()[:IG_CAPTION_MAX]
@@ -421,6 +467,8 @@ class GtaPoster:
                 if u.slot_at
             }
             queue = [clip for clip, _ in eligible_clips(now, platform)]
+            # Families already out that day, plus the ones this plan places.
+            days = families_by_day(platform, self._tz)
             for moment in moments:
                 key = slot_key(moment)
                 row = holders.get(key)
@@ -430,12 +478,17 @@ class GtaPoster:
                     "status": "open",
                     "clip_id": None,
                 }
+                day = days.setdefault(moment.astimezone(self._tz).date().isoformat(), set())
                 if row is not None:
                     entry.update(status=row.status, clip_id=row.clip_id, upload_id=row.id)
                 elif (moment - now).total_seconds() < MIN_LEAD_S:
                     entry["status"] = "missed"
-                elif queue:
-                    entry.update(status="planned", clip_id=queue.pop(0).id)
+                else:
+                    pick = next((c for c in queue if c.family_id not in day), None)
+                    if pick is not None:
+                        queue.remove(pick)
+                        day.add(pick.family_id)
+                        entry.update(status="planned", clip_id=pick.id)
                 out.append(entry)
         order = {p: i for i, p in enumerate(store.PLATFORMS)}
         out.sort(key=lambda e: (e["slot_at"], order[e["platform"]]))
@@ -499,7 +552,9 @@ class GtaPoster:
             )
             return "waiting"
 
-        candidates = await asyncio.to_thread(eligible_clips, now, platform)
+        candidates = await asyncio.to_thread(
+            lambda: eligible_clips(now, platform, slot=slot, tz=self._tz)
+        )
         if not candidates:
             state.message = (
                 f"No finished clip that passed QA is waiting for the {slot_key(slot)} slot."

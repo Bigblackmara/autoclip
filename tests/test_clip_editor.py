@@ -73,7 +73,7 @@ def _clip_columns() -> set[str]:
 
 class TestMigration:
     def test_fresh_database_has_the_editor_columns(self, initialised_db) -> None:
-        assert db.SCHEMA_VERSION == 7
+        assert db.SCHEMA_VERSION == 8
         assert _clip_columns() >= V7_COLUMNS
 
     def test_a_v6_database_upgrades_and_keeps_its_clips(self, autoclip_home: Path) -> None:
@@ -97,8 +97,8 @@ class TestMigration:
                 "VALUES ('c', 'j', 1, 30, 'Old clip', 'now')"
             )
 
-        assert db.init() == 7
-        assert db.init() == 7  # idempotent
+        assert db.init() == db.SCHEMA_VERSION
+        assert db.init() == db.SCHEMA_VERSION  # idempotent
         clip = store.get_clip("c")
         assert clip is not None and clip.title == "Old clip"
         assert clip.hook_options == [] and clip.hashtags == [] and clip.flash_forward is None

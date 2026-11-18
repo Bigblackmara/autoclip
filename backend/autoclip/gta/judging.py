@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,7 +33,12 @@ from .settings import GtaBias, GtaSettings
 log = logging.getLogger(__name__)
 
 CHUNK_PROMPT = "gta_chunk_v1"
-FINAL_PROMPT = "gta_final_v1"
+#: v2 asks for three hook title options and the peak line (flash-forward);
+#: v1 (one hook title) is kept so older answers and tests still parse.
+FINAL_PROMPT = "gta_final_v2"
+FINAL_PROMPT_V1 = "gta_final_v1"
+#: Hook title options kept per clip.
+HOOK_OPTIONS = 3
 
 MOMENT_TYPES = ("first_reaction", "crazy_discovery", "freakout", "funny_fail", "hot_take", "other")
 
@@ -228,15 +233,39 @@ class _Verdict(BaseModel):
     payoff: _Answer = _Answer()
     score: int = 0
     hook_title: str = ""
+    #: v2: three options, best first (``hook_title`` is v1's single title).
+    hook_titles: list[str] = []
+    #: v2: the verbatim peak line for the flash-forward.
+    peak_quote: str = ""
     reaction_text: str = ""
     caption: str = ""
     hashtags: list[str] = []
     moment_type: str = "other"
 
-    @field_validator("id", "hook_title", "reaction_text", "caption", "moment_type", mode="before")
+    @field_validator(
+        "id", "hook_title", "peak_quote", "reaction_text", "caption", "moment_type", mode="before"
+    )
     @classmethod
     def _text(cls, value: Any) -> str:
         return "" if value is None else str(value)
+
+    @field_validator("hook_titles", mode="before")
+    @classmethod
+    def _titles(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        return [str(v) for v in value if v is not None]
+
+    def options(self) -> list[str]:
+        """Up to :data:`HOOK_OPTIONS` distinct cleaned hook titles, best first."""
+        out: list[str] = []
+        for raw in [*self.hook_titles, self.hook_title]:
+            title = _clean_title(raw)
+            if title and title.lower() not in {o.lower() for o in out}:
+                out.append(title)
+        return out[:HOOK_OPTIONS]
 
     @field_validator("score", mode="before")
     @classmethod
@@ -319,6 +348,10 @@ class Candidate:
     hook_title: str = ""
     caption: str = ""
     hashtags: list[str] = field(default_factory=list)
+    hook_options: list[str] = field(default_factory=list)
+    #: The judge's peak line in stream seconds (flash-forward), if found.
+    teaser_start_s: float | None = None
+    teaser_end_s: float | None = None
 
     def reject(self, reason: str) -> None:
         self.status = "rejected"
@@ -565,9 +598,74 @@ async def final_round(
     cancelled: Callable[[], bool] | None = None,
 ) -> list[Candidate]:
     """Phase 2 on every Phase 1 survivor; returns ALL candidates, updated."""
+    alive = [c for c in candidates if c.status == "candidate"]
+    async for c, verdict in _verdicts(
+        transcript,
+        alive,
+        complete=complete,
+        settings=settings,
+        streamer=streamer,
+        title=title,
+        curve=curve,
+        cancelled=cancelled,
+    ):
+        if verdict is None:
+            c.reject("Phase 2: the judge gave no verdict")
+            continue
+        _apply_verdict(c, verdict, settings, streamer)
+        _anchor_peak(transcript, c, verdict.peak_quote)
+
+    _head_to_head(candidates, settings)
+    return candidates
+
+
+async def describe(
+    transcript: Transcript,
+    candidates: list[Candidate],
+    *,
+    complete: Complete,
+    settings: GtaSettings,
+    streamer: str,
+    title: str,
+    curve: HypeCurve | None = None,
+) -> list[Candidate]:
+    """The final prompt's texts for moments the USER picked (no reject phase).
+
+    Hook title options, reaction text, caption, hashtags and the peak line
+    are applied; the three yes/no tests are recorded but never reject a
+    pick. A candidate the judge skipped keeps its texts unchanged.
+    """
+    async for c, verdict in _verdicts(
+        transcript,
+        candidates,
+        complete=complete,
+        settings=settings,
+        streamer=streamer,
+        title=title,
+        curve=curve,
+    ):
+        if verdict is None:
+            continue
+        _apply_texts(c, verdict)
+        c.score = verdict.score
+        _anchor_peak(transcript, c, verdict.peak_quote)
+    return candidates
+
+
+async def _verdicts(
+    transcript: Transcript,
+    alive: list[Candidate],
+    *,
+    complete: Complete,
+    settings: GtaSettings,
+    streamer: str,
+    title: str,
+    curve: HypeCurve | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> AsyncIterator[tuple[Candidate, _Verdict | None]]:
+    """Ask the final prompt about ``alive`` in batches; yields (candidate, verdict|None)."""
     system = load_prompt(FINAL_PROMPT)
     config = DetectionConfig(prompt_version=FINAL_PROMPT, temperature=0.2)
-    alive = [c for c in candidates if c.status == "candidate"]
     note = _bias_note(settings.bias)
 
     for offset in range(0, len(alive), FINAL_BATCH):
@@ -599,18 +697,13 @@ async def final_round(
         assert isinstance(parsed, _FinalOut)
         by_id = {v.id.strip(): v for v in parsed.verdicts}
         for c in batch:
-            verdict = by_id.get(c.id)
-            if verdict is None:
-                c.reject("Phase 2: the judge gave no verdict")
-                continue
-            _apply_verdict(c, verdict, settings, streamer)
-
-    _head_to_head(candidates, settings)
-    return candidates
+            yield c, by_id.get(c.id)
 
 
-def _apply_verdict(c: Candidate, verdict: _Verdict, settings: GtaSettings, streamer: str) -> None:
+def _apply_texts(c: Candidate, verdict: _Verdict) -> None:
+    """Everything the judge WROTE for a clip (not its yes/no tests)."""
     c.verdict = {
+        **c.verdict,
         "scroll_stop": verdict.scroll_stop.model_dump(),
         "context_free": verdict.context_free.model_dump(),
         "payoff": verdict.payoff.model_dump(),
@@ -618,12 +711,68 @@ def _apply_verdict(c: Candidate, verdict: _Verdict, settings: GtaSettings, strea
         # at the clip's key moment.
         "reaction_text": _clean_title(verdict.reaction_text, max_words=6),
     }
-    c.score = verdict.score
-    c.hook_title = _clean_title(verdict.hook_title)
-    c.caption = verdict.caption.strip()
-    c.hashtags = clean_hashtags(verdict.hashtags)
+    options = verdict.options()
+    c.hook_options = options
+    c.hook_title = options[0] if options else ""
+    caption = verdict.caption.strip()
+    if caption:
+        c.caption = caption
+    tags = clean_hashtags(verdict.hashtags)
+    if tags:
+        c.hashtags = tags
     if verdict.moment_type:
         c.moment_type = _clean_type(verdict.moment_type)
+
+
+def _anchor_peak(transcript: Transcript, c: Candidate, quote: str) -> None:
+    """Where the judge's verbatim peak line is spoken inside the clip (stream s)."""
+    span = find_quote(transcript, c.start_s, c.end_s, quote)
+    if span is not None:
+        c.teaser_start_s, c.teaser_end_s = span
+
+
+#: A peak line must start at least this far into its clip: the opening line
+#: itself would just play twice in a row.
+PEAK_LEAD_S = 2.5
+
+
+def find_quote(
+    transcript: Transcript, start_s: float, end_s: float, quote: str
+) -> tuple[float, float] | None:
+    """(start, end) stream seconds of ``quote`` spoken within ``start_s``-``end_s``.
+
+    Matching is on letters and digits only (ASR tokenisation and punctuation
+    differ from the model's copy). The LAST match past the opening wins:
+    payoffs land late, and a line repeated at the very start is no tease.
+    """
+    key = _letters(quote)
+    if len(key) < 3 or not transcript.words:
+        return None
+    first, stop = transcript.indices_in_range(start_s, end_s)  # half-open
+    words = transcript.words
+    best: tuple[float, float] | None = None
+    for index in range(first, stop):
+        if words[index].start < start_s + PEAK_LEAD_S:
+            continue
+        text = ""
+        for j in range(index, stop):
+            text += _letters(words[j].text)
+            if not text or not (key.startswith(text) or text.startswith(key)):
+                break
+            if len(text) >= len(key):
+                best = (words[index].start, words[j].end)
+                break
+    return best
+
+
+def _letters(text: str) -> str:
+    # Letters and digits of any script (Hindi stays matchable).
+    return re.sub(r"[\W_]", "", text.lower())
+
+
+def _apply_verdict(c: Candidate, verdict: _Verdict, settings: GtaSettings, streamer: str) -> None:
+    _apply_texts(c, verdict)
+    c.score = verdict.score
     failed = [
         label
         for label, answer in (

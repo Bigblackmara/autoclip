@@ -665,6 +665,9 @@ def _store_candidates(stream: GtaStream, candidates: list[judging.Candidate]) ->
                 reject_reason=c.reject_reason,
                 caption=c.caption,
                 hashtags=c.hashtags,
+                hook_options=c.hook_options,
+                teaser_start_s=c.teaser_start_s,
+                teaser_end_s=c.teaser_end_s,
             )
         )
 
@@ -679,6 +682,15 @@ def section_bounds(clip: GtaClip, settings: GtaSettings) -> tuple[float, float]:
     return start, clip.end_s + settings.section_pad_s
 
 
+def section_stem(clip: GtaClip) -> str:
+    """File stem of the clip's video section: a variant shares its original's.
+
+    A variant covers exactly the same moment, so it never downloads the
+    section again.
+    """
+    return clip.family_id
+
+
 def stage_section(
     clip: GtaClip, stream: GtaStream, report: Reporter, settings: GtaSettings
 ) -> None:
@@ -687,7 +699,7 @@ def stage_section(
     fetch.download_section(
         stream.url,
         ws.sections_dir,
-        clip.id,
+        section_stem(clip),
         start,
         end,
         fmt=settings.clip_format,
@@ -700,7 +712,7 @@ def aligned_section_start(
 ) -> float:
     """Stream time at which the downloaded section really starts (cached)."""
     ws = Workspace(stream.id)
-    cache = ws.sections_dir / f"{clip.id}.offset.json"
+    cache = ws.sections_dir / f"{section_stem(clip)}.offset.json"
     cached = _load_json(cache)
     if isinstance(cached, dict) and cached.get("section") == section.name:
         return float(cached["start_s"])
@@ -731,9 +743,91 @@ def clip_destination(clip: GtaClip, stream: GtaStream) -> Path:
 
 
 def post_text(clip: GtaClip) -> str:
-    """Caption + hashtags exactly as they should be pasted."""
+    """Caption + hashtags exactly as they should be pasted.
+
+    The caption is the one written in the caption language at the last
+    render, when there is one.
+    """
     tags = " ".join(clip.hashtags)
-    return f"{clip.caption}\n\n{tags}".strip()
+    caption = str(clip.localised.get("caption") or "") or clip.caption
+    return f"{caption}\n\n{tags}".strip()
+
+
+def shown_hook(clip: GtaClip) -> str:
+    """The hook title as rendered (caption language), else the stored one."""
+    return str(clip.localised.get("hook") or "") or clip.hook_title
+
+
+def wants_flash_forward(clip: GtaClip, settings: GtaSettings) -> bool:
+    """The clip's own choice, else the GTA setting."""
+    return settings.flash_forward if clip.flash_forward is None else clip.flash_forward
+
+
+def caption_look(clip: GtaClip, settings: GtaSettings) -> str:
+    """The clip's caption look (a variant's own), else the GTA setting."""
+    from .settings import CAPTION_STYLES
+
+    return clip.caption_style if clip.caption_style in CAPTION_STYLES else settings.caption_style
+
+
+def localise_clip(
+    clip: GtaClip,
+    words: list[Word],
+    settings: GtaSettings,
+    *,
+    language: str,
+    cache_dir: Path,
+) -> tuple[list[Word] | None, str]:
+    """Captions, hook and post text in the GTA caption language.
+
+    Returns (caption words to show, or None when they are the spoken ones;
+    the hook title to render) and saves the hook + post caption on the clip
+    (``localised``) so the .txt file and the poster use the same language.
+    Never raises: a failed model pass leaves the rule-based text.
+    """
+    from ..pipeline import language as caption_language
+
+    mode = settings.caption_language
+    result = caption_language.for_export(
+        words,
+        mode,
+        language=language,
+        hook=clip.hook_title,
+        description=clip.caption,
+        settings=load_settings(),
+        cache_dir=cache_dir,
+    )
+    localised = {
+        "mode": mode,
+        "hook": result.hook if result.hook != clip.hook_title else "",
+        "caption": result.description if result.description != clip.caption else "",
+        "applied": result.applied,
+    }
+    localised = {k: v for k, v in localised.items() if v}
+    clip.localised = localised
+    store.update_clip(clip.id, localised=localised)
+    changed = any(a.text != b.text for a, b in zip(words, result.words, strict=False)) or len(
+        words
+    ) != len(result.words)
+    return (result.words if changed else None), result.hook or clip.hook_title
+
+
+def hype_peak(ws: Workspace, start_s: float, end_s: float) -> float | None:
+    """Stream second the Hype Curve peaks inside a clip (None without a curve)."""
+    if not ws.hype.exists():
+        return None
+    try:
+        curve = hype.HypeCurve.load(ws.hype)
+    except (OSError, ValueError, KeyError):
+        return None
+    a = max(0, int(start_s))
+    b = min(curve.seconds, int(np.ceil(end_s)))
+    if b <= a:
+        return None
+    window = curve.score[a:b]
+    if not len(window) or float(window.max()) <= 0:
+        return None
+    return a + int(np.argmax(window)) + 0.5
 
 
 def logo_path(settings: GtaSettings) -> Path | None:
@@ -753,8 +847,18 @@ def logo_path(settings: GtaSettings) -> Path | None:
         return None
 
 
-def render_extras(settings: GtaSettings, reaction_text: str) -> render.Extras:
-    """Own-value edits + watermark for one clip, from GTA settings."""
+def render_extras(
+    settings: GtaSettings,
+    reaction_text: str,
+    *,
+    flash_forward: bool | None = None,
+    motion_seed: int = 0,
+) -> render.Extras:
+    """Own-value edits + watermark for one clip, from GTA settings.
+
+    ``flash_forward`` None follows the setting; ``motion_seed`` is a
+    variant's own zoom pattern.
+    """
     watermark = None
     logo_file = logo_path(settings)
     if logo_file is not None:
@@ -772,6 +876,9 @@ def render_extras(settings: GtaSettings, reaction_text: str) -> render.Extras:
         watermark=watermark,
         keywords=settings.keyword_highlight,
         motion=settings.motion,
+        flash_forward=settings.flash_forward if flash_forward is None else flash_forward,
+        flash_forward_s=settings.flash_forward_s,
+        motion_seed=motion_seed,
     )
 
 
@@ -789,12 +896,19 @@ def render_and_qa(
     cancelled: Callable[[], bool],
     live: bool = False,
     reaction_text: str = "",
+    display_words: list[Word] | None = None,
+    teaser: tuple[float, float] | None = None,
+    peak_s: float | None = None,
+    flash_forward: bool | None = None,
+    motion_seed: int = 0,
+    style_key: str | None = None,
 ) -> dict:
     """Render one clip and run QA, fixing what can be fixed automatically.
 
     Loudness off target -> gain-corrected remux; black frames at the very
     start/end -> re-render trimmed (up to twice). Runs under the heavy gate.
-    Returns the QA dict (``passed`` plus every check).
+    Returns the QA dict (``passed`` plus every check). The flash-forward
+    counts towards the length cap, so the length check (< 60 s) still holds.
     """
     export_settings = load_settings().export
     trim_start = trim_end = 0.0
@@ -813,9 +927,17 @@ def render_and_qa(
                     hook_title=hook_title,
                     destination=destination,
                     work_dir=work_dir,
-                    extras=render_extras(settings, reaction_text),
+                    extras=render_extras(
+                        settings,
+                        reaction_text,
+                        flash_forward=flash_forward,
+                        motion_seed=motion_seed,
+                    ),
+                    display_words=display_words,
+                    teaser=teaser,
+                    peak_s=peak_s,
                 ),
-                style_key=settings.caption_style,
+                style_key=style_key or settings.caption_style,
                 title_s=settings.hook_title_s,
                 dead_air_min_s=settings.dead_air_min_s,
                 dead_air_keep_s=settings.dead_air_keep_s,
@@ -863,6 +985,7 @@ def render_and_qa(
                 **qa_report.to_dict(),
                 "cut_dead_air_s": round(result.cut_s, 2),
                 "duration_s": round(result.duration_s, 2),
+                "flash_forward_s": result.teaser_s,
                 "attempts": attempt + 1,
             }
             if qa_report.black_frames.ok or not qa_report.black_spans:
@@ -880,7 +1003,7 @@ def render_and_qa(
 def stage_render(clip: GtaClip, stream: GtaStream, report: Reporter, settings: GtaSettings) -> dict:
     """Render + QA one approved clip of a VOD. Returns {"path", "qa"}."""
     ws = Workspace(stream.id)
-    section = fetch._find_media(ws.sections_dir, clip.id)  # noqa: SLF001
+    section = fetch._find_media(ws.sections_dir, section_stem(clip))  # noqa: SLF001
     if section is None:
         raise StageError("The clip's video section is missing; it will be downloaded again.")
     section_start = aligned_section_start(clip, stream, section, settings)
@@ -888,18 +1011,37 @@ def stage_render(clip: GtaClip, stream: GtaStream, report: Reporter, settings: G
     first, last = transcript.indices_in_range(clip.start_s, clip.end_s)
     words = transcript.slice(first, last) if last >= first else []
     destination = Path(clip.path) if clip.path else clip_destination(clip, stream)
+    display_words, hook_title = localise_clip(
+        clip,
+        words,
+        settings,
+        language=transcript.language,
+        cache_dir=ws.render_dir(clip.id) / "language",
+    )
+    flash = wants_flash_forward(clip, settings)
+    teaser = (
+        (clip.teaser_start_s, clip.teaser_end_s)
+        if clip.teaser_start_s is not None and clip.teaser_end_s is not None
+        else None
+    )
     qa_dict = render_and_qa(
         section=section,
         section_start_s=section_start,
         start_s=clip.start_s,
         end_s=clip.end_s,
         words=words,
-        hook_title=clip.hook_title,
+        hook_title=hook_title,
         destination=destination,
         work_dir=ws.render_dir(clip.id),
         settings=settings,
         cancelled=report.cancelled,
         reaction_text=str(clip.verdict.get("reaction_text") or ""),
+        display_words=display_words,
+        teaser=teaser if flash else None,
+        peak_s=hype_peak(ws, clip.start_s, clip.end_s) if flash and teaser is None else None,
+        flash_forward=flash,
+        motion_seed=clip.motion_seed,
+        style_key=caption_look(clip, settings),
     )
     # The caption file next to the clip: one copy-paste away from posting.
     destination.with_suffix(".txt").write_text(post_text(clip) + "\n", encoding="utf-8")
