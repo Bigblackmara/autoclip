@@ -233,6 +233,44 @@ def get_transcript(job_id: str) -> Transcript | None:
 # --------------------------------------------------------------------------
 
 
+_CLIP_COLUMNS = (
+    "id, job_id, rank, start_s, end_s, start_word, end_word, title, hook, score, reason, "
+    "status, user_trimmed, created_at, hook_options, hook_text, description, hashtags, "
+    "teaser_start_s, teaser_end_s, flash_forward, variant_of, motion_seed"
+)
+_CLIP_INSERT = (
+    f"INSERT INTO clips ({_CLIP_COLUMNS}) VALUES ({', '.join('?' * len(_CLIP_COLUMNS.split(',')))})"
+)
+
+
+def _clip_values(c: Clip) -> tuple[Any, ...]:
+    return (
+        c.id,
+        c.job_id,
+        c.rank,
+        c.start_s,
+        c.end_s,
+        c.start_word,
+        c.end_word,
+        c.title,
+        c.hook,
+        c.score,
+        c.reason,
+        c.status,
+        int(c.user_trimmed),
+        c.created_at,
+        json.dumps(c.hook_options),
+        c.hook_text,
+        c.description,
+        json.dumps(c.hashtags),
+        c.teaser_start_s,
+        c.teaser_end_s,
+        None if c.flash_forward is None else int(c.flash_forward),
+        c.variant_of,
+        c.motion_seed,
+    )
+
+
 def replace_clips(job_id: str, clips: list[Clip]) -> list[Clip]:
     """Swap in a fresh set of clips for a job.
 
@@ -241,33 +279,15 @@ def replace_clips(job_id: str, clips: list[Clip]) -> list[Clip]:
     """
     with connection() as conn:
         conn.execute("DELETE FROM clips WHERE job_id = ?", (job_id,))
-        conn.executemany(
-            """
-            INSERT INTO clips (id, job_id, rank, start_s, end_s, start_word, end_word,
-                               title, hook, score, reason, status, user_trimmed, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    c.id,
-                    c.job_id,
-                    c.rank,
-                    c.start_s,
-                    c.end_s,
-                    c.start_word,
-                    c.end_word,
-                    c.title,
-                    c.hook,
-                    c.score,
-                    c.reason,
-                    c.status,
-                    int(c.user_trimmed),
-                    c.created_at,
-                )
-                for c in clips
-            ],
-        )
+        conn.executemany(_CLIP_INSERT, [_clip_values(c) for c in clips])
     return clips
+
+
+def create_clip(clip: Clip) -> Clip:
+    """Insert one clip (a variant) next to a job's existing ones."""
+    with connection() as conn:
+        conn.execute(_CLIP_INSERT, _clip_values(clip))
+    return clip
 
 
 def get_clip(clip_id: str) -> Clip | None:
@@ -279,7 +299,7 @@ def get_clip(clip_id: str) -> Clip | None:
 def list_clips(job_id: str) -> list[Clip]:
     with connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM clips WHERE job_id = ? ORDER BY rank ASC", (job_id,)
+            "SELECT * FROM clips WHERE job_id = ? ORDER BY rank ASC, rowid ASC", (job_id,)
         ).fetchall()
     return [Clip.from_row(r) for r in rows]
 
@@ -294,7 +314,12 @@ def update_clip(
     title: str | None = None,
     status: ClipStatus | None = None,
     user_trimmed: bool | None = None,
+    hook_text: str | None = None,
+    description: str | None = None,
+    hashtags: list[str] | None = None,
+    flash_forward: bool | None | _Unset = UNSET,
 ) -> None:
+    """Patch the supplied fields. ``flash_forward=None`` clears the per-clip override."""
     fields: dict[str, Any] = {}
     for name, value in (
         ("start_s", start_s),
@@ -303,11 +328,17 @@ def update_clip(
         ("end_word", end_word),
         ("title", title),
         ("status", status),
+        ("hook_text", hook_text),
+        ("description", description),
     ):
         if value is not None:
             fields[name] = value
     if user_trimmed is not None:
         fields["user_trimmed"] = int(user_trimmed)
+    if hashtags is not None:
+        fields["hashtags"] = json.dumps(hashtags)
+    if not isinstance(flash_forward, _Unset):
+        fields["flash_forward"] = None if flash_forward is None else int(flash_forward)
 
     if not fields:
         return

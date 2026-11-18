@@ -157,6 +157,24 @@ class ClipOut(BaseModel):
     #: The job's layout setting — what a re-export uses unless told otherwise.
     layout: str = "auto"
     exports: list[ExportOut] = Field(default_factory=list)
+    #: Up to three headline options from detection, best first.
+    hook_options: list[str] = Field(default_factory=list)
+    #: The chosen headline as stored ("" = none chosen yet).
+    hook_text: str = ""
+    #: What the render shows: the chosen hook, else the first option, else the title.
+    headline: str = ""
+    description: str = ""
+    hashtags: list[str] = Field(default_factory=list)
+    #: The clip's own flash-forward toggle; None follows ``flash_forward_default``.
+    flash_forward: bool | None = None
+    flash_forward_default: bool = False
+    #: Whether the model flagged a tease line (otherwise one is picked by rule).
+    has_teaser: bool = False
+    teaser_start_s: float | None = None
+    teaser_end_s: float | None = None
+    #: The original this clip is a variant of, and its zoom-pattern seed.
+    variant_of: str | None = None
+    motion_seed: int = 0
 
     @classmethod
     def of(
@@ -168,6 +186,7 @@ class ClipOut(BaseModel):
         default_style: str = "bold_pop",
         default_ratio: str = "9:16",
         default_layout: str = "auto",
+        flash_forward_default: bool = False,
     ) -> ClipOut:
         return cls(
             id=clip.id,
@@ -188,14 +207,44 @@ class ClipOut(BaseModel):
             ratio=edit.ratio if edit else default_ratio,
             layout=default_layout,
             exports=[ExportOut.of(e) for e in (exports or [])],
+            hook_options=clip.hook_options,
+            hook_text=clip.hook_text,
+            headline=clip.headline,
+            description=clip.description,
+            hashtags=clip.hashtags,
+            flash_forward=clip.flash_forward,
+            flash_forward_default=flash_forward_default,
+            has_teaser=clip.teaser is not None,
+            teaser_start_s=clip.teaser_start_s,
+            teaser_end_s=clip.teaser_end_s,
+            variant_of=clip.variant_of,
+            motion_seed=clip.motion_seed,
         )
 
 
 class ClipPatchIn(BaseModel):
+    """A clip edit. Omitted fields are left alone.
+
+    ``flash_forward`` is tri-state: true/false override the export setting,
+    an explicit null goes back to following it.
+    """
+
     start_s: float | None = Field(default=None, ge=0)
     end_s: float | None = Field(default=None, gt=0)
     title: str | None = None
     status: Literal["candidate", "kept", "discarded", "exported"] | None = None
+    hook_text: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2200)
+    hashtags: list[str] | None = Field(default=None, max_length=30)
+    flash_forward: bool | None = None
+
+
+class VariantIn(BaseModel):
+    """Options for "Make variant". The variant is rendered unless ``export`` is false."""
+
+    export: bool = True
+    ratio: Literal["9:16", "1:1", "16:9"] | None = None
+    layout: Literal["auto", "split", "crop"] | None = None
 
 
 class CaptionPatchIn(BaseModel):

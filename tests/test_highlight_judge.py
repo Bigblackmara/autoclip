@@ -371,7 +371,7 @@ def _settings() -> Settings:
 
 
 class TestRunnerWiring:
-    def test_defaults_use_the_curve_the_v2_prompt_and_the_judge(
+    def test_defaults_use_the_curve_the_v3_prompt_and_the_judge(
         self, youtube_source: Source, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The runner's comment fetcher goes through signals.fetch_comments.
@@ -387,8 +387,10 @@ class TestRunnerWiring:
         runner, clips = _run_highlights(youtube_source, _settings(), provider, monkeypatch)
 
         assert fetched == ["https://youtu.be/abc"]
-        assert provider.prompts("highlight_v2"), "audience data switches to the v2 prompt"
-        assert "The reveal" in provider.prompts("highlight_v2")[0][1]
+        (system, user), *_ = provider.prompts("highlight_v3")
+        assert "## Audience signals" in system and "`hooks`" in system
+        assert "## Language" in system, "the caption-language rule is appended"
+        assert "The reveal" in user, "audience data adds hints to the prompt"
         assert provider.prompts("highlight_judge_v1")
         assert "B" not in [c.title for c in clips]
         assert clips[0].title == "E"  # the most replayed stretch
@@ -407,7 +409,9 @@ class TestRunnerWiring:
         runner, clips = _run_highlights(youtube_source, settings, provider, monkeypatch)
 
         assert [c.title for c in clips] == ["A", "B", "C"]
-        assert not provider.prompts("highlight_v2")
+        assert not any(
+            "Audience signals for this section" in u for _, u in provider.prompts("highlight_v3")
+        )
         assert not provider.prompts("highlight_judge_v1")
         assert not runner.workspace.audience.exists()
 

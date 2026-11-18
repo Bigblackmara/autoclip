@@ -70,6 +70,36 @@ export interface Clip {
   /** The job's layout setting; what a re-export uses unless told otherwise. */
   layout: Layout
   exports: ExportRecord[]
+  /** Up to three on-screen headline options from detection, best first. */
+  hook_options: string[]
+  /** The chosen headline as stored ('' = none chosen). */
+  hook_text: string
+  /** What the render shows: the chosen hook, else the first option, else the title. */
+  headline: string
+  description: string
+  hashtags: string[]
+  /** The clip's own flash-forward toggle; null follows `flash_forward_default`. */
+  flash_forward: boolean | null
+  flash_forward_default: boolean
+  /** Whether the model flagged a tease line (otherwise one is picked by rule). */
+  has_teaser: boolean
+  teaser_start_s: number | null
+  teaser_end_s: number | null
+  /** The original clip this one re-cuts (null for an original). */
+  variant_of: string | null
+  motion_seed: number
+}
+
+export interface ClipPatch {
+  start_s?: number
+  end_s?: number
+  title?: string
+  status?: ClipStatus
+  hook_text?: string
+  description?: string
+  hashtags?: string[]
+  /** null goes back to following the export setting. */
+  flash_forward?: boolean | null
 }
 
 /**
@@ -145,6 +175,12 @@ export interface ProviderStatus {
 }
 
 export type Pace = 'off' | 'natural' | 'fast'
+/**
+ * Language of burned captions, the hook and the post text. `as_spoken` keeps
+ * each script except Hindi (written as Hinglish), `roman` writes everything
+ * in Latin letters, `english` translates.
+ */
+export type CaptionLanguage = 'as_spoken' | 'roman' | 'english'
 export type Motion = 'off' | 'subtle' | 'dynamic'
 export type WatermarkMode = 'off' | 'text' | 'image'
 export type WatermarkCorner = 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
@@ -187,6 +223,8 @@ export interface Settings {
     watermark_opacity: number
     fps: number
     two_pass_loudnorm: boolean
+    flash_forward: boolean
+    caption_language: CaptionLanguage
   }
   /** Retention: delete work older than N days (0 = keep everything). */
   housekeeping: { retention_days: number }
@@ -424,10 +462,15 @@ export const api = {
   getCropPath: (clipId: string) => request<CropPath>(`/api/clips/${clipId}/crop-path`),
   getClipWords: (clipId: string) => request<Word[]>(`/api/clips/${clipId}/words`),
 
-  patchClip: (
-    clipId: string,
-    patch: { start_s?: number; end_s?: number; title?: string; status?: ClipStatus },
-  ) => request<Clip>(`/api/clips/${clipId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  patchClip: (clipId: string, patch: ClipPatch) =>
+    request<Clip>(`/api/clips/${clipId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+
+  /** Same moment, next caption style / zoom pattern / hook; rendered unless `exportNow` is false. */
+  makeVariant: (clipId: string, options: { exportNow?: boolean; layout?: Layout } = {}) =>
+    request<Clip>(`/api/clips/${clipId}/variant`, {
+      method: 'POST',
+      body: JSON.stringify({ export: options.exportNow ?? true, layout: options.layout }),
+    }),
 
   patchCaptions: (
     clipId: string,
