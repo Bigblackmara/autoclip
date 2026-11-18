@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +27,7 @@ from ..pipeline import edit as shared_edit
 from ..pipeline.edit import Keep, loudnorm_filter, output_duration, remap_words
 from ..pipeline.export import encoder_args
 from ..pipeline.transcript import Word
+from . import captions as gta_captions
 
 __all__ = ["Keep", "loudnorm_filter", "output_duration", "remap_words"]
 
@@ -42,7 +43,8 @@ SAFE_TOP_PX = 150
 SAFE_BOTTOM_PX = 300
 #: Captions sit in the bottom band, their baseline just above the bottom
 #: safe zone (1-2 lines grow upwards from there).
-CAPTION_MARGIN_RATIO = (SAFE_BOTTOM_PX + 30) / OUT_H
+CAPTION_MARGIN_PX = SAFE_BOTTOM_PX + 30
+CAPTION_MARGIN_RATIO = CAPTION_MARGIN_PX / OUT_H
 #: Hook title and reaction text: centred in the top band, below the logo row.
 TITLE_FONT_RATIO = 0.052
 TITLE_STYLE = "GtaHook"
@@ -209,17 +211,24 @@ def write_subtitles(
     duration_s: float,
     reaction_text: str = "",
     reaction_window: tuple[float, float] | None = None,
+    keywords: Sequence[str] = (),
 ) -> Path:
+    """Captions (bottom band, 1-2 lines), hook title and reaction (top band).
+
+    ``style_key`` is a GTA look (``gta``, ``pop``, ``neon``, ``comic``,
+    ``minimal``) or a caption preset key; ``keywords`` are drawn bigger in
+    the look's emphasis colour.
+    """
     import pysubs2
 
-    style = captions.get_style(style_key)
-    subs = captions.build_ass(
+    style = gta_captions.resolve_style(style_key)
+    subs = gta_captions.build_ass(
         words,
         style,
         width=OUT_W,
         height=OUT_H,
-        time_offset_s=0.0,
-        margin_v_ratio=CAPTION_MARGIN_RATIO,
+        margin_v_px=CAPTION_MARGIN_PX,
+        keywords=keywords,
     )
     title = hook_title.strip()
     text_y = TEXT_CENTRE_Y
@@ -292,13 +301,16 @@ def build_filtergraph(
     audio_filter: str,
     punch_in: tuple[float, float, float] | None = None,
     watermark: Watermark | None = None,
+    motion: FrameMotion | None = None,
 ) -> str:
     """Cut + concat, uncropped fit over a blurred fill, subtitles, audio chain.
 
     Keep times are section-local; the input is seeked to ``seek_s`` so the
     trims are relative to that. ``punch_in`` = (start, end, zoom) in OUTPUT
     seconds: the stream frame cuts to a centred zoom for that span.
-    ``watermark`` reads the logo from input 1.
+    ``watermark`` reads the logo from input 1. ``motion`` zooms the stream
+    frame layer only (zoompan in place of its fit-scale): the blurred
+    background, the punch-in copy and the text are never moved by it.
     """
     parts: list[str] = []
     labels: list[str] = []
@@ -317,9 +329,12 @@ def build_filtergraph(
         f"[bgsrc]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
         f"crop={OUT_W}:{OUT_H},boxblur=28:2,eq=brightness=-0.06:saturation=1.15[bg]"
     )
-    parts.append(
-        f"[fgsrc]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos[fg]"
-    )
+    if motion is not None:
+        parts.append(f"[fgsrc]{motion.filter()}[fg]")
+    else:
+        parts.append(
+            f"[fgsrc]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos[fg]"
+        )
     current = "[bg][fg]overlay=(W-w)/2:(H-h)/2"
     if punch_in:
         a, b, zoom = punch_in
@@ -400,6 +415,68 @@ class Extras:
     punch_in_s: float = 1.5
     reaction_text: str = ""
     watermark: Watermark | None = None
+    #: Key words drawn bigger in the caption look's accent colour.
+    keywords: bool = False
+    #: Step zooms on the stream frame: "off" | "subtle" | "dynamic".
+    motion: str = "off"
+
+
+@dataclass(frozen=True)
+class FrameMotion:
+    """Zooms applied to the stream frame layer (output seconds)."""
+
+    zooms: tuple[shared_edit.Zoom, ...]
+    intro: bool
+    #: Size of the fitted, uncropped frame in the 1080x1920 canvas.
+    width: int
+    height: int
+
+    def filter(self) -> str:
+        """zoompan about the frame's centre, output at the fitted size.
+
+        zoompan crops the source frame and scales it straight to the fitted
+        size, so the zoom costs no extra upscale of an already-scaled frame.
+        """
+        expr = shared_edit.zoom_expression(list(self.zooms), self.intro)
+        return (
+            f"zoompan=z='{expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+            f":d=1:s={self.width}x{self.height}:fps={FPS}"
+        )
+
+
+def fitted_size(width: int | None, height: int | None) -> tuple[int, int] | None:
+    """The whole frame scaled to fit 1080x1920 (even sizes), or None."""
+    if not width or not height or width <= 0 or height <= 0:
+        return None
+    scale = min(OUT_W / width, OUT_H / height)
+    w = max(2, min(OUT_W, 2 * round(width * scale / 2)))
+    h = max(2, min(OUT_H, 2 * round(height * scale / 2)))
+    return w, h
+
+
+def plan_motion(
+    words: list[Word], duration: float, keeps: list[Keep], level: str, section: Path
+) -> FrameMotion | None:
+    """Step zooms through the clip (edit.plan_zooms), or None for no motion.
+
+    Jump cuts from the dead-air cut always get a zoom change, which hides
+    the jump. Never fatal: an unreadable section just renders without motion.
+    """
+    if level not in {"subtle", "dynamic"} or duration < 4.0:
+        return None
+    zooms = shared_edit.plan_zooms(words, duration, level, shared_edit.cut_times(keeps))
+    intro = level == "dynamic"
+    if not intro and not any(z.z != 1.0 for z in zooms):
+        return None
+    try:
+        info = ffmpeg.probe(section)
+    except Exception:
+        log.warning("Could not read %s for motion; rendering without it.", section.name)
+        return None
+    size = fitted_size(info.width, info.height)
+    if size is None:
+        return None
+    return FrameMotion(zooms=tuple(zooms), intro=intro, width=size[0], height=size[1])
 
 
 def key_moment(
@@ -536,6 +613,12 @@ def render(
     if extras.punch_in and duration > 3.0:
         punch = (window[0], window[1], extras.punch_in_zoom)
         edits.append("punch-in")
+    motion = plan_motion(out_words, duration, keeps, extras.motion, job.section)
+    if motion is not None:
+        edits.append("motion")
+    keywords = gta_captions.clip_keywords(out_words, extras.keywords)
+    if keywords:
+        edits.append("key words")
     ass = write_subtitles(
         workspace / "captions.ass",
         out_words,
@@ -545,6 +628,7 @@ def render(
         duration_s=duration,
         reaction_text=extras.reaction_text,
         reaction_window=window,
+        keywords=keywords,
     )
     if extras.reaction_text.strip() and f"{REACTION_STYLE}," in ass.read_text(encoding="utf-8"):
         edits.append("reaction text")
@@ -568,6 +652,7 @@ def render(
         audio_filter=audio_filter,
         punch_in=punch,
         watermark=watermark,
+        motion=motion,
     )
     logo_input = ["-i", str(watermark.path)] if watermark is not None else []
 

@@ -50,6 +50,20 @@ class GtaLiveSettings(BaseModel):
     turnaround_s: float = 180.0
 
 
+#: GTA caption looks -> the pipeline.captions preset each one renders with.
+#: ``karaoke_fill`` is kept for settings saved before the looks were added.
+CAPTION_STYLES = {
+    "gta": "bold_pop",
+    "pop": "pop",
+    "neon": "neon",
+    "comic": "comic",
+    "minimal": "minimal",
+    "karaoke_fill": "karaoke_fill",
+}
+#: Older saves stored the preset name of the GTA look.
+CAPTION_ALIASES = {"bold_pop": "gta", "": "gta"}
+MOTION_LEVELS = ("off", "subtle", "dynamic")
+
 #: YouTube video categories offered for GTA clips (id -> name).
 YOUTUBE_CATEGORIES = {"20": "Gaming", "22": "People & Blogs", "23": "Comedy", "24": "Entertainment"}
 
@@ -145,8 +159,18 @@ class GtaSettings(BaseModel):
 
     #: On-screen hook title duration, seconds.
     hook_title_s: float = 3.0
-    #: Caption preset (see pipeline.captions.STYLES).
-    caption_style: str = "bold_pop"
+    #: Caption look (see :data:`CAPTION_STYLES`): ``gta`` is the classic GTA
+    #: look (white, black outline, spoken word yellow); ``pop`` / ``neon`` /
+    #: ``comic`` / ``minimal`` reuse the normal pipeline's presets. Every one
+    #: stays in the bottom band, above the bottom safe zone, in 1-2 lines.
+    caption_style: str = "gta"
+    #: Draw 3-8 key words per clip bigger and in the style's accent colour
+    #: (at most one per caption line).
+    keyword_highlight: bool = True
+    #: Subtle step zooms through the clip on the stream frame only (the
+    #: blurred background and the text bands never move), on top of the
+    #: punch-in: ``off`` / ``subtle`` (~every 4.5 s) / ``dynamic`` (~2.2 s).
+    motion: str = "subtle"
 
     #: Loudness target and the QA tolerance around it.
     loudness_lufs: float = -14.0
@@ -169,6 +193,15 @@ class GtaSettings(BaseModel):
 
     #: Where finished clips go. Empty = ``<AutoClip home>/exports/gta``.
     output_dir: str = ""
+
+    #: YouTube VODs: timestamps viewers wrote in the top comments ("2:13:05
+    #: was insane") join the Hype Curve. One extra request, cached per
+    #: stream; a failure just leaves the signal out.
+    comment_signal: bool = True
+    #: YouTube VODs: use YouTube's own captions as the transcript where they
+    #: look right, skipping Whisper for those parts (Whisper on any doubt).
+    #: Off by default: automatic captions have no punctuation.
+    youtube_captions: bool = False
 
     #: Own-value editing: a punch-in zoom on the clip's key moment (its
     #: loudest beat), with the judge's short reaction text in the top band.
@@ -212,6 +245,22 @@ class GtaSettings(BaseModel):
     def _at_least_one(cls, value: int) -> int:
         if value < 1:
             raise ValueError("must be at least 1")
+        return value
+
+    @field_validator("caption_style", mode="before")
+    @classmethod
+    def _caption_style(cls, value: object) -> str:
+        key = str(value or "").strip().lower()
+        key = CAPTION_ALIASES.get(key, key)
+        if key not in CAPTION_STYLES:
+            raise ValueError(f"caption_style must be one of {', '.join(CAPTION_STYLES)}")
+        return key
+
+    @field_validator("motion")
+    @classmethod
+    def _motion(cls, value: str) -> str:
+        if value not in MOTION_LEVELS:
+            raise ValueError(f"motion must be one of {', '.join(MOTION_LEVELS)}")
         return value
 
     @field_validator("watermark_corner")
