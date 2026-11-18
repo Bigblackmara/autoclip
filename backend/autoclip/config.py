@@ -132,6 +132,36 @@ class ExportSettings(BaseModel):
     #: always uses the speaker-following crop. Other ratios always crop.
     layout: Literal["auto", "split", "crop"] = "auto"
 
+    # -- short-form editing (normal mode; see pipeline/edit.py) -------------
+    #: Cut pauses: "natural" shortens pauses over ~0.6 s, "fast" nearly all,
+    #: "off" keeps everything. Cuts land only on measured silences.
+    pace: Literal["off", "natural", "fast"] = "natural"
+    #: The clip's title as a headline over the first ~3 seconds.
+    hook_title: bool = True
+    #: Punch-in zooms at natural pauses: "subtle" every ~4-6 s, "dynamic" more
+    #: often plus a quick zoom-out on the hook. Jump cuts always get a zoom step.
+    motion: Literal["off", "subtle", "dynamic"] = "subtle"
+    #: Draw 3-8 important words per clip bigger and in an accent colour.
+    keyword_highlight: bool = True
+    #: Background music: a track file, or a folder to pick one from per clip.
+    music_enabled: bool = False
+    music_path: str = ""
+    #: Music level in percent (100 = the track's own level), before ducking.
+    music_volume: int = Field(default=30, ge=0, le=200)
+    #: Push the music down while someone is talking.
+    music_duck: bool = True
+    #: Watermark: "text" draws ``watermark_text`` as a logo, "image" overlays a PNG.
+    watermark: Literal["off", "text", "image"] = "off"
+    watermark_text: str = ""
+    watermark_image: str = ""
+    watermark_corner: Literal["top_left", "top_right", "bottom_left", "bottom_right"] = "top_right"
+    watermark_opacity: float = Field(default=0.85, ge=0.05, le=1.0)
+    #: Output frame rate, forced on every normal-mode export.
+    fps: int = Field(default=30, ge=15, le=60)
+    #: Measure loudness first and normalise linearly (lands on the target
+    #: rather than near it). Off falls back to one-pass dynamic loudnorm.
+    two_pass_loudnorm: bool = True
+
 
 class Settings(BaseModel):
     """Top-level persisted settings."""

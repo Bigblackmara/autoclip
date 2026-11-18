@@ -164,8 +164,26 @@ Everything the UI does is also on the CLI:
 | `karaoke_fill` | words fill with colour exactly as they're spoken |
 | `clean_lower` | minimal lower third, no animation |
 | `boxed` | high-contrast text on a solid block |
+| `pop` | big three-word bursts, spoken word gold, key words green |
+| `neon` | glowing cyan outline, spoken word mint, key words magenta |
+| `comic` | yellow comic lettering two words at a time, key words red |
+| `minimal` | sentence-case lines with a soft shadow, only key words coloured |
 
 Fonts are bundled under the SIL Open Font License, so nothing is fetched at runtime.
+
+### Editing (normal-mode exports)
+
+Every batch export and re-export gets short-form editing on top of the crop, in the same ffmpeg pass. All of it lives in the `export` settings (Settings → Editing):
+
+| setting | default | does |
+|---|---|---|
+| `pace` | `natural` | cuts pauses longer than ~0.6 s (`fast`: nearly every pause; `off`: none). Cuts land only on silences measured from the audio, never through a transcribed word; a lone "um" between two pauses goes with them. Captions are re-timed and each jump cut gets a small zoom step to hide it. |
+| `hook_title` | on | the clip's title as a headline for the first ~3 s |
+| `motion` | `subtle` | punch-in zooms at natural pauses (`subtle` every ~4-5 s, `dynamic` more often plus a quick zoom-out on the hook, `off`). Never on the facecam split layout. |
+| `keyword_highlight` | on | 3-8 important words per clip (numbers first, then the longest non-stopwords) drawn bigger in the style's accent colour, one per line |
+| `music_enabled`, `music_path`, `music_volume`, `music_duck` | off, —, 30 %, on | a track file or a folder (one track picked per clip), looped, faded in/out and ducked under speech |
+| `watermark`, `watermark_text`, `watermark_image`, `watermark_corner`, `watermark_opacity` | `off` | a text logo or a PNG in any corner |
+| `fps`, `two_pass_loudnorm` | 30, on | forced output frame rate; loudness measured first, then normalised linearly to `loudness_lufs` (-14) |
 
 ## Streamer clips: facecam layout
 
@@ -291,4 +309,4 @@ AutoClip bundles [yt-dlp](https://github.com/yt-dlp/yt-dlp). **Only download con
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Bundled fonts (Anton, Inter) are under the SIL Open Font License.
+MIT — see [LICENSE](LICENSE). Bundled fonts (Anton, Inter, Bangers, Poppins) are under the SIL Open Font License.

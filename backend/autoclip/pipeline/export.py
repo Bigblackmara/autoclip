@@ -18,8 +18,10 @@ from pathlib import Path
 from ..config import ExportSettings
 from ..system import report
 from . import captions as captions_module
+from . import edit as edit_module
 from . import ffmpeg
 from .captions import CaptionStyle
+from .edit import EditPlan
 from .reframe.croppath import CropPath, segment_crop_filter
 from .reframe.facecam import Facecam
 from .transcript import Word
@@ -76,6 +78,12 @@ class ExportRequest:
     #: building the request — see :func:`resolve_layout`.
     layout: str = "crop"
     facecam: Facecam | None = None
+    #: False when the source has no audio track (screen recordings, GIFs).
+    has_audio: bool = True
+    #: Short-form editing on top of the crop (pace cuts, zooms, hook, key
+    #: words, music, watermark, forced fps, two-pass loudness). None renders
+    #: the plain crop + captions export, as Live Watch does.
+    edit: EditPlan | None = None
 
     @property
     def is_split(self) -> bool:
@@ -89,6 +97,43 @@ class ExportRequest:
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
+
+    @property
+    def output_duration_s(self) -> float:
+        """Length of the rendered clip (shorter than the span when pauses are cut)."""
+        if self.edit is None:
+            return self.duration_s
+        return self.edit.output_duration(self.duration_s)
+
+    @property
+    def is_cut(self) -> bool:
+        keeps = self.edit.keeps if self.edit is not None else None
+        return bool(keeps) and (
+            len(keeps) > 1 or keeps[0].start > 1e-3 or keeps[0].end < self.duration_s - 1e-3
+        )
+
+
+@dataclass(frozen=True)
+class InputLayout:
+    """ffmpeg input indices of the optional extra inputs (None when absent)."""
+
+    background: int | None = None
+    watermark: int | None = None
+    music: int | None = None
+
+
+def input_layout(request: ExportRequest) -> InputLayout:
+    """Inputs are: 0 source, then background, watermark and music when used."""
+    index = 1
+    background = watermark = music = None
+    if not request.has_video:
+        background, index = index, index + 1
+    edit = request.edit
+    if edit is not None and edit.watermark is not None:
+        watermark, index = index, index + 1
+    if edit is not None and edit.music is not None:
+        music = index
+    return InputLayout(background=background, watermark=watermark, music=music)
 
 
 def resolve_layout(setting: str, facecam: Facecam | None, ratio: str) -> str:
@@ -349,14 +394,124 @@ def _captions_chain(
     subtitle_name: str | None,
     fonts_name: str,
 ) -> str:
-    """Append the caption burn (or a pass-through) producing ``[vout]``."""
-    if request.burn_captions and subtitle_name is not None:
+    """Append the edit chain and the caption burn (or a pass-through) producing ``[vout]``."""
+    if request.edit is not None:
+        edit_parts, current = _edit_video_chain(request, current)
+        graph = ";".join([graph, *edit_parts])
+    if subtitle_name is not None and (request.burn_captions or request.edit is not None):
         # Bare relative names — ffmpeg runs with its cwd set to the render
         # workspace, so there is nothing here that needs escaping.
         tail = f"{current}ass=filename={subtitle_name}:fontsdir={fonts_name}[vout]"
     else:
         tail = f"{current}null[vout]"
     return f"{graph};{tail}"
+
+
+def _edit_video_chain(request: ExportRequest, current: str) -> tuple[list[str], str]:
+    """Forced fps, pause cuts, punch-in zooms and the watermark, in that order.
+
+    Cuts are applied after the crop so the crop path keeps working in clip
+    time; zooms after the cuts so each jump cut can change the framing.
+    """
+    edit = request.edit
+    assert edit is not None
+    out_w, out_h = ratio_dimensions(request.ratio)
+    parts: list[str] = []
+    fps = edit.fps
+    if request.is_cut:
+        keeps = edit.kept(request.duration_s)
+        if len(keeps) == 1:
+            keep = keeps[0]
+            parts.append(
+                f"{current}fps={fps},trim=start={keep.start:.4f}:end={keep.end:.4f},"
+                "setpts=PTS-STARTPTS[ecut]"
+            )
+        else:
+            labels = "".join(f"[ek{i}]" for i in range(len(keeps)))
+            parts.append(f"{current}fps={fps},split={len(keeps)}{labels}")
+            for i, keep in enumerate(keeps):
+                parts.append(
+                    f"[ek{i}]trim=start={keep.start:.4f}:end={keep.end:.4f},"
+                    f"setpts=PTS-STARTPTS[ec{i}]"
+                )
+            joined = "".join(f"[ec{i}]" for i in range(len(keeps)))
+            parts.append(f"{joined}concat=n={len(keeps)}:v=1:a=0[ecut]")
+        current = "[ecut]"
+    else:
+        parts.append(f"{current}fps={fps}[efps]")
+        current = "[efps]"
+
+    # Zooms would cut into the facecam panel of the split stack, and there is
+    # nothing to zoom on an audio-only background.
+    if edit.has_motion and request.has_video and not request.is_split:
+        zoom = edit_module.zoom_filter(edit.zooms, edit.intro_zoom, out_w, out_h, fps)
+        parts.append(f"{current}{zoom},setsar=1[ezoom]")
+        current = "[ezoom]"
+
+    inputs = input_layout(request)
+    if edit.watermark is not None and inputs.watermark is not None:
+        parts.append(
+            edit_module.watermark_filter(
+                edit.watermark, inputs.watermark, current, "[ewm]", out_w, out_h
+            )
+        )
+        current = "[ewm]"
+    return parts, current
+
+
+def build_edit_audio_graph(
+    request: ExportRequest, *, tail: str, music_index: int | None
+) -> str | None:
+    """The edited audio chain ending in ``[aout]``, or None when there is no audio.
+
+    Speech is cut to the same keeps as the picture (12 ms fades so the joins
+    don't click), music is looped/faded/ducked under it, and ``tail`` (the
+    loudnorm, or its measuring variant) runs last over the whole mix.
+    """
+    edit = request.edit
+    assert edit is not None
+    parts: list[str] = []
+    speech: str | None = None
+    if request.has_audio:
+        if request.is_cut:
+            keeps = edit.kept(request.duration_s)
+            if len(keeps) > 1:
+                labels = "".join(f"[ea{i}]" for i in range(len(keeps)))
+                parts.append(f"[0:a]asplit={len(keeps)}{labels}")
+                sources = [f"[ea{i}]" for i in range(len(keeps))]
+            else:
+                sources = ["[0:a]"]
+            for i, (keep, source) in enumerate(zip(keeps, sources, strict=True)):
+                fade = min(0.012, keep.duration / 4)
+                parts.append(
+                    f"{source}atrim=start={keep.start:.4f}:end={keep.end:.4f},"
+                    f"asetpts=PTS-STARTPTS,afade=t=in:st=0:d={fade:.3f},"
+                    f"afade=t=out:st={keep.duration - fade:.3f}:d={fade:.3f}[eac{i}]"
+                )
+            joined = "".join(f"[eac{i}]" for i in range(len(keeps)))
+            parts.append(f"{joined}concat=n={len(keeps)}:v=0:a=1,{edit_module.AUDIO_FORMAT}[esp]")
+        else:
+            parts.append(f"[0:a]{edit_module.AUDIO_FORMAT}[esp]")
+        speech = "[esp]"
+
+    if edit.music is not None and music_index is not None:
+        parts.append(
+            edit_module.music_chain(
+                music_index,
+                request.output_duration_s,
+                edit.music_volume,
+                duck=edit.music_duck,
+                speech=speech,
+                out_label="[emix]",
+            )
+        )
+        current = "[emix]"
+    elif speech is not None:
+        current = speech
+    else:
+        return None
+    parts.append(f"{current}{tail}[aout]")
+    return ";".join(parts)
 
 
 def _fit_chain(source_label: str, index: int, out_w: int, out_h: int) -> list[str]:
@@ -459,20 +614,48 @@ def export_clip(
     subtitle_name: str | None = None
     fonts_name = "fonts"
     render_cwd: Path | None = None
+    edit = request.edit
+    out_duration = request.output_duration_s
 
-    if request.burn_captions and request.words:
+    # Caption words on the output timeline: absolute transcript times, or —
+    # when the edit cuts pauses — re-timed onto the cut clip.
+    caption_words = request.words
+    caption_offset = request.start_s
+    if edit is not None:
+        caption_words = edit_module.retime_words(
+            [
+                Word(w.text, w.start - request.start_s, w.end - request.start_s, w.speaker)
+                for w in request.words
+            ],
+            edit.kept(request.duration_s),
+        )
+        caption_offset = 0.0
+    hook = edit.hook_text if edit is not None else ""
+
+    if (request.burn_captions and caption_words) or hook:
         margin_v_ratio = None
         if request.is_split and request.facecam is not None:
             top_h = split_geometry(request.facecam, request.crop_path, out_w, out_h).top_h
             margin_v_ratio = split_caption_margin(request.style, out_h, top_h)
         ass_path = captions_module.write_ass(
             workspace / "captions.ass",
-            request.words,
+            caption_words if request.burn_captions else [],
             request.style,
             width=out_w,
             height=out_h,
-            time_offset_s=request.start_s,
+            time_offset_s=caption_offset,
             margin_v_ratio=margin_v_ratio,
+            keywords=edit.keywords if edit is not None else (),
+            hook_text=hook,
+            hook_s=edit.hook_s if edit is not None else 3.0,
+            hook_top_px=(
+                edit_module.hook_top_px(
+                    out_w, out_h, split=request.is_split, watermark=edit.watermark
+                )
+                if edit is not None
+                else None
+            ),
+            duration_s=out_duration,
         )
         render_cwd, subtitle_name, fonts_name = ffmpeg.relative_filter_workspace(
             ass_path, captions_module.FONT_DIR
@@ -481,6 +664,50 @@ def export_clip(
     filtergraph = build_video_filtergraph(
         request, subtitle_name=subtitle_name, fonts_name=fonts_name
     )
+    inputs = input_layout(request)
+
+    # The edited export mixes its audio inside the filtergraph (cuts, music)
+    # and, with two-pass loudness, measures that exact mix first.
+    audio_map = ["-map", "0:a?", "-af", build_audio_filtergraph(settings)]
+    if edit is not None:
+        audio_map = []
+        target = settings.loudness_lufs
+        measured = None
+        if edit.two_pass_loudnorm:
+            measure_graph = build_edit_audio_graph(
+                request,
+                tail=edit_module.measure_filter(target=target, true_peak=LOUDNESS_TRUE_PEAK),
+                music_index=1 if edit.music is not None else None,
+            )
+            if measure_graph is not None:
+                measure_inputs = [
+                    "-ss",
+                    f"{request.start_s:.4f}",
+                    "-t",
+                    f"{request.duration_s:.4f}",
+                    "-i",
+                    str(request.source),
+                    *(_music_input(edit.music) if edit.music is not None else []),
+                ]
+                measured = edit_module.measure_loudnorm(measure_inputs, measure_graph)
+        audio_graph = build_edit_audio_graph(
+            request,
+            tail=edit_module.loudnorm_filter(measured, target=target, true_peak=LOUDNESS_TRUE_PEAK)
+            + f",aresample={AUDIO_SAMPLE_RATE}",
+            music_index=inputs.music,
+        )
+        if audio_graph is not None:
+            filtergraph = f"{filtergraph};{audio_graph}"
+            audio_map = ["-map", "[aout]"]
+
+    extra_inputs: list[str] = []
+    output_args: list[str] = []
+    if edit is not None:
+        if edit.watermark is not None:
+            extra_inputs += ["-i", str(edit.watermark.path)]
+        if edit.music is not None:
+            extra_inputs += _music_input(edit.music)
+        output_args = ["-r", str(edit.fps), "-t", f"{out_duration:.4f}"]
 
     request.destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -521,17 +748,16 @@ def export_clip(
             "-i",
             str(request.source),
             *background_input,
+            *extra_inputs,
             "-filter_complex",
             filtergraph,
             "-map",
             "[vout]",
-            "-map",
-            "0:a?",
-            "-af",
-            build_audio_filtergraph(settings),
+            *audio_map,
             *video_args,
             "-pix_fmt",
             "yuv420p",
+            *output_args,
             "-c:a",
             "aac",
             "-b:a",
@@ -546,7 +772,7 @@ def export_clip(
     def run(video_args: list[str]) -> None:
         ffmpeg.run(
             render_args(video_args),
-            total_duration_s=request.duration_s,
+            total_duration_s=out_duration,
             on_progress=on_progress,
             cancelled=cancelled,
             cwd=render_cwd,
@@ -596,18 +822,24 @@ def export_clip(
             log.warning("Could not remove the partial render %s.", partial, exc_info=True)
         raise
 
-    if settings.write_srt and request.words:
+    if settings.write_srt and caption_words:
         captions_module.write_srt(
             request.destination.with_suffix(".srt"),
-            request.words,
-            time_offset_s=request.start_s,
+            caption_words,
+            time_offset_s=caption_offset,
         )
 
     log.info(
-        "Exported %s (%.1fs, %s, %s)",
+        "Exported %s (%.1fs, %s, %s%s)",
         request.destination.name,
-        request.duration_s,
+        out_duration,
         request.ratio,
         "split" if request.is_split else "crop",
+        f"; {', '.join(edit.summary())}" if edit is not None and edit.summary() else "",
     )
     return request.destination
+
+
+def _music_input(track: Path) -> list[str]:
+    """A music input looped forever; the filtergraph cuts it to the clip."""
+    return ["-stream_loop", "-1", "-i", str(track)]

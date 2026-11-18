@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from ..config import load as load_settings
 from ..db import store
 from ..db.models import Export, new_id
 from ..pipeline import captions as captions_module
+from ..pipeline import edit as edit_module
 from ..pipeline import export as export_module
+from ..pipeline.prepare import Silence
 from ..pipeline.reframe.croppath import CropPath, centre_crop
 from ..pipeline.runner import (
     JobWorkspace,
@@ -250,6 +253,21 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         )
     )
 
+    layout = export_module.resolve_layout(layout_setting, facecam, payload.ratio)
+    # The same short-form edits as the batch export (pause cuts, zooms, hook,
+    # key words, music, watermark), from the current export settings.
+    plan = await asyncio.to_thread(
+        edit_module.plan_for_clip,
+        settings.export,
+        start_s=clip.start_s,
+        end_s=clip.end_s,
+        words=words,
+        silences=await asyncio.to_thread(_cached_silences, workspace),
+        title=clip.title or clip.hook,
+        seed=clip.id,
+        allow_motion=source.has_video and layout != "split",
+    )
+
     request = export_module.ExportRequest(
         source=Path(source.path),
         destination=destination,
@@ -260,8 +278,10 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         style=style,
         ratio=payload.ratio,
         has_video=source.has_video,
-        layout=export_module.resolve_layout(layout_setting, facecam, payload.ratio),
+        layout=layout,
         facecam=facecam,
+        has_audio=source.has_audio,
+        edit=plan,
     )
 
     try:
@@ -348,6 +368,18 @@ async def caption_styles() -> list[CaptionStyleOut]:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _cached_silences(workspace: JobWorkspace) -> list[Silence]:
+    """The job's measured silences (for pause cuts); empty when not measured."""
+    if not workspace.silences.exists():
+        return []
+    try:
+        raw = json.loads(workspace.silences.read_text(encoding="utf-8"))
+        return [Silence(start=float(item["start"]), end=float(item["end"])) for item in raw]
+    except (OSError, ValueError, TypeError, KeyError):
+        log.warning("Ignoring an unreadable silences file in %s.", workspace.root)
+        return []
 
 
 def _load_transcript(job_id: str) -> Transcript:

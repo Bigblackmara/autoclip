@@ -58,7 +58,7 @@ def _transcript(seconds: int = 120) -> Transcript:
 def _our_tags_removed(text: str) -> str:
     """Event text minus the override blocks AutoClip itself emits."""
     for tag in pysubs2.SSAEvent.OVERRIDE_SEQUENCE.findall(text):
-        if tag.startswith(("{\\c", "{\\kf", "{\\r")):
+        if tag.startswith(("{\\c", "{\\kf", "{\\r", "{\\blur")):
             text = text.replace(tag, "", 1)
     return text
 

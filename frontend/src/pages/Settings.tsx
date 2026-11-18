@@ -3,10 +3,14 @@ import { useEffect, useState } from 'react'
 import {
   api,
   type Layout,
+  type Motion,
+  type Pace,
   type ProviderStatus,
   type Settings as SettingsData,
   type SettingsPatch,
   type SystemStatus,
+  type WatermarkCorner,
+  type WatermarkMode,
 } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
 
@@ -294,6 +298,146 @@ export function Settings() {
         </label>
       </Section>
 
+      <Section
+        title="Editing"
+        note="Applied to every normal-mode export and re-export: pause cuts, zooms, headline, key words, music and logo."
+      >
+        <div className="grid gap-5 sm:grid-cols-3">
+          <Select
+            label="Cut pauses"
+            hint="Cuts only on measured silences; captions are re-timed."
+            value={settings.export.pace}
+            onChange={(value) => patch({ export: { pace: value as Pace } })}
+            options={['off', 'natural', 'fast']}
+            labels={{
+              off: 'Off — keep everything',
+              natural: 'Natural — pauses over 0.6 s',
+              fast: 'Fast — nearly every pause',
+            }}
+          />
+          <Select
+            label="Motion"
+            hint="Punch-in zooms at natural pauses. Jump cuts always get a zoom step."
+            value={settings.export.motion}
+            onChange={(value) => patch({ export: { motion: value as Motion } })}
+            options={['off', 'subtle', 'dynamic']}
+            labels={{
+              off: 'Off — steady framing',
+              subtle: 'Subtle — every few seconds',
+              dynamic: 'Dynamic — often, zoom-out on the hook',
+            }}
+          />
+          <NumberField
+            label="Frame rate (fps)"
+            value={settings.export.fps}
+            integer
+            min={15}
+            onCommit={(value) => patch({ export: { fps: value } })}
+          />
+        </div>
+
+        <div className="mt-5 flex flex-wrap gap-x-8 gap-y-3">
+          <Toggle
+            label="Hook headline (first 3 s, from the clip title)"
+            checked={settings.export.hook_title}
+            onChange={(checked) => patch({ export: { hook_title: checked } })}
+          />
+          <Toggle
+            label="Highlight key words in captions"
+            checked={settings.export.keyword_highlight}
+            onChange={(checked) => patch({ export: { keyword_highlight: checked } })}
+          />
+          <Toggle
+            label="Two-pass loudness (lands on the target)"
+            checked={settings.export.two_pass_loudnorm}
+            onChange={(checked) => patch({ export: { two_pass_loudnorm: checked } })}
+          />
+        </div>
+
+        <div className="mt-8 grid gap-5 sm:grid-cols-3">
+          <div className="sm:col-span-3">
+            <Toggle
+              label="Background music"
+              checked={settings.export.music_enabled}
+              onChange={(checked) => patch({ export: { music_enabled: checked } })}
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <Field
+              label="Music track or folder"
+              hint="A file, or a folder to pick one track per clip from. Looped, faded, under the voice."
+              value={settings.export.music_path}
+              placeholder="C:\Music\background.mp3"
+              onCommit={(value) => patch({ export: { music_path: value } })}
+            />
+          </div>
+          <NumberField
+            label="Music volume (%)"
+            value={settings.export.music_volume}
+            integer
+            min={0}
+            onCommit={(value) => patch({ export: { music_volume: value } })}
+          />
+          <div className="sm:col-span-3">
+            <Toggle
+              label="Duck the music while someone talks"
+              checked={settings.export.music_duck}
+              onChange={(checked) => patch({ export: { music_duck: checked } })}
+            />
+          </div>
+        </div>
+
+        <div className="mt-8 grid gap-5 sm:grid-cols-3">
+          <Select
+            label="Watermark"
+            value={settings.export.watermark}
+            onChange={(value) => patch({ export: { watermark: value as WatermarkMode } })}
+            options={['off', 'text', 'image']}
+            labels={{ off: 'Off', text: 'Text logo', image: 'PNG image' }}
+          />
+          <Select
+            label="Corner"
+            value={settings.export.watermark_corner}
+            onChange={(value) =>
+              patch({ export: { watermark_corner: value as WatermarkCorner } })
+            }
+            options={['top_left', 'top_right', 'bottom_left', 'bottom_right']}
+            labels={{
+              top_left: 'Top left',
+              top_right: 'Top right',
+              bottom_left: 'Bottom left',
+              bottom_right: 'Bottom right',
+            }}
+          />
+          <NumberField
+            label="Opacity (0.05–1)"
+            value={settings.export.watermark_opacity}
+            min={0.05}
+            onCommit={(value) => patch({ export: { watermark_opacity: value } })}
+          />
+          {settings.export.watermark === 'text' && (
+            <div className="sm:col-span-3">
+              <Field
+                label="Logo text"
+                value={settings.export.watermark_text}
+                placeholder="MY CHANNEL"
+                onCommit={(value) => patch({ export: { watermark_text: value } })}
+              />
+            </div>
+          )}
+          {settings.export.watermark === 'image' && (
+            <div className="sm:col-span-3">
+              <Field
+                label="Logo PNG"
+                value={settings.export.watermark_image}
+                placeholder="C:\Brand\logo.png"
+                onCommit={(value) => patch({ export: { watermark_image: value } })}
+              />
+            </div>
+          )}
+        </div>
+      </Section>
+
       {system && (
         <Section title="This machine">
           <dl className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
@@ -329,6 +473,28 @@ function Section({
       </div>
       <div className="mt-5">{children}</div>
     </section>
+  )
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex items-center gap-3 text-sm text-ink-200">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="size-4 accent-sodium-500"
+      />
+      {label}
+    </label>
   )
 }
 
