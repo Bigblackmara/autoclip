@@ -78,8 +78,42 @@ class IngestSettings(BaseModel):
     #: As of 2026 most anonymous YouTube downloads hit a bot check that only
     #: browser cookies reliably clear, so this is a first-class setting.
     cookies_from_browser: str = ""
-    #: Offer YouTube's own auto-captions as a fast path, skipping Whisper.
+    #: Use YouTube's own captions (manual, else automatic, in the video's own
+    #: language) as the transcript and skip Whisper. Off by default: automatic
+    #: captions carry no punctuation, so clip edges lean on pauses alone and
+    #: burned-in captions read as one lower-case run. Whisper is used whenever
+    #: the captions are missing or look wrong.
     prefer_youtube_captions: bool = False
+
+
+class DetectionSettings(BaseModel):
+    """Audience signals and the judge pass around highlight detection."""
+
+    #: Build the per-second audience curve: YouTube "Most replayed", comment
+    #: timestamps, chapters, with audio energy as the fallback.
+    audience_signals: bool = True
+    #: Read timestamps viewers wrote in the top comments (one extra yt-dlp
+    #: request per YouTube source; failures are ignored).
+    fetch_comments: bool = True
+    #: How many top comments to read.
+    max_comments: int = Field(default=300, ge=0, le=5000)
+    #: Use per-second loudness as a signal (the only one for uploads).
+    audio_energy: bool = True
+    #: Pass each window's audience peaks to the model as hints.
+    audience_hints: bool = True
+    #: Peaks listed per transcript window.
+    hints_per_window: int = Field(default=4, ge=0, le=20)
+    #: Share of the final score taken from audience data (heatmap/comments).
+    audience_weight: float = Field(default=0.4, ge=0.0, le=1.0)
+    #: Share taken from the curve when it is audio energy alone (a weak signal).
+    energy_weight: float = Field(default=0.12, ge=0.0, le=1.0)
+    #: Second LLM pass with three yes/no tests (hook, context-free, payoff)
+    #: that drops weak candidates. A failed judge keeps every candidate.
+    judge: bool = True
+    #: Candidates sent to the judge (at least twice ``clips.max_clips``).
+    judge_max_candidates: int = Field(default=20, ge=1, le=200)
+    #: Never let the judge leave fewer clips than this.
+    judge_min_keep: int = Field(default=1, ge=0, le=100)
 
 
 class ExportSettings(BaseModel):
@@ -115,6 +149,7 @@ class Settings(BaseModel):
     clips: ClipSettings = Field(default_factory=ClipSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     export: ExportSettings = Field(default_factory=ExportSettings)
+    detection: DetectionSettings = Field(default_factory=DetectionSettings)
 
     #: Set when secrets had to be written to config.json because no keyring
     #: backend was usable. Surfaced as a warning in the UI and in `doctor`.
