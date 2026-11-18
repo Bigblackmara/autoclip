@@ -328,6 +328,45 @@ def _migration_v6(conn: sqlite3.Connection) -> None:
     _run_in_transaction(conn, statements)
 
 
+#: Columns added to ``clips`` by v7, with their DDL.
+_V7_CLIP_COLUMNS: tuple[tuple[str, str], ...] = (
+    # Up to three on-screen headline options from detection (JSON list).
+    ("hook_options", "TEXT NOT NULL DEFAULT '[]'"),
+    # The headline actually rendered: one of the options or free text.
+    ("hook_text", "TEXT NOT NULL DEFAULT ''"),
+    # Post text: description and hashtags (JSON list of "#tag").
+    ("description", "TEXT NOT NULL DEFAULT ''"),
+    ("hashtags", "TEXT NOT NULL DEFAULT '[]'"),
+    # The punchiest line the model flagged for a flash-forward opening, in
+    # absolute source seconds. NULL = none flagged (a heuristic picks one).
+    ("teaser_start_s", "REAL"),
+    ("teaser_end_s", "REAL"),
+    # Per-clip flash-forward: NULL follows the export setting, 0/1 override it.
+    ("flash_forward", "INTEGER"),
+    # Variants: the clip this one re-cuts, and its zoom-pattern seed.
+    ("variant_of", "TEXT"),
+    ("motion_seed", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migration_v7(conn: sqlite3.Connection) -> None:
+    """Clip editor: hook options, post text, flash-forward and variants.
+
+    Additive and idempotent: each column is only added when missing. A
+    database without a ``clips`` table (hand-built in tests) is left alone.
+    """
+    columns = _column_names(conn, "clips")
+    if not columns:
+        _run_in_transaction(conn, [])
+        return
+    statements = [
+        f"ALTER TABLE clips ADD COLUMN {name} {ddl}"
+        for name, ddl in _V7_CLIP_COLUMNS
+        if name not in columns
+    ]
+    _run_in_transaction(conn, statements)
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
@@ -337,6 +376,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v4,
     _migration_v5,
     _migration_v6,
+    _migration_v7,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

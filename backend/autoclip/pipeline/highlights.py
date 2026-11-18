@@ -339,7 +339,14 @@ def build_clips(
                 hook=candidate.hook.strip(),
                 score=candidate.score,
                 reason=candidate.reason.strip(),
+                hook_options=list(candidate.hooks),
+                hook_text=candidate.hooks[0] if candidate.hooks else "",
+                description=candidate.description.strip(),
+                hashtags=list(candidate.hashtags),
             )
+        )
+        clips[-1].teaser_start_s, clips[-1].teaser_end_s = teaser_times(
+            transcript, candidate, boundary.start_s, boundary.end_s
         )
         if audience is not None:
             blend_score(clips[-1], audience)
@@ -352,6 +359,25 @@ def build_clips(
     clips = rank_clips(clips, config.max_clips)
     log.info("Produced %d final clips.", len(clips))
     return clips
+
+
+def teaser_times(
+    transcript: Transcript, candidate: ClipCandidate, start_s: float, end_s: float
+) -> tuple[float | None, float | None]:
+    """The model's flash-forward line in source seconds, if it lies inside the clip.
+
+    The line is checked against the clip's refined edges; the final fit (a
+    pause to end on, 0.8-3.6 s long) happens when the edit is planned, since
+    a later trim can move the edges again.
+    """
+    first, last = candidate.teaser_start_word_index, candidate.teaser_end_word_index
+    words = transcript.words
+    if first is None or last is None or not (0 <= first <= last < len(words)):
+        return None, None
+    a, b = words[first].start, words[last].end
+    if a < start_s - 0.05 or b > end_s + 0.05 or b <= a:
+        return None, None
+    return round(a, 3), round(b, 3)
 
 
 def rank_clips(clips: list[Clip], max_clips: int | None) -> list[Clip]:

@@ -141,13 +141,46 @@ class Clip:
     status: ClipStatus = "candidate"
     user_trimmed: bool = False
     created_at: str = field(default_factory=utcnow)
+    #: Up to three on-screen headline options from detection.
+    hook_options: list[str] = field(default_factory=list)
+    #: The headline the render uses (an option or free text); empty = default.
+    hook_text: str = ""
+    #: Post text for the upload.
+    description: str = ""
+    hashtags: list[str] = field(default_factory=list)
+    #: The line flagged for a flash-forward opening, absolute source seconds.
+    teaser_start_s: float | None = None
+    teaser_end_s: float | None = None
+    #: Per-clip flash-forward. None follows ``export.flash_forward``.
+    flash_forward: bool | None = None
+    #: The clip this one is a variant of (None for an original).
+    variant_of: str | None = None
+    #: Zoom-pattern seed; 0 is the plain pattern, variants count up.
+    motion_seed: int = 0
 
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
 
+    @property
+    def headline(self) -> str:
+        """The on-screen hook headline: the chosen one, else the first option, else the title."""
+        for text in (self.hook_text, *self.hook_options[:1], self.title, self.hook):
+            if text and text.strip():
+                return text.strip()
+        return ""
+
+    @property
+    def teaser(self) -> tuple[float, float] | None:
+        if self.teaser_start_s is None or self.teaser_end_s is None:
+            return None
+        if self.teaser_end_s <= self.teaser_start_s:
+            return None
+        return (self.teaser_start_s, self.teaser_end_s)
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Clip:
+        flash = row["flash_forward"]
         return cls(
             id=row["id"],
             job_id=row["job_id"],
@@ -163,7 +196,25 @@ class Clip:
             status=row["status"],
             user_trimmed=bool(row["user_trimmed"]),
             created_at=row["created_at"],
+            hook_options=_json_list(row["hook_options"]),
+            hook_text=row["hook_text"] or "",
+            description=row["description"] or "",
+            hashtags=_json_list(row["hashtags"]),
+            teaser_start_s=row["teaser_start_s"],
+            teaser_end_s=row["teaser_end_s"],
+            flash_forward=None if flash is None else bool(flash),
+            variant_of=row["variant_of"],
+            motion_seed=row["motion_seed"] or 0,
         )
+
+
+def _json_list(raw: str | None) -> list[str]:
+    """A JSON list of strings from a TEXT column; anything unreadable is empty."""
+    try:
+        value = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
 
 
 @dataclass

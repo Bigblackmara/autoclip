@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import {
   api,
+  type CaptionLanguage,
   type Layout,
   type Motion,
   type Pace,
@@ -334,13 +335,30 @@ export function Settings() {
             min={15}
             onCommit={(value) => patch({ export: { fps: value } })}
           />
+          <Select
+            label="Caption language"
+            hint="Burned captions, the hook and the post text. Roman and English use the AI provider for scripts the rules can't handle."
+            value={settings.export.caption_language}
+            onChange={(value) => patch({ export: { caption_language: value as CaptionLanguage } })}
+            options={['as_spoken', 'roman', 'english']}
+            labels={{
+              as_spoken: 'As spoken — Hindi as Hinglish',
+              roman: 'Roman — every language in Latin letters',
+              english: 'English — translated, timings kept',
+            }}
+          />
         </div>
 
         <div className="mt-5 flex flex-wrap gap-x-8 gap-y-3">
           <Toggle
-            label="Hook headline (first 3 s, from the clip title)"
+            label="Hook headline (first 3 s, the hook picked in review)"
             checked={settings.export.hook_title}
             onChange={(checked) => patch({ export: { hook_title: checked } })}
+          />
+          <Toggle
+            label="Flash-forward opening by default (best line first)"
+            checked={settings.export.flash_forward}
+            onChange={(checked) => patch({ export: { flash_forward: checked } })}
           />
           <Toggle
             label="Highlight key words in captions"

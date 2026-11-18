@@ -61,12 +61,59 @@ class ClipCandidate(BaseModel):
     hook: str = ""
     score: int = Field(default=50, ge=0, le=100)
     reason: str = ""
+    #: Up to three on-screen headline options (prompt v3+), best first.
+    hooks: list[str] = Field(default_factory=list)
+    #: The punchiest 1-3 s line for a flash-forward opening, as word indices.
+    #: None (or -1 from the model) = no line works as a tease.
+    teaser_start_word_index: int | None = None
+    teaser_end_word_index: int | None = None
+    #: Post text (prompt v3+).
+    description: str = ""
+    hashtags: list[str] = Field(default_factory=list)
 
-    @field_validator("title", "hook", "reason", mode="before")
+    @field_validator("title", "hook", "reason", "description", mode="before")
     @classmethod
     def _coerce_to_string(cls, value: Any) -> str:
         # Models occasionally return null or a number where text was asked for.
         return "" if value is None else str(value)
+
+    @field_validator("hooks", mode="before")
+    @classmethod
+    def _coerce_hooks(cls, value: Any) -> list[str]:
+        """Up to three distinct, non-empty headlines; a bare string is one option."""
+        if value is None:
+            return []
+        items = [value] if isinstance(value, str) else value
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for item in items:
+            text = " ".join(str(item).split()).strip().strip('"').strip()[:80]
+            if text and text.lower() not in {o.lower() for o in out}:
+                out.append(text)
+        return out[:3]
+
+    @field_validator("hashtags", mode="before")
+    @classmethod
+    def _coerce_hashtags(cls, value: Any) -> list[str]:
+        """``#tag`` strings, deduplicated; accepts a list or one space/comma separated string."""
+        if value is None:
+            return []
+        items = re.split(r"[\s,]+", value) if isinstance(value, str) else value
+        if not isinstance(items, list):
+            return []
+        return normalise_hashtags(str(item) for item in items)
+
+    @field_validator("teaser_start_word_index", "teaser_end_word_index", mode="before")
+    @classmethod
+    def _coerce_teaser(cls, value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
 
     @field_validator("score", mode="before")
     @classmethod
@@ -81,6 +128,19 @@ class ClipCandidate(BaseModel):
         if 0.0 < number <= 1.0:
             number *= 100
         return max(0, min(100, round(number)))
+
+
+def normalise_hashtags(items: Any, *, limit: int = 12) -> list[str]:
+    """Clean hashtags: ``#`` prefix, no spaces or stray punctuation, no duplicates."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        tag = re.sub(r"[^\w]", "", str(item).strip().lstrip("#"), flags=re.UNICODE)
+        if not tag or tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        out.append(f"#{tag}")
+    return out[:limit]
 
 
 class ClipCandidates(BaseModel):
@@ -120,6 +180,9 @@ class DetectionConfig:
     #: iterate on prompts without touching code.
     prompt_version: str = "highlight_v1"
     temperature: float = 0.3
+    #: Extra system-prompt rule on which language and script hooks and post
+    #: text are written in (see :func:`autoclip.pipeline.language.writing_rule`).
+    writing_rule: str = ""
 
 
 @dataclass
@@ -169,6 +232,8 @@ class LLMProvider(ABC):
         error back so the model can correct itself.
         """
         system = load_prompt(config.prompt_version)
+        if config.writing_rule:
+            system = "\n\n".join([system, "## Language", config.writing_rule])
         user = render_window_prompt(window, config)
 
         raw = await self._complete(system, user, config)
@@ -236,9 +301,23 @@ class LLMProvider(ABC):
                 continue
             candidate.start_word_index = start
             candidate.end_word_index = end
+            _clean_teaser(candidate)
             cleaned.append(candidate)
 
         return ClipCandidates(clips=cleaned)
+
+
+def _clean_teaser(candidate: ClipCandidate) -> None:
+    """Drop a tease line that is not a forward span inside the clip."""
+    first, last = candidate.teaser_start_word_index, candidate.teaser_end_word_index
+    if (
+        first is None
+        or last is None
+        or last < first
+        or first < candidate.start_word_index
+        or last > candidate.end_word_index
+    ):
+        candidate.teaser_start_word_index = candidate.teaser_end_word_index = None
 
 
 # --------------------------------------------------------------------------

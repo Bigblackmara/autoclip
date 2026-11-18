@@ -40,6 +40,9 @@ __all__ = [
     "provider_names",
 ]
 
+#: The highlight-detection prompt the pipeline uses (older versions are kept).
+DETECTION_PROMPT = "highlight_v3"
+
 PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
@@ -83,6 +86,7 @@ def build_provider(name: str | None = None, settings: Settings | None = None) ->
 def detection_config(settings: Settings | None = None) -> DetectionConfig:
     """Build a :class:`DetectionConfig` from user settings."""
     from ..config import load
+    from ..pipeline.language import writing_rule
 
     settings = settings if settings is not None else load()
     return DetectionConfig(
@@ -90,4 +94,8 @@ def detection_config(settings: Settings | None = None) -> DetectionConfig:
         max_duration_s=settings.clips.max_duration_s,
         max_clips=settings.clips.max_clips,
         language=settings.whisper.language,
+        # v3 also asks for three hook headlines, a flash-forward line and
+        # post text; it handles sections with and without audience signals.
+        prompt_version=DETECTION_PROMPT,
+        writing_rule=writing_rule(settings.export.caption_language),
     )

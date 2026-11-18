@@ -552,8 +552,6 @@ class PipelineRunner:
                 energy_weight=detection.energy_weight,
                 hints_per_window=detection.hints_per_window if detection.audience_hints else 0,
             )
-            if detection.audience_hints:
-                config.prompt_version = "highlight_v2"
         judge = self._build_judge(provider, config.max_clips)
 
         clips = await highlights.detect(
@@ -653,9 +651,11 @@ class PipelineRunner:
         # Short-form editing: pause cuts land on the silences measured at
         # prepare time; the watermark is resolved (and a text logo drawn) once.
         from . import edit
+        from . import language as caption_language
 
         silences = self._export_silences()
         watermark = edit.resolve_watermark(self.settings.export)
+        language_mode = self.settings.export.caption_language
 
         for index, clip in enumerate(clips):
             self._check_cancelled()
@@ -677,6 +677,20 @@ class PipelineRunner:
                 clip.title or f"clip-{clip.rank}", ratio, rank=clip.rank
             )
             layout = export.resolve_layout(self.settings.export.layout, facecam, ratio)
+            # Caption language: Hinglish / romanised / translated captions,
+            # hook and post text (timings kept; see pipeline/language.py).
+            localised = caption_language.for_export(
+                words,
+                language_mode,
+                language=transcript.language,
+                hook=clip.headline,
+                description=clip.description,
+                provider_name=self.job.provider or self.settings.active_provider,
+                settings=self.settings,
+                cache_dir=self.workspace.root / "caption_language",
+            )
+            if localised.description != clip.description:
+                store.update_clip(clip.id, description=localised.description)
 
             request = export.ExportRequest(
                 source=source_path,
@@ -684,7 +698,7 @@ class PipelineRunner:
                 start_s=clip.start_s,
                 end_s=clip.end_s,
                 crop_path=crop_path,
-                words=words,
+                words=localised.words,
                 style=style,
                 ratio=ratio,
                 has_video=self.source.has_video,
@@ -697,10 +711,14 @@ class PipelineRunner:
                     end_s=clip.end_s,
                     words=words,
                     silences=silences,
-                    title=clip.title or clip.hook,
+                    title=localised.hook,
                     seed=clip.id,
                     allow_motion=self.source.has_video and layout != "split",
                     watermark=watermark,
+                    display_words=localised.words if localised.applied else None,
+                    flash_forward=clip.flash_forward,
+                    teaser=clip.teaser,
+                    motion_seed=clip.motion_seed,
                 ),
             )
 

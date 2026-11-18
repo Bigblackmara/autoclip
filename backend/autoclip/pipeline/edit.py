@@ -9,7 +9,11 @@ same ffmpeg pass as the crop and captions:
   cut that would swallow a word.
 * **Motion** — punch-in zooms at natural pauses, plus a zoom change at every
   jump cut so the jump hides in the picture.
-* **Hook headline** — the clip's title on screen for the first ~3 seconds.
+* **Hook headline** — the chosen hook (else the clip's title) on screen for
+  the first ~3 seconds.
+* **Flash-forward** — optionally, the clip's punchiest 1-3 s line plays
+  first, punched in, then the clip from the start. It is the first keep of
+  the plan, so captions, zooms and the audio follow it automatically.
 * **Key words** — 3-8 important words drawn bigger in an accent colour.
 * **Music** — a user-supplied track (or one picked from a folder), looped,
   faded and ducked under speech.
@@ -26,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import subprocess
 from collections.abc import Sequence
@@ -270,31 +275,56 @@ _SPACING = {"subtle": 4.5, "dynamic": 2.2}
 _CLAUSE_END = re.compile(r"[.!?,;:]$")
 
 
+#: Variant zoom patterns: spacing and depth multipliers by ``seed % 3``.
+_SEED_SPACING = (1.0, 0.8, 1.25)
+_SEED_DEPTH = (1.0, 1.25, 0.75)
+#: Steady punch-in of a variant when Motion is off, by ``seed % 3``.
+_SEED_STATIC = (1.03, 1.05, 1.07)
+
+
+def _seeded(levels: tuple[float, ...], spacing: float, seed: int) -> tuple[list[float], float]:
+    """A variant's zoom pattern: odd seeds start punched in, others change pace and depth."""
+    if seed <= 0:
+        return list(levels), spacing
+    k = seed % 3
+    shift = seed % len(levels)
+    rotated = list(levels[shift:] + levels[:shift])
+    deeper = [round(1.0 + (z - 1.0) * _SEED_DEPTH[k], 3) for z in rotated]
+    return deeper, spacing * _SEED_SPACING[k]
+
+
 def plan_zooms(
     words: Sequence[Word],
     duration: float,
     motion: str,
     jump_cuts: Sequence[float] = (),
+    seed: int = 0,
 ) -> list[Zoom]:
     """Step zooms like a short-form editor: normal and closer framing alternate.
 
     ``words`` and ``jump_cuts`` are on the output timeline. Subtle zooms every
     ~4.5 s at natural pauses, dynamic every ~2.2 s with two depths. Every jump
     cut always gets a zoom change (also with motion "off"), which hides the jump.
+
+    ``seed`` > 0 gives a variant its own pattern (different spacing, depth and
+    starting framing) so a re-post of the same moment is not frame-identical;
+    with motion "off" a variant gets a steady slight punch-in instead.
     """
     if duration < 4.0:
         return []
     cuts = [t for t in jump_cuts if 0.3 < t < duration - 0.3]
     if motion not in _LEVELS:
+        base = _SEED_STATIC[seed % 3] if seed > 0 else 1.0
         if not cuts:
-            return []
-        out = [Zoom(0.0, 1.0)]
+            return [Zoom(0.0, base)] if seed > 0 else []
+        phase = seed % 2
+        out = [Zoom(0.0, base)]
         for i, t in enumerate(sorted(cuts)):
-            out.append(Zoom(round(t, 3), CUT_ZOOM if i % 2 == 0 else 1.0))
+            stepped = (i + phase) % 2 == 0
+            out.append(Zoom(round(t, 3), round(base * CUT_ZOOM, 3) if stepped else base))
         return out
 
-    levels = _LEVELS[motion]
-    spacing = _SPACING[motion]
+    levels, spacing = _seeded(_LEVELS[motion], _SPACING[motion], seed)
     forced = set(cuts)
     events = list(cuts)
     last = float("-inf")
@@ -590,6 +620,136 @@ HOOK_SECONDS = 3.0
 HOOK_MAX_CHARS = 80
 
 
+# --------------------------------------------------------------------------
+# Flash-forward (cold open)
+# --------------------------------------------------------------------------
+
+#: A tease line lasts this long (seconds of source).
+TEASER_MIN_S = 0.8
+TEASER_MAX_S = 3.6
+#: It must start at least this far into the clip: the opening line itself
+#: would just play twice in a row.
+TEASER_LEAD_S = 2.5
+#: Punch-in over the tease, so it reads as a flash-forward, not a stutter.
+TEASER_ZOOM = 1.16
+#: Clips shorter than this get no flash-forward.
+TEASER_MIN_CLIP_S = 6.0
+_CLAUSE = re.compile(r"[,;:\u2014\u2013]$")
+
+
+def fit_teaser(
+    span: tuple[float, float], duration: float, silences: Sequence[tuple[float, float]] = ()
+) -> Keep | None:
+    """Check and tidy a tease line (clip-relative) against the clip.
+
+    It must sit inside the clip but not at its very start, last 0.8-3.6 s and,
+    when a measured pause follows it, end in that pause so no word is clipped.
+    """
+    start, end = span
+    s = max(0.0, start - 0.1)
+    if s < TEASER_LEAD_S or s > duration - TEASER_MIN_S or end <= start:
+        return None
+    pause = next(
+        (a for a, _ in sorted(silences) if s + TEASER_MIN_S <= a <= s + 3.5 and a >= end - 0.6),
+        None,
+    )
+    e = min(duration, pause + 0.1) if pause is not None else min(end + 0.15, duration)
+    if not (TEASER_MIN_S <= e - s <= TEASER_MAX_S):
+        return None
+    return Keep(round(s, 3), round(e, 3))
+
+
+def _phrases(words: Sequence[Word]) -> list[tuple[int, int, bool]]:
+    """(first, last, ends_sentence) runs, split at punctuation and pauses."""
+    out: list[tuple[int, int, bool]] = []
+    first = 0
+    for index, word in enumerate(words):
+        nxt = words[index + 1] if index + 1 < len(words) else None
+        sentence = word.ends_sentence
+        if (
+            nxt is None
+            or sentence
+            or _CLAUSE.search(word.text.strip())
+            or nxt.start - word.end >= 0.3
+        ):
+            out.append((first, index, sentence or nxt is None))
+            first = index + 1
+    return out
+
+
+def _word_weight(word: Word, keywords: Sequence[str]) -> float:
+    bare = _key(word.text)
+    if not bare or bare in STOPWORDS or FILLER.match(bare):
+        return 0.0
+    if any(ch.isdigit() for ch in bare) or "$" in bare or "%" in bare:
+        return 6.0
+    weight = 4.0 if keyword_of(word.text, keywords) else 0.0
+    if len(bare) >= 5:
+        weight += 2.0
+    elif len(bare) >= 4:
+        weight += 1.0
+    return weight
+
+
+def pick_teaser(
+    words: Sequence[Word],
+    duration: float,
+    silences: Sequence[tuple[float, float]] = (),
+    keywords: Sequence[str] = (),
+) -> Keep | None:
+    """The best 1-3 s line for a flash-forward when the model flagged none.
+
+    ``words`` are clip-relative. Candidates are runs of whole phrases inside
+    one sentence; each is scored on what it says (numbers, key words, long
+    content words, an exclamation or question) per square-root word, with a
+    bonus for the second half, where punchlines live. The best one that
+    :func:`fit_teaser` accepts wins.
+    """
+    if duration < TEASER_MIN_CLIP_S or not words:
+        return None
+    keywords = list(keywords) or pick_keywords(words)
+    longest = TEASER_MAX_S - 0.2
+    spans: set[tuple[int, int]] = set()
+    phrases = _phrases(words)
+    for i, (first, _, _) in enumerate(phrases):
+        for j in range(i, len(phrases)):
+            last = phrases[j][1]
+            if words[last].end - words[first].start > longest:
+                break
+            spans.add((first, last))
+            if phrases[j][2]:
+                break  # never run on into the next sentence
+    # A sentence too long to flash whole still ends on its payoff: its last
+    # 1-3 seconds are a candidate too.
+    first = 0
+    for index, word in enumerate(words):
+        if word.ends_sentence or index == len(words) - 1:
+            head = first
+            while head < index and word.end - words[head].start > longest:
+                head += 1
+            spans.add((head, index))
+            first = index + 1
+
+    candidates: list[tuple[float, float, float]] = []
+    for first, last in spans:
+        start, end = words[first].start, words[last].end
+        if end - start < TEASER_MIN_S or start < TEASER_LEAD_S:
+            continue
+        run = words[first : last + 1]
+        score = sum(_word_weight(w, keywords) for w in run) / max(1, len(run)) ** 0.5
+        if run[-1].text.strip().endswith(("!", "?")):
+            score += 2.0
+        if start >= duration / 2:
+            score += 1.5
+        if score > 0:
+            candidates.append((score, start, end))
+    for _, start, end in sorted(candidates, key=lambda c: (-c[0], c[1])):
+        fitted = fit_teaser((start, end), duration, silences)
+        if fitted is not None:
+            return fitted
+    return None
+
+
 def hook_top_px(out_w: int, out_h: int, *, split: bool, watermark: Watermark | None) -> int:
     """Top of the hook headline: below the app's top UI, and below a top-corner logo."""
     top = round(out_h * ((0.12 if split else 0.156) if out_h > out_w else 0.06))
@@ -697,6 +857,11 @@ class EditPlan:
     hook_text: str = ""
     hook_s: float = HOOK_SECONDS
     keywords: list[str] = field(default_factory=list)
+    #: The flash-forward line (clip-relative source span) played first, or
+    #: None. When set it is also ``keeps[0]``.
+    teaser: Keep | None = None
+    #: Output time the hook headline appears (after the flash-forward).
+    hook_start_s: float = 0.0
     watermark: Watermark | None = None
     music: Path | None = None
     #: Linear gain applied to the music before mixing.
@@ -718,8 +883,11 @@ class EditPlan:
     def summary(self) -> list[str]:
         """Edits actually applied (for logs)."""
         out: list[str] = []
-        if self.keeps and len(self.keeps) > 1:
-            out.append(f"{len(self.keeps) - 1} pause cuts")
+        if self.teaser is not None:
+            out.append("flash-forward")
+        cuts = len(self.keeps or []) - 1 - (1 if self.teaser is not None else 0)
+        if cuts > 0:
+            out.append(f"{cuts} pause cuts")
         if self.has_motion:
             out.append("zooms")
         if self.hook_text:
@@ -744,33 +912,87 @@ def plan_for_clip(
     seed: str = "",
     allow_motion: bool = True,
     watermark: Watermark | None = None,
+    display_words: Sequence[Word] | None = None,
+    flash_forward: bool | None = None,
+    teaser: tuple[float, float] | None = None,
+    motion_seed: int = 0,
 ) -> EditPlan:
     """Build the edit plan for one clip from the export settings.
 
     ``words`` and ``silences`` are in absolute (source) time. ``allow_motion``
     is False for layouts zooms would break (the split facecam stack, audio-only).
+    ``title`` is the hook headline (the clip's chosen hook, else its title).
+
+    ``display_words`` are the caption words when they differ from the spoken
+    ones (a translated caption language): key words are picked from them,
+    while pause cuts keep using the measured ``words``.
+
+    ``flash_forward`` (None = ``settings.flash_forward``) opens on a tease
+    line: ``teaser`` (absolute, as flagged by the model) when it fits, else the
+    best line :func:`pick_teaser` finds. The tease becomes the first keep, so
+    the captions, the audio and the zooms (shifted by its length, with a
+    punch-in over it) all follow it. ``motion_seed`` picks a variant's zoom
+    pattern.
     """
     duration = max(0.0, end_s - start_s)
-    rel_words = [
-        Word(text=w.text, start=w.start - start_s, end=w.end - start_s, speaker=w.speaker)
-        for w in words
-    ]
+
+    def relative(items: Sequence[Word]) -> list[Word]:
+        return [
+            Word(text=w.text, start=w.start - start_s, end=w.end - start_s, speaker=w.speaker)
+            for w in items
+        ]
+
+    rel_words = relative(words)
+    rel_display = relative(display_words) if display_words is not None else rel_words
     fps = settings.fps
+    clip_silences = silences_in(silences, start_s, end_s)
     keeps: list[Keep] | None = None
     if settings.pace != "off":
-        clip_silences = silences_in(silences, start_s, end_s)
         planned = plan_pace(duration, clip_silences, rel_words, settings.pace)
         if len(planned) > 1 or (planned and planned[0].duration < duration - 1e-3):
             keeps = snap_keeps(planned, duration, fps)
 
-    kept = keeps or [Keep(0.0, duration)]
-    out_words = retime_words(rel_words, kept)
-    out_duration = output_duration(kept)
+    main = keeps or [Keep(0.0, duration)]
+    out_words = retime_words(rel_display, main)
+    out_duration = output_duration(main)
+    keywords = pick_keywords(out_words) if settings.keyword_highlight else []
+
+    teaser_keep: Keep | None = None
+    wants_teaser = settings.flash_forward if flash_forward is None else flash_forward
+    if wants_teaser and duration >= TEASER_MIN_CLIP_S:
+        if teaser is not None:
+            teaser_keep = fit_teaser(
+                (teaser[0] - start_s, teaser[1] - start_s), duration, clip_silences
+            )
+        if teaser_keep is None:
+            teaser_keep = pick_teaser(rel_words, duration, clip_silences, keywords)
+        if teaser_keep is not None:
+            # On the frame grid, so the tease and the story join without the
+            # sound slipping against the picture; widened, never narrowed, so
+            # the line's last word is not clipped.
+            a = math.floor(teaser_keep.start * fps + 1e-6) / fps
+            b = min(math.ceil(teaser_keep.end * fps - 1e-6), int(duration * fps + 1e-6)) / fps
+            teaser_keep = Keep(round(a, 4), round(b, 4)) if b - a >= MIN_KEEP_S else None
+
     zooms: list[Zoom] = []
     intro = False
     if allow_motion:
-        zooms = plan_zooms(out_words, out_duration, settings.motion, cut_times(kept))
-        intro = settings.motion == "dynamic" and out_duration >= 4.0
+        zooms = plan_zooms(out_words, out_duration, settings.motion, cut_times(main), motion_seed)
+        intro = settings.motion == "dynamic" and out_duration >= 4.0 and teaser_keep is None
+
+    hook_start = 0.0
+    if teaser_keep is not None:
+        lead = teaser_keep.duration
+        hook_start = round(lead, 4)
+        if keeps is None:
+            # An uncut clip still needs a frame-exact second piece to join to.
+            main = snap_keeps(main, duration, fps)
+        keeps = [teaser_keep, *main]
+        if allow_motion:
+            shifted = [Zoom(round(z.t + lead, 3), z.z) for z in zooms]
+            if not shifted or shifted[0].t > lead + 1e-6:
+                shifted.insert(0, Zoom(round(lead, 3), 1.0))
+            zooms = [Zoom(0.0, TEASER_ZOOM), *shifted]
 
     music = resolve_music(settings.music_path, seed) if settings.music_enabled else None
     return EditPlan(
@@ -778,7 +1000,9 @@ def plan_for_clip(
         zooms=zooms,
         intro_zoom=intro,
         hook_text=hook_text(title) if settings.hook_title else "",
-        keywords=pick_keywords(out_words) if settings.keyword_highlight else [],
+        keywords=keywords,
+        teaser=teaser_keep,
+        hook_start_s=hook_start,
         watermark=watermark if watermark is not None else resolve_watermark(settings),
         music=music,
         music_volume=settings.music_volume / 100.0,

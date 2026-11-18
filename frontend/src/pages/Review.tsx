@@ -8,12 +8,14 @@ import {
   LAYOUTS,
   type CaptionStyle,
   type Clip,
+  type ClipPatch,
   type CropPath,
   type Job,
   type Layout,
   type Word,
 } from '../api'
 import { CaptionEditor } from '../components/CaptionEditor'
+import { ClipTextEditor } from '../components/ClipTextEditor'
 import { ClipPlayer } from '../components/ClipPlayer'
 import { ErrorNote } from '../components/ErrorNote'
 import { TrimBar } from '../components/TrimBar'
@@ -34,6 +36,7 @@ export function Review() {
   // Per-clip layout picked here for the next export; unset means the job's.
   const [layouts, setLayouts] = useState<Record<string, Layout>>({})
   const [exportingKept, setExportingKept] = useState(false)
+  const [makingVariant, setMakingVariant] = useState<string | null>(null)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
@@ -127,6 +130,33 @@ export function Review() {
       setError(err as Error)
     } finally {
       setSavingWords(false)
+    }
+  }
+
+  const saveText = async (clip: Clip, patch: ClipPatch) => {
+    try {
+      patchClip(await api.patchClip(clip.id, patch))
+    } catch (err) {
+      setError(err as Error)
+    }
+  }
+
+  const makeVariant = async (clip: Clip) => {
+    // One at a time: each variant is a full render.
+    if (makingVariant || !jobId) return
+    setMakingVariant(clip.id)
+    setError(null)
+    try {
+      const variant = await api.makeVariant(clip.id, { layout: layouts[clip.id] })
+      setClips(await api.listClips(jobId))
+      setSelectedId(variant.id)
+    } catch (err) {
+      setError(err as Error)
+      // The variant row exists even when its render failed; show it so the
+      // export can be retried from it.
+      api.listClips(jobId).then(setClips, () => undefined)
+    } finally {
+      setMakingVariant(null)
     }
   }
 
@@ -295,6 +325,8 @@ export function Review() {
                   )}
                 </div>
 
+                <ClipTextEditor clip={selected} onSave={(patch) => saveText(selected, patch)} />
+
                 <CaptionEditor
                   words={words}
                   onChange={(next) => {
@@ -386,6 +418,14 @@ export function Review() {
                   >
                     {exporting.has(selected.id) ? 'Rendering…' : 'Export this clip'}
                   </button>
+                  <button
+                    onClick={() => makeVariant(selected)}
+                    disabled={makingVariant !== null}
+                    className="btn btn-ghost mt-2 w-full"
+                    title="Same moment with the next caption style, zoom pattern and hook, so it can be posted again"
+                  >
+                    {makingVariant === selected.id ? 'Rendering variant…' : 'Make variant'}
+                  </button>
 
                   {selected.exports.length > 0 && (
                     <ul className="mt-4 space-y-2">
@@ -472,6 +512,7 @@ function ClipRow({
         <div className="mt-1 flex items-baseline gap-3">
           <span className="numeric text-xs text-ink-500">{formatDuration(clip.duration_s)}</span>
           {clip.user_trimmed && <span className="text-xs text-ink-600">trimmed</span>}
+          {clip.variant_of && <span className="text-xs text-ink-500">variant</span>}
           {clip.exports.length > 0 && (
             <span className="text-xs text-signal-good">exported</span>
           )}

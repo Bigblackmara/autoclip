@@ -648,6 +648,7 @@ def export_clip(
             keywords=edit.keywords if edit is not None else (),
             hook_text=hook,
             hook_s=edit.hook_s if edit is not None else 3.0,
+            hook_start_s=edit.hook_start_s if edit is not None else 0.0,
             hook_top_px=(
                 edit_module.hook_top_px(
                     out_w, out_h, split=request.is_split, watermark=edit.watermark

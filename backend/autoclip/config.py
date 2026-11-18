@@ -161,6 +161,15 @@ class ExportSettings(BaseModel):
     #: Measure loudness first and normalise linearly (lands on the target
     #: rather than near it). Off falls back to one-pass dynamic loudnorm.
     two_pass_loudnorm: bool = True
+    #: Flash-forward opening: play the clip's punchiest 1-3 s line first
+    #: (punched in), then the clip from the start. A clip's own toggle in
+    #: the review page overrides this default.
+    flash_forward: bool = False
+    #: Language of burned captions, the hook headline and the post text.
+    #: "as_spoken" keeps each language's own script except Hindi, which is
+    #: written in Latin letters (Hinglish); "roman" writes every language in
+    #: Latin letters; "english" translates (an LLM pass, timings kept).
+    caption_language: Literal["as_spoken", "roman", "english"] = "as_spoken"
 
 
 class Settings(BaseModel):

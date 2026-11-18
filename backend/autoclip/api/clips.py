@@ -1,10 +1,11 @@
-"""Clip review, editing, preview media, and export."""
+"""Clip review, editing, preview media, variants and export."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -13,10 +14,11 @@ from fastapi.responses import FileResponse
 from .. import paths
 from ..config import load as load_settings
 from ..db import store
-from ..db.models import Export, new_id
+from ..db.models import Clip, ClipEdit, Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import edit as edit_module
 from ..pipeline import export as export_module
+from ..pipeline import language as language_module
 from ..pipeline.prepare import Silence
 from ..pipeline.reframe.croppath import CropPath, centre_crop
 from ..pipeline.runner import (
@@ -26,6 +28,7 @@ from ..pipeline.runner import (
     wants_facecam,
 )
 from ..pipeline.transcript import Transcript, Word
+from ..providers.base import normalise_hashtags
 from .schemas import (
     CaptionPatchIn,
     CaptionStyleOut,
@@ -33,6 +36,7 @@ from .schemas import (
     ClipPatchIn,
     ExportOut,
     ExportRequestIn,
+    VariantIn,
     WordOut,
 )
 
@@ -60,7 +64,17 @@ def _job_layout(job_id: str) -> str:
     return (settings_for_job(job).export if job else load_settings().export).layout
 
 
-def _clip_out(clip, defaults: tuple[str, str] | None = None, layout: str | None = None) -> ClipOut:
+def _flash_forward_default() -> bool:
+    """The export setting a clip without its own flash-forward toggle follows."""
+    return load_settings().export.flash_forward
+
+
+def _clip_out(
+    clip,
+    defaults: tuple[str, str] | None = None,
+    layout: str | None = None,
+    flash_default: bool | None = None,
+) -> ClipOut:
     edit = store.get_clip_edit(clip.id)
     exports = store.list_exports(clip.id)
     style, ratio = defaults or _job_export_defaults(clip.job_id)
@@ -71,6 +85,9 @@ def _clip_out(clip, defaults: tuple[str, str] | None = None, layout: str | None 
         default_style=style,
         default_ratio=ratio,
         default_layout=layout or _job_layout(clip.job_id),
+        flash_forward_default=(
+            flash_default if flash_default is not None else _flash_forward_default()
+        ),
     )
 
 
@@ -81,7 +98,8 @@ async def list_clips_for_job(job_id: str) -> list[ClipOut]:
     clips = await asyncio.to_thread(store.list_clips, job_id)
     defaults = await asyncio.to_thread(_job_export_defaults, job_id)
     layout = await asyncio.to_thread(_job_layout, job_id)
-    return [await asyncio.to_thread(_clip_out, clip, defaults, layout) for clip in clips]
+    flash = await asyncio.to_thread(_flash_forward_default)
+    return [await asyncio.to_thread(_clip_out, clip, defaults, layout, flash) for clip in clips]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)
@@ -136,10 +154,11 @@ async def clip_crop_path(clip_id: str) -> dict:
 
 @router.patch("/clips/{clip_id}", response_model=ClipOut)
 async def patch_clip(clip_id: str, payload: ClipPatchIn) -> ClipOut:
-    """Trim, retitle, or keep/discard a clip.
+    """Trim, retitle, keep/discard, pick a hook, edit post text, toggle flash-forward.
 
     A trim re-derives the word range from the new times, so captions stay in
     step with the boundaries without the client having to compute indices.
+    The chosen hook may be one of the clip's options or free text.
     """
     clip = await asyncio.to_thread(store.get_clip, clip_id)
     if clip is None:
@@ -168,6 +187,12 @@ async def patch_clip(clip_id: str, payload: ClipPatchIn) -> ClipOut:
         title=payload.title,
         status=payload.status,
         user_trimmed=True if trimmed else None,
+        hook_text=" ".join(payload.hook_text.split()) if payload.hook_text is not None else None,
+        description=payload.description.strip() if payload.description is not None else None,
+        hashtags=normalise_hashtags(payload.hashtags) if payload.hashtags is not None else None,
+        flash_forward=(
+            payload.flash_forward if "flash_forward" in payload.model_fields_set else store.UNSET
+        ),
     )
 
     updated = await asyncio.to_thread(store.get_clip, clip_id)
@@ -188,7 +213,6 @@ async def patch_captions(clip_id: str, payload: CaptionPatchIn) -> ClipOut:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     existing = await asyncio.to_thread(store.get_clip_edit, clip_id)
-    from ..db.models import ClipEdit
 
     # The first edit of a clip must keep whatever the user didn't change at
     # the job's values; falling back to "bold_pop"/"9:16" meant picking a
@@ -216,14 +240,141 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     clip = await asyncio.to_thread(store.get_clip, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="Clip not found.")
+    record = await _render(
+        clip,
+        ratio=payload.ratio,
+        style_key=payload.style,
+        layout_setting=payload.layout,
+        write_srt=payload.write_srt,
+    )
+    return ExportOut.of(record)
 
+
+@router.post("/clips/{clip_id}/variant", response_model=ClipOut, status_code=201)
+async def make_variant(clip_id: str, payload: VariantIn | None = None) -> ClipOut:
+    """A new clip for the same moment that can be posted again without being a duplicate.
+
+    The variant takes the next caption style (cycling through the presets),
+    the next zoom pattern (``motion_seed``) and the next hook option, keeps
+    the original's trim, caption edits, post text and flash-forward choice,
+    and is rendered straight away unless ``export`` is false.
+    """
+    payload = payload or VariantIn()
+    parent = await asyncio.to_thread(store.get_clip, clip_id)
+    if parent is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    variant = await asyncio.to_thread(_create_variant, parent)
+    if payload.export:
+        edit = await asyncio.to_thread(store.get_clip_edit, variant.id)
+        default_style, default_ratio = await asyncio.to_thread(_job_export_defaults, variant.job_id)
+        await _render(
+            variant,
+            ratio=payload.ratio or (edit.ratio if edit else default_ratio),
+            style_key=edit.caption_style if edit else default_style,
+            layout_setting=payload.layout,
+            write_srt=False,
+        )
+    updated = await asyncio.to_thread(store.get_clip, variant.id)
+    return await asyncio.to_thread(_clip_out, updated)
+
+
+def next_style(current: str) -> str:
+    """The preset after ``current`` in the preset order (wrapping round)."""
+    keys = list(captions_module.PRESETS)
+    if current not in keys:
+        return keys[0]
+    return keys[(keys.index(current) + 1) % len(keys)]
+
+
+def next_hook(clip: Clip) -> str:
+    """The hook option after the one ``clip`` shows; its own headline when there are none."""
+    options = [o for o in clip.hook_options if o.strip()]
+    if not options:
+        return clip.hook_text
+    current = clip.headline
+    if current in options:
+        return options[(options.index(current) + 1) % len(options)]
+    return options[0]
+
+
+def _create_variant(parent: Clip) -> Clip:
+    """Insert the variant row (plus its caption edits and cached framing)."""
+    root_id = parent.variant_of or parent.id
+    root = store.get_clip(root_id) or parent
+    family = [
+        c for c in store.list_clips(parent.job_id) if c.id == root_id or c.variant_of == root_id
+    ]
+    number = sum(1 for c in family if c.variant_of == root_id) + 1
+    seed = max((c.motion_seed for c in family), default=0) + 1
+
+    edit = store.get_clip_edit(parent.id)
+    default_style, default_ratio = _job_export_defaults(parent.job_id)
+    style = next_style(edit.caption_style if edit else default_style)
+
+    variant = Clip(
+        id=new_id(),
+        job_id=parent.job_id,
+        rank=parent.rank,
+        start_s=parent.start_s,
+        end_s=parent.end_s,
+        start_word=parent.start_word,
+        end_word=parent.end_word,
+        title=f"{root.title or f'Clip {root.rank}'} (variant {number})",
+        hook=parent.hook,
+        score=parent.score,
+        reason=parent.reason,
+        status="kept",
+        user_trimmed=parent.user_trimmed,
+        hook_options=list(parent.hook_options),
+        hook_text=next_hook(parent),
+        description=parent.description,
+        hashtags=list(parent.hashtags),
+        teaser_start_s=parent.teaser_start_s,
+        teaser_end_s=parent.teaser_end_s,
+        flash_forward=parent.flash_forward,
+        variant_of=root_id,
+        motion_seed=seed,
+    )
+    store.create_clip(variant)
+    store.upsert_clip_edit(
+        ClipEdit(
+            clip_id=variant.id,
+            edited_words=edit.edited_words if edit else None,
+            caption_style=style,
+            ratio=edit.ratio if edit else default_ratio,
+        )
+    )
+    # The same span, so the same framing: without these the variant would be
+    # re-framed from scratch (or fall back to a centre crop).
+    workspace = JobWorkspace(parent.job_id)
+    for cached in (workspace.crop_path, workspace.facecam):
+        source_file, target_file = cached(parent.id), cached(variant.id)
+        if source_file.exists():
+            try:
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_file, target_file)
+            except OSError:
+                log.warning("Could not copy %s for variant %s.", source_file.name, variant.id)
+    return variant
+
+
+async def _render(
+    clip: Clip,
+    *,
+    ratio: str,
+    style_key: str,
+    layout_setting: str | None,
+    write_srt: bool,
+) -> Export:
+    """Render one clip with the current export settings and record the file."""
+    clip_id = clip.id
     job = await asyncio.to_thread(store.get_job, clip.job_id)
     source = await asyncio.to_thread(store.get_source, job.source_id) if job else None
     if job is None or source is None:
         raise HTTPException(status_code=404, detail="The clip's source is missing.")
 
     try:
-        style = captions_module.get_style(payload.style)
+        style = captions_module.get_style(style_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -233,14 +384,14 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     ]
 
     settings = load_settings()
-    settings.export.write_srt = payload.write_srt
+    settings.export.write_srt = write_srt
 
     workspace = JobWorkspace(clip.job_id)
-    crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, payload.ratio)
+    crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, ratio)
 
-    layout_setting = payload.layout or await asyncio.to_thread(_job_layout, clip.job_id)
+    layout_setting = layout_setting or await asyncio.to_thread(_job_layout, clip.job_id)
     facecam = None
-    if wants_facecam(layout_setting, payload.ratio, source.has_video):
+    if wants_facecam(layout_setting, ratio, source.has_video):
         # Cached from the job's reframe stage when it ran with a split-capable
         # layout; detected now (and cached) otherwise.
         facecam = await asyncio.to_thread(facecam_for_clip, workspace, clip, source)
@@ -248,14 +399,28 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     destination = (
         paths.exports_dir()
         / clip.job_id
-        / export_module.output_filename(
-            clip.title or f"clip-{clip.rank}", payload.ratio, rank=clip.rank
-        )
+        / export_module.output_filename(clip.title or f"clip-{clip.rank}", ratio, rank=clip.rank)
     )
 
-    layout = export_module.resolve_layout(layout_setting, facecam, payload.ratio)
+    layout = export_module.resolve_layout(layout_setting, facecam, ratio)
+    # Caption language (Hinglish / romanised / translated) for the captions,
+    # the hook and the post text, as the batch export does.
+    transcript_row = await asyncio.to_thread(store.get_transcript, clip.job_id)
+    localised = await asyncio.to_thread(
+        language_module.for_export,
+        words,
+        settings.export.caption_language,
+        language=transcript_row.language if transcript_row else "",
+        hook=clip.headline,
+        description=clip.description,
+        provider_name=job.provider or settings.active_provider,
+        settings=settings,
+        cache_dir=workspace.root / "caption_language",
+    )
+    if localised.description != clip.description:
+        await asyncio.to_thread(store.update_clip, clip_id, description=localised.description)
     # The same short-form edits as the batch export (pause cuts, zooms, hook,
-    # key words, music, watermark), from the current export settings.
+    # key words, flash-forward, music, watermark), from the current settings.
     plan = await asyncio.to_thread(
         edit_module.plan_for_clip,
         settings.export,
@@ -263,9 +428,13 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         end_s=clip.end_s,
         words=words,
         silences=await asyncio.to_thread(_cached_silences, workspace),
-        title=clip.title or clip.hook,
+        title=localised.hook,
         seed=clip.id,
         allow_motion=source.has_video and layout != "split",
+        display_words=localised.words if localised.applied else None,
+        flash_forward=clip.flash_forward,
+        teaser=clip.teaser,
+        motion_seed=clip.motion_seed,
     )
 
     request = export_module.ExportRequest(
@@ -274,9 +443,9 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         start_s=clip.start_s,
         end_s=clip.end_s,
         crop_path=crop_path,
-        words=words,
+        words=localised.words,
         style=style,
-        ratio=payload.ratio,
+        ratio=ratio,
         has_video=source.has_video,
         layout=layout,
         facecam=facecam,
@@ -298,14 +467,13 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
         id=new_id(),
         clip_id=clip_id,
         path=str(destination),
-        ratio=payload.ratio,
+        ratio=ratio,
         style=style.key,
         size_bytes=destination.stat().st_size,
     )
     await asyncio.to_thread(store.create_export, record)
     await asyncio.to_thread(store.update_clip, clip_id, status="exported")
-
-    return ExportOut.of(record)
+    return record
 
 
 @router.get("/exports/{export_id}/download")

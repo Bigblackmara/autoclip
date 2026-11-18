@@ -345,6 +345,7 @@ def build_ass(
     hook_text: str = "",
     hook_s: float = 3.0,
     hook_top_px: int | None = None,
+    hook_start_s: float = 0.0,
     duration_s: float | None = None,
 ) -> pysubs2.SSAFile:
     """Build an ASS subtitle file for a clip.
@@ -355,7 +356,8 @@ def build_ass(
     ``keywords`` (normalised, see :func:`edit.pick_keywords`) are drawn in the
     style's emphasis colour and size: at most one per caption line, and each
     key word at most twice per clip. ``hook_text`` adds a headline at the top
-    for the first ``hook_s`` seconds (clip-relative, never past ``duration_s``).
+    for ``hook_s`` seconds from ``hook_start_s`` (clip-relative, never past
+    ``duration_s``); the start moves past a flash-forward opening.
 
     Preconditions:
         words are in chronological order and carry start/end timings.
@@ -394,6 +396,7 @@ def build_ass(
             hook_s=hook_s,
             top_px=hook_top_px,
             duration_s=duration_s,
+            start_s=hook_start_s,
         )
 
     return subs
@@ -416,6 +419,7 @@ def _add_hook(
     hook_s: float,
     top_px: int | None,
     duration_s: float | None,
+    start_s: float = 0.0,
 ) -> None:
     hook = pysubs2.SSAStyle()
     hook.fontname = HOOK_FONT
@@ -433,14 +437,15 @@ def _add_hook(
     hook.marginl = hook.marginr = round(width * 0.1)
     subs.styles[HOOK_STYLE_NAME] = hook
 
-    end = hook_s + 0.2
+    start = max(0.0, start_s)
+    end = start + hook_s + 0.2
     if duration_s is not None:
-        end = min(end, max(1.5, duration_s - 0.2))
+        end = min(end, max(start + 1.5, duration_s - 0.2))
     top = top_px if top_px is not None else round(height * 0.156)
     body = escape_ass_text(text.strip())
     subs.events.append(
         pysubs2.SSAEvent(
-            start=0,
+            start=pysubs2.make_time(s=start),
             end=pysubs2.make_time(s=end),
             style=HOOK_STYLE_NAME,
             layer=1,
@@ -638,6 +643,7 @@ def write_ass(
     hook_text: str = "",
     hook_s: float = 3.0,
     hook_top_px: int | None = None,
+    hook_start_s: float = 0.0,
     duration_s: float | None = None,
 ) -> Path:
     """Render captions to an .ass file and return its path.
@@ -656,6 +662,7 @@ def write_ass(
         hook_text=hook_text,
         hook_s=hook_s,
         hook_top_px=hook_top_px,
+        hook_start_s=hook_start_s,
         duration_s=duration_s,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
