@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { api, formatDuration } from '../api'
 import { ErrorNote } from '../components/ErrorNote'
@@ -22,9 +22,13 @@ export function JobProgress() {
   const [cancelling, setCancelling] = useState(false)
   const [retrying, setRetrying] = useState(false)
   const [actionError, setActionError] = useState<Error | null>(null)
+  // Whether the job was already finished when this page opened: then the
+  // page is a destination (e.g. to pick parts), not a progress screen.
+  const doneOnArrival = useRef<boolean | null>(null)
+  if (job && doneOnArrival.current === null) doneOnArrival.current = job.status === 'done'
 
   useEffect(() => {
-    if (job?.status === 'done') {
+    if (job?.status === 'done' && !doneOnArrival.current) {
       // A short hold so the completed state is legible rather than a flash.
       const timer = setTimeout(() => navigate(`/jobs/${job.id}/clips`), 900)
       return () => clearTimeout(timer)
@@ -96,6 +100,11 @@ export function JobProgress() {
             <button onClick={retry} disabled={retrying} className="btn btn-primary">
               {retrying ? 'Retrying…' : 'Retry'}
             </button>
+          )}
+          {job.status === 'done' && (
+            <Link to={`/jobs/${job.id}/pick`} className="btn btn-ghost">
+              Pick parts
+            </Link>
           )}
           {job.status === 'done' && (
             <button onClick={() => navigate(`/jobs/${job.id}/clips`)} className="btn btn-primary">

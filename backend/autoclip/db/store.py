@@ -270,6 +270,42 @@ def replace_clips(job_id: str, clips: list[Clip]) -> list[Clip]:
     return clips
 
 
+def add_clips(clips: list[Clip]) -> list[Clip]:
+    """Insert clips alongside a job's existing ones (e.g. parts the user picked).
+
+    Unlike :func:`replace_clips` nothing is deleted, so the job's detected
+    clips, their edits and their exports are untouched.
+    """
+    with connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO clips (id, job_id, rank, start_s, end_s, start_word, end_word,
+                               title, hook, score, reason, status, user_trimmed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    c.id,
+                    c.job_id,
+                    c.rank,
+                    c.start_s,
+                    c.end_s,
+                    c.start_word,
+                    c.end_word,
+                    c.title,
+                    c.hook,
+                    c.score,
+                    c.reason,
+                    c.status,
+                    int(c.user_trimmed),
+                    c.created_at,
+                )
+                for c in clips
+            ],
+        )
+    return clips
+
+
 def get_clip(clip_id: str) -> Clip | None:
     with connection() as conn:
         row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()

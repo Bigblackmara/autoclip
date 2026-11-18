@@ -17,10 +17,12 @@ from ..db.models import Export, new_id
 from ..pipeline import captions as captions_module
 from ..pipeline import edit as edit_module
 from ..pipeline import export as export_module
+from ..pipeline import segments as segments_module
 from ..pipeline.prepare import Silence
 from ..pipeline.reframe.croppath import CropPath, centre_crop
 from ..pipeline.runner import (
     JobWorkspace,
+    clip_spans,
     facecam_for_clip,
     settings_for_job,
     wants_facecam,
@@ -109,6 +111,10 @@ async def clip_words(clip_id: str) -> list[WordOut]:
 
     transcript = await asyncio.to_thread(_load_transcript, clip.job_id)
     words = transcript.slice(clip.start_word, clip.end_word)
+    spans = await asyncio.to_thread(clip_spans, JobWorkspace(clip.job_id), clip)
+    if spans:
+        # A joined clip: only the words its parts actually play.
+        words = segments_module.words_in(words, spans)
     return [WordOut(text=w.text, start=w.start, end=w.end, speaker=w.speaker) for w in words]
 
 
@@ -236,7 +242,17 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     settings.export.write_srt = payload.write_srt
 
     workspace = JobWorkspace(clip.job_id)
-    crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, payload.ratio)
+    # A joined clip renders on its own timeline (see pipeline.segments).
+    spans = await asyncio.to_thread(clip_spans, workspace, clip)
+    start_s, end_s = clip.start_s, clip.end_s
+    silences = await asyncio.to_thread(_cached_silences, workspace)
+    if spans:
+        words = segments_module.words_on_timeline(words, spans)
+        start_s, end_s = 0.0, segments_module.total(spans)
+        silences = segments_module.silences_on_timeline(silences, spans)
+    crop_path = await asyncio.to_thread(
+        _crop_path_for, workspace, clip, source, payload.ratio, duration_s=end_s - start_s
+    )
 
     layout_setting = payload.layout or await asyncio.to_thread(_job_layout, clip.job_id)
     facecam = None
@@ -259,20 +275,21 @@ async def export_clip(clip_id: str, payload: ExportRequestIn) -> ExportOut:
     plan = await asyncio.to_thread(
         edit_module.plan_for_clip,
         settings.export,
-        start_s=clip.start_s,
-        end_s=clip.end_s,
+        start_s=start_s,
+        end_s=end_s,
         words=words,
-        silences=await asyncio.to_thread(_cached_silences, workspace),
+        silences=silences,
         title=clip.title or clip.hook,
         seed=clip.id,
-        allow_motion=source.has_video and layout != "split",
+        allow_motion=source.has_video and layout != "split" and not crop_path.has_split,
     )
 
     request = export_module.ExportRequest(
         source=Path(source.path),
         destination=destination,
-        start_s=clip.start_s,
-        end_s=clip.end_s,
+        start_s=start_s,
+        end_s=end_s,
+        spans=segments_module.as_pairs(spans) if spans else None,
         crop_path=crop_path,
         words=words,
         style=style,
@@ -412,7 +429,9 @@ def _crop_path_fits(path: CropPath, duration_s: float, aspect: tuple[int, int]) 
     return True
 
 
-def _crop_path_for(workspace: JobWorkspace, clip, source, ratio: str) -> CropPath:
+def _crop_path_for(
+    workspace: JobWorkspace, clip, source, ratio: str, *, duration_s: float | None = None
+) -> CropPath:
     """Reuse the job's cached crop path, falling back to a centre crop.
 
     A re-export at a different ratio can't reuse a path computed for the
@@ -426,16 +445,18 @@ def _crop_path_for(workspace: JobWorkspace, clip, source, ratio: str) -> CropPat
     (or trimmed into an empty segment) once the duration changed.
     """
     aspect = {"9:16": (9, 16), "1:1": (1, 1), "16:9": (16, 9)}[ratio]
+    # A joined clip's path spans its parts, not its envelope.
+    duration = duration_s if duration_s is not None else clip.end_s - clip.start_s
     cached = workspace.crop_path(clip.id)
     if cached.exists():
         path = CropPath.load(cached)
-        if _crop_path_fits(path, clip.end_s - clip.start_s, aspect):
+        if _crop_path_fits(path, duration, aspect):
             return path
 
     return centre_crop(
         source.width or 1920,
         source.height or 1080,
-        clip.end_s - clip.start_s,
+        duration,
         aspect_w=aspect[0],
         aspect_h=aspect[1],
     )

@@ -491,6 +491,14 @@ function RecentJobs({ jobs }: { jobs: Job[] }) {
               <span className="hidden text-xs text-ink-500 sm:block">{job.provider}</span>
               <StatusTag job={job} />
             </a>
+            {job.status === 'done' && (
+              <a
+                href={`/jobs/${job.id}/pick`}
+                className="-mt-3 block pb-3 text-right text-[0.6875rem] text-ink-500 transition-colors hover:text-sodium-500"
+              >
+                Pick parts on the rewatch graph →
+              </a>
+            )}
           </li>
         ))}
       </ul>

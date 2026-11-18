@@ -131,6 +131,13 @@ class ExportSettings(BaseModel):
     #: "split" asks for the stacked layout whenever a facecam is found; "crop"
     #: always uses the speaker-following crop. Other ratios always crop.
     layout: Literal["auto", "split", "crop"] = "auto"
+    #: How each shot is framed (normal mode; a facecam stack from ``layout``
+    #: takes precedence). "auto" picks per shot: two people too far apart for
+    #: one crop get a top/bottom split, shots with no faces (screen, slides,
+    #: gameplay) are fitted over a blurred copy, the rest follow the speaker.
+    #: "fill" always crops, "split" splits any two-person shot, "fit" fits
+    #: every shot. See ``pipeline.reframe.FRAMINGS``.
+    framing: Literal["auto", "fill", "split", "fit"] = "auto"
 
     # -- short-form editing (normal mode; see pipeline/edit.py) -------------
     #: Cut pauses: "natural" shortens pauses over ~0.6 s, "fast" nearly all,

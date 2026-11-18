@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import {
   api,
+  type Framing,
   type Layout,
   type Motion,
   type Pace,
@@ -258,6 +259,19 @@ export function Settings() {
               auto: 'Auto — facecam + gameplay when a cam is found',
               split: 'Facecam + gameplay',
               crop: 'Crop — follow the speaker',
+            }}
+          />
+          <Select
+            label="Framing"
+            hint="Podcasts: put two far-apart speakers in their own halves. Screen and game footage with no face: fit the whole frame over a blurred copy."
+            value={settings.export.framing}
+            onChange={(value) => patch({ export: { framing: value as Framing } })}
+            options={['auto', 'fill', 'split', 'fit']}
+            labels={{
+              auto: 'Auto — split two speakers, fit screens',
+              fill: 'Fill — always crop',
+              split: 'Split speakers whenever two faces',
+              fit: 'Fit — whole frame, blurred fill',
             }}
           />
           <NumberField
