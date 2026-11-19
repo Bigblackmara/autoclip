@@ -152,6 +152,8 @@ class TestOpenAIRejectedParameters:
 
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         monkeypatch.setattr(OpenAIProvider, "_client", lambda self: client)
+        # Not the real stored numes/Groq keys: those would answer instead.
+        monkeypatch.setattr("autoclip.providers.openai_provider.fast_endpoints", lambda: [])
 
         with pytest.raises(ProviderError, match="rejected the API key"):
             await OpenAIProvider("x", api_key="test").detect_highlights(window, DetectionConfig())

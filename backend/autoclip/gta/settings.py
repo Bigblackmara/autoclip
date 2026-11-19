@@ -48,6 +48,9 @@ class GtaLiveSettings(BaseModel):
     context_s: float = 60.0
     #: The clip must be finished within this long of the moment, seconds.
     turnaround_s: float = 180.0
+    #: Also judge what was SAID every this many seconds, even without a loud
+    #: spike (something important, a reveal, a story worth watching). 0 = off.
+    judge_every_s: float = 180.0
 
 
 #: GTA caption looks -> the pipeline.captions preset each one renders with.
@@ -175,6 +178,10 @@ class GtaSettings(BaseModel):
     #: blurred background and the text bands never move), on top of the
     #: punch-in: ``off`` / ``subtle`` (~every 4.5 s) / ``dynamic`` (~2.2 s).
     motion: str = "subtle"
+    #: "fit" = whole stream frame over a blurred fill; "split" = the streamer's
+    #: webcam across the top, gameplay zoomed to fill the bottom (falls back to
+    #: "fit" when no webcam is found).
+    layout: str = "fit"
 
     #: Loudness target and the QA tolerance around it.
     loudness_lufs: float = -14.0
@@ -220,6 +227,24 @@ class GtaSettings(BaseModel):
     #: clip can override it. Off by default.
     flash_forward: bool = False
     flash_forward_s: float = 2.0
+    #: A static white caption box with black text (the hook) on screen for
+    #: the whole clip, near the bottom just above the platform's bottom bar
+    #: (the subtitles move up to sit above it).
+    static_caption: bool = True
+    #: An AI narrator: a line of context at the start and a question at the
+    #: end, written by the AI and voiced locally (Kokoro), with the stream
+    #: audio ducked under it. Original commentary for YouTube's reused-content
+    #: rule (Partner Program).
+    voiceover: bool = True
+    #: Narrator voice: a Microsoft neural voice (edge-tts, free; e.g.
+    #: en-US-ChristopherNeural, en-US-GuyNeural, en-US-AndrewNeural) or an
+    #: offline Kokoro voice (af_heart, am_michael …).
+    voiceover_voice: str = "en-US-ChristopherNeural"
+    voiceover_speed: float = 1.05
+    #: Stream audio level while the narrator speaks, dB.
+    voiceover_duck_db: float = -11.0
+    #: Also close with a narrator question (clips of 14 s or more).
+    voiceover_outro: bool = True
     #: Language/script of the burned captions, the hook title and the post
     #: text: ``as_spoken`` (Hindi as Hinglish, everything else as spoken),
     #: ``roman`` (Latin letters) or ``english`` (translated by the AI).

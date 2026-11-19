@@ -19,6 +19,7 @@ import {
   PLATFORM_NAME,
   PLATFORM_SHORT,
   gtaApi,
+  type GtaClip,
   slotLabel,
   type GtaPosting,
   type InstagramStatus,
@@ -162,9 +163,228 @@ export function YouTubeTab() {
         onChange={refreshAll}
       />
       {overview && <ScheduleSection overview={overview} onChange={refreshAll} />}
+      {overview && <ScheduledSection overview={overview} />}
+      <ReadySection onChange={loadOverview} />
       {overview && <PlanSection overview={overview} />}
       {overview && <HistorySection overview={overview} onChange={loadOverview} />}
     </div>
+  )
+}
+
+// --------------------------------------------------------------------------
+// Ready to post: every finished clip (VOD or live) as soon as it passes QA
+// --------------------------------------------------------------------------
+
+const ON_YOUTUBE = new Set(['uploading', 'scheduled', 'posted', 'checking'])
+
+/** A Date as the value a datetime-local input wants (local time, minutes). */
+function localInputValue(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function untilText(iso: string | null): string {
+  if (!iso) return ''
+  const ms = new Date(iso).getTime() - Date.now()
+  if (Number.isNaN(ms)) return ''
+  if (ms <= 0) return 'going public now'
+  const m = Math.round(ms / 60000)
+  return m < 60 ? `in ${m} min` : `in ${Math.floor(m / 60)} h ${m % 60} min`
+}
+
+function whenText(iso: string | null): string {
+  return iso ? new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : ''
+}
+
+/** Every post waiting to go public, soonest first, with its exact time. */
+function ScheduledSection({ overview }: { overview: PostingOverview }) {
+  const [, tick] = useState(0)
+  useEffect(() => {
+    const id = window.setInterval(() => tick((n) => n + 1), 30_000)
+    return () => window.clearInterval(id)
+  }, [])
+  const waiting = overview.uploads
+    .filter((u) => u.status === 'scheduled' || u.status === 'uploading')
+    .sort((a, b) => (a.slot_at ?? '').localeCompare(b.slot_at ?? ''))
+  const recent = overview.uploads
+    .filter((u) => u.status === 'posted')
+    .sort((a, b) => (b.slot_at ?? '').localeCompare(a.slot_at ?? ''))
+    .slice(0, 5)
+  return (
+    <section className="rounded-2xl border border-line bg-surface p-5 sm:p-6">
+      <h2 className="text-base font-semibold text-fg">Scheduled ({waiting.length})</h2>
+      {waiting.length === 0 ? (
+        <p className="mt-2 text-sm text-fg-muted">Nothing scheduled.</p>
+      ) : (
+        <ul className="mt-2 divide-y divide-line">
+          {waiting.map((u) => (
+            <li key={u.id} className="flex flex-wrap items-baseline gap-x-4 gap-y-1 py-3 text-sm">
+              <span className="w-44 font-medium text-fg">{whenText(u.slot_at)}</span>
+              <span className="text-xs font-semibold text-accent">{untilText(u.slot_at)}</span>
+              <PlatformTag platform={u.platform} />
+              <span className="min-w-0 flex-1 truncate text-fg">{u.title || u.clip_title}</span>
+              {u.url && (
+                <a href={u.url} target="_blank" rel="noreferrer" className="text-xs text-accent underline">
+                  Open ↗
+                </a>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {recent.length > 0 && (
+        <>
+          <h3 className="mt-4 text-sm font-semibold text-fg">Posted</h3>
+          <ul className="mt-1 divide-y divide-line">
+            {recent.map((u) => (
+              <li key={u.id} className="flex flex-wrap items-baseline gap-x-4 py-2 text-sm">
+                <span className="w-44 text-fg-muted">{whenText(u.slot_at)}</span>
+                <PlatformTag platform={u.platform} />
+                <span className="min-w-0 flex-1 truncate text-fg">{u.title || u.clip_title}</span>
+                {u.url && (
+                  <a href={u.url} target="_blank" rel="noreferrer" className="text-xs text-accent underline">
+                    Open ↗
+                  </a>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  )
+}
+
+function ReadyRow({ clip, onPosted }: { clip: GtaClip; onPosted: () => void }) {
+  const [title, setTitle] = useState(clip.hook_title || '')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const [failed, setFailed] = useState(false)
+  const [when, setWhen] = useState(() => localInputValue(new Date(Date.now() + 60 * 60 * 1000)))
+  const seconds = Math.round(clip.end_s - clip.start_s)
+  const post = async (schedule: boolean) => {
+    setBusy(true)
+    setMessage(schedule ? 'Uploading and scheduling…' : 'Uploading to YouTube…')
+    setFailed(false)
+    try {
+      const at = schedule ? new Date(when).toISOString() : undefined
+      const result = await gtaApi.postNow(clip.id, title.trim(), at)
+      const good = schedule ? result.outcome === 'scheduled' : result.outcome === 'posted'
+      setFailed(!good)
+      setMessage(
+        good && !schedule && result.upload?.url ? `Live: ${result.upload.url}` : result.message,
+      )
+      onPosted()
+    } catch (err) {
+      setFailed(true)
+      setMessage(errorText(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <li className="flex flex-wrap items-start gap-4 py-4">
+      <video
+        src={`/api/gta/clips/${encodeURIComponent(clip.id)}/video`}
+        className="h-40 w-[5.6rem] shrink-0 rounded-lg bg-black object-cover"
+        controls
+        preload="metadata"
+      />
+      <div className="min-w-[14rem] flex-1 space-y-2">
+        <label className="block text-xs font-medium text-fg-muted" htmlFor={`title-${clip.id}`}>
+          YouTube title
+        </label>
+        <input
+          id={`title-${clip.id}`}
+          value={title}
+          maxLength={100}
+          onChange={(e) => setTitle(e.target.value)}
+          className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-fg"
+        />
+        <p className="text-xs text-fg-muted">
+          {seconds} s · {clip.moment_type || 'moment'}
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={busy || !title.trim()}
+            onClick={() => void post(false)}
+            className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50"
+          >
+            {busy ? 'Working…' : 'Post now (public)'}
+          </button>
+          <span className="text-xs text-fg-muted">or</span>
+          <input
+            type="datetime-local"
+            value={when}
+            onChange={(e) => setWhen(e.target.value)}
+            className="rounded-lg border border-line bg-surface px-2 py-1 text-sm text-fg"
+            aria-label="Schedule time"
+          />
+          <button
+            type="button"
+            disabled={busy || !title.trim() || !when}
+            onClick={() => void post(true)}
+            className="rounded-lg border border-line px-3 py-1.5 text-sm font-semibold text-fg disabled:opacity-50"
+          >
+            Schedule
+          </button>
+          {message && (
+            <span className={`text-xs ${failed ? 'text-danger' : 'text-success'} break-all`}>{message}</span>
+          )}
+        </div>
+      </div>
+    </li>
+  )
+}
+
+function ReadySection({ onChange }: { onChange: () => void }) {
+  const [clips, setClips] = useState<GtaClip[]>([])
+  const load = useCallback(() => {
+    gtaApi
+      .clips()
+      .then((all) =>
+        setClips(
+          all.filter(
+            (c) =>
+              c.status === 'ready' &&
+              c.has_video &&
+              c.qa?.passed === true &&
+              !ON_YOUTUBE.has(c.uploads?.youtube?.status ?? ''),
+          ),
+        ),
+      )
+      .catch(() => undefined)
+  }, [])
+  useEffect(() => {
+    load()
+    const id = window.setInterval(load, POLL_MS)
+    return () => window.clearInterval(id)
+  }, [load])
+  return (
+    <section className="rounded-2xl border border-line bg-surface p-5 sm:p-6">
+      <h2 className="text-base font-semibold text-fg">Ready to post ({clips.length})</h2>
+      <p className="mt-1 text-sm text-fg-muted">
+        Every clip appears here the moment it passes QA, live clips included. Edit the title and post it now, or
+        leave it for the schedule.
+      </p>
+      {clips.length === 0 ? (
+        <p className="mt-4 text-sm text-fg-muted">No finished clips waiting.</p>
+      ) : (
+        <ul className="mt-2 divide-y divide-line">
+          {clips.map((c) => (
+            <ReadyRow
+              key={c.id}
+              clip={c}
+              onPosted={() => {
+                load()
+                onChange()
+              }}
+            />
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 
@@ -851,7 +1071,7 @@ function HistorySection({ overview, onChange }: { overview: PostingOverview; onC
                   {statusText(u.platform, u.status)}
                   {u.status === 'failed' && ` (${u.attempts}/${MAX_UPLOAD_ATTEMPTS})`}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-ink-100">{u.clip_title}</span>
+                <span className="min-w-0 flex-1 truncate text-ink-100">{u.title || u.clip_title}</span>
                 {u.url && (
                   <a href={u.url} target="_blank" rel="noreferrer" className="text-xs text-sodium-400 underline">
                     Open on {PLATFORM_NAME[u.platform]} ↗

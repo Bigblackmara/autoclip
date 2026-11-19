@@ -35,7 +35,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -591,17 +591,58 @@ class GtaPoster:
         )
         return row
 
+    async def post_now(
+        self, clip_id: str, title: str = "", publish_at: datetime | None = None
+    ) -> str:
+        """Upload one ready clip to YouTube as public right now (outside the slots).
+
+        ``title`` replaces the clip's hook title when given. Returns the
+        outcome ("posted", "failed", "paused"); raises ValueError when the
+        clip can't be posted (not ready, or already on YouTube).
+        """
+        clip = await asyncio.to_thread(store.get_clip, clip_id)
+        if clip is None or not is_postable(clip):
+            raise ValueError("That clip isn't ready to post (finished and QA passed).")
+        row = await asyncio.to_thread(store.upload_for_clip, clip_id, "youtube")
+        if row is not None and row.status in {"uploading", "scheduled", "posted", "checking"}:
+            raise ValueError("That clip is already on YouTube or being uploaded.")
+        settings = await asyncio.to_thread(load_settings)
+        if publish_at is not None:
+            if publish_at.tzinfo is None:
+                raise ValueError("The schedule time needs a timezone.")
+            if publish_at <= self._clock() + timedelta(minutes=2):
+                raise ValueError("Pick a time at least a few minutes from now.")
+            # Uploaded private now; YouTube makes it public at publish_at.
+            return await self._upload(clip, row, publish_at, settings, title_override=title)
+        return await self._upload(
+            clip, row, self._clock(), settings, title_override=title, public_now=True
+        )
+
     async def _upload(
-        self, clip: GtaClip, row: GtaUpload | None, slot: datetime, settings: GtaSettings
+        self,
+        clip: GtaClip,
+        row: GtaUpload | None,
+        slot: datetime,
+        settings: GtaSettings,
+        *,
+        title_override: str = "",
+        public_now: bool = False,
     ) -> str:
         state = self.states["youtube"]
         key = slot_key(slot)
-        title = post_title(clip)
+        title = (_clean_text(title_override) or post_title(clip))[:100]
         row = await self._claim("youtube", clip, row, key, title)
         state.uploading_clip_id = clip.id
-        state.message = f"Uploading “{title}” for the {key} slot…"
+        state.message = (
+            f"Posting “{title}” now…" if public_now else f"Uploading “{title}” for the {key} slot…"
+        )
         try:
             meta = build_meta(clip, settings, slot)
+            meta = replace(
+                meta,
+                title=title,
+                **({"privacy": "public", "publish_at": None} if public_now else {}),
+            )
             result = await self._uploader(Path(clip.path), meta)
         except asyncio.CancelledError:
             await asyncio.to_thread(
@@ -645,12 +686,16 @@ class GtaPoster:
         await asyncio.to_thread(
             store.update_upload,
             row.id,
-            status="scheduled",
+            status="posted" if public_now else "scheduled",
             video_id=result.media_id,
             url=result.url,
             error=None,
             attempts=row.attempts + 1,
         )
+        if public_now:
+            state.message = f"“{title}” is live on YouTube."
+            log.info("GTA clip %s posted now as %s", clip.id, result.media_id)
+            return "posted"
         state.message = f"Scheduled “{title}” to go public at {key}."
         log.info("GTA clip %s uploaded as %s, public at %s", clip.id, result.media_id, key)
         return "scheduled"

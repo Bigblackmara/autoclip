@@ -16,7 +16,7 @@ Pipeline shape (and why it is two subprocesses at most, never a pipe chain):
 2. **Copy.** One long-lived ffmpeg reads the resolved URL and writes
    ``seg_{index:06d}.ts`` files into the buffer directory with the ``segment``
    muxer (``-f segment``, NOT the HLS muxer — the work order pins this) at
-   ``-segment_time 6 -reset_timestamps 1``, codecs copied. A pipe chain
+   ``-segment_time 6`` (one continuous clock), codecs copied. A pipe chain
    (streamlink | ffmpeg) would tie ffmpeg's lifetime to a third party's
    socket; two decoupled processes mean a reconnect restarts only resolution.
 
@@ -362,20 +362,19 @@ class StreamCapture:
             "-y",
             # A read that blocks this long fails the input instead of
             # freezing ffmpeg (and with it the whole stream) forever.
-            "-rw_timeout",
-            str(int(RW_TIMEOUT_S * 1_000_000)),
-            "-i",
-            stream_url,
+            *_input_args(stream_url),
             "-c",
             "copy",
-            "-map",
-            "0",
+            *_map_args(stream_url),
             "-f",
             "segment",
             "-segment_time",
             str(int(SEGMENT_TIME_S)),
-            "-reset_timestamps",
-            "1",
+            # No -reset_timestamps: segments keep one continuous clock, so a
+            # byte-concatenated window plays back exactly. Resetting every
+            # segment made each join a timestamp jump that ffmpeg "repaired"
+            # per stream, and the audio drifted ~10 ms later per join (measured
+            # +119 ms after 55 s) — the voice delay in live clips.
             "-segment_start_number",
             str(start_number),
             # Real per-segment start/end times (stream copy cuts at
@@ -803,6 +802,25 @@ def _resolve_with_streamlink(url: str) -> str:
     raise CaptureError(f"No playable streams found: {url}", offline=True)
 
 
+#: Tried in order after a "confirm you're not a bot" page: plain IPv4, then
+#: IPv4 with the mobile-web player client (it still passes when the
+#: default web client is challenged on both routes).
+_BOT_CHECK_FALLBACKS: tuple[dict, ...] = (
+    {"source_address": "0.0.0.0"},
+    {"source_address": "0.0.0.0", "extractor_args": {"youtube": {"player_client": ["mweb"]}}},
+)
+
+
+def _is_bot_check(message: str) -> bool:
+    lowered = message.lower()
+    return "not a bot" in lowered or "sign in to confirm" in lowered
+
+
+def _extract(yt_dlp, options: dict, url: str):  # noqa: ANN001 - yt_dlp module
+    with yt_dlp.YoutubeDL(options) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 def _resolve_with_ytdlp(url: str) -> str:
     """yt-dlp fallback (already a hard dep): extract_info, take a format URL."""
     try:
@@ -825,7 +843,8 @@ def _resolve_with_ytdlp(url: str) -> str:
         def error(self, msg: str) -> None: ...
 
     options = {
-        "format": "best/bestvideo+bestaudio",
+        # A muxed stream first; else video + audio as two inputs (YouTube live).
+        "format": "best[vcodec!=none][acodec!=none]/bestvideo[height<=1080]+bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -837,12 +856,27 @@ def _resolve_with_ytdlp(url: str) -> str:
 
     options.update(js_runtime_options())
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract(yt_dlp, options, url)
     except Exception as exc:  # noqa: BLE001 - third-party API, surface as hint
-        # Raw yt-dlp text mentions "not exist"/"offline" for dead channels;
-        # keep it unfiltered so the watcher's marker sniffing can work.
-        raise CaptureError(f"yt-dlp could not resolve {url}: {exc}") from exc
+        if not _is_bot_check(str(exc)):
+            # Raw yt-dlp text mentions "not exist"/"offline" for dead channels;
+            # keep it unfiltered so the watcher's marker sniffing can work.
+            raise CaptureError(f"yt-dlp could not resolve {url}: {exc}") from exc
+        # YouTube flags VPN (e.g. Cloudflare WARP) IPv6 addresses with a
+        # "confirm you're not a bot" page; the same request over IPv4 passes.
+        log.info("YouTube bot check over the default route; retrying %s over IPv4.", url)
+        info = None
+        last: Exception = exc
+        for extra in _BOT_CHECK_FALLBACKS:
+            try:
+                info = _extract(yt_dlp, {**options, **extra}, url)
+                break
+            except Exception as again:  # noqa: BLE001
+                last = again
+                if not _is_bot_check(str(again)):
+                    break
+        if info is None:
+            raise CaptureError(f"yt-dlp could not resolve {url}: {last}") from last
     if not info:
         raise CaptureError(f"yt-dlp returned no info for {url}")
     if isinstance(info, list):  # noplaylist violated: take the first entry
@@ -854,13 +888,42 @@ def _resolve_with_ytdlp(url: str) -> str:
     # "works on Twitch" must not mean "breaks on YouTube Live".
     requested = info.get("requested_formats")
     if requested:
-        for fmt in requested:
-            if isinstance(fmt, dict) and fmt.get("url"):
-                return str(fmt["url"])
+        urls = [str(f["url"]) for f in requested if isinstance(f, dict) and f.get("url")]
+        if len(urls) >= 2:
+            # Video first, audio second: both are captured and muxed.
+            return SPLIT_SEPARATOR.join(urls[:2])
+        if urls:
+            return urls[0]
     direct = info.get("url")
     if direct:
         return str(direct)
     raise CaptureError(f"yt-dlp found no stream URL for {url}")
+
+
+#: Joins a separate video URL and audio URL into one resolved "stream URL"
+#: (YouTube live now serves its HLS video and audio as separate streams).
+SPLIT_SEPARATOR = " || "
+
+
+def _input_args(stream_url: str) -> list[str]:
+    """``-rw_timeout … -i url`` for each input (one, or video + audio).
+
+    Two inputs keep their real timestamps (``-copyts``): YouTube's video and
+    audio playlists rarely open on the same segment, and ffmpeg's default
+    per-input reset to zero would shift the audio by that gap (5 s seen).
+    """
+    args: list[str] = ["-copyts"] if SPLIT_SEPARATOR in stream_url else []
+    for part in stream_url.split(SPLIT_SEPARATOR):
+        # A read that blocks this long fails the input instead of
+        # freezing ffmpeg (and with it the whole stream) forever.
+        args += ["-rw_timeout", str(int(RW_TIMEOUT_S * 1_000_000)), "-i", part]
+    return args
+
+
+def _map_args(stream_url: str) -> list[str]:
+    if SPLIT_SEPARATOR in stream_url:
+        return ["-map", "0:v:0", "-map", "1:a:0"]
+    return ["-map", "0"]
 
 
 def _offline_hint(url: str) -> str:

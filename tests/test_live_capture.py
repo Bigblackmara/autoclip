@@ -678,12 +678,13 @@ class TestRealArgv:
         cap.stop()
         joined = " ".join(argv)
         # Work-order-pinned flags: segment muxer (NOT HLS), copy codecs, all
-        # streams, 6s segments, per-segment timestamp reset, faststart.
+        # streams, 6s segments, one continuous clock, faststart.
         assert "-f" in argv and argv[argv.index("-f") + 1] == "segment"
         assert "-c" in argv and argv[argv.index("-c") + 1] == "copy"
         assert "-map" in argv and argv[argv.index("-map") + 1] == "0"
         assert argv[argv.index("-segment_time") + 1] == "6"
-        assert argv[argv.index("-reset_timestamps") + 1] == "1"
+        # No per-segment reset: it made audio drift at every join.
+        assert "-reset_timestamps" not in argv
         assert "-segment_start_number" in argv
         assert argv[argv.index("-movflags") + 1] == "+faststart"
         assert "-nostdin" in argv
@@ -821,3 +822,55 @@ class TestKillProcessTree:
         monkeypatch.setattr(os, "killpg", lambda pid, sig: sent.append((pid, sig)))
         kill_process_tree(777)
         assert sent[0] == (777, signal.SIGTERM)
+
+
+def test_ytdlp_resolve_retries_over_ipv4_on_bot_check(monkeypatch):
+    """YouTube's "confirm you're not a bot" page (VPN IPv6) -> retry over IPv4."""
+    from autoclip.live import capture
+
+    seen: list = []
+
+    def fake_extract(yt_dlp, options, url):
+        seen.append(options.get("source_address"))
+        if options.get("source_address") != "0.0.0.0":
+            raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you're not a bot.")
+        return {"url": "https://manifest.example/hls.m3u8"}
+
+    monkeypatch.setattr(capture, "_extract", fake_extract)
+    assert capture._resolve_with_ytdlp("https://www.youtube.com/watch?v=x") == (
+        "https://manifest.example/hls.m3u8"
+    )
+    assert seen == [None, "0.0.0.0"]
+
+
+def test_ytdlp_resolve_other_errors_not_retried(monkeypatch):
+    from autoclip.live import capture
+
+    calls: list = []
+
+    def fake_extract(yt_dlp, options, url):
+        calls.append(1)
+        raise RuntimeError("This live event has ended.")
+
+    monkeypatch.setattr(capture, "_extract", fake_extract)
+    with pytest.raises(capture.CaptureError, match="has ended"):
+        capture._resolve_with_ytdlp("https://www.youtube.com/watch?v=x")
+    assert len(calls) == 1
+
+
+def test_ytdlp_resolve_falls_back_to_mweb_client(monkeypatch):
+    """Bot check on both routes with the web client -> IPv4 + mweb client."""
+    from autoclip.live import capture
+
+    seen: list = []
+
+    def fake_extract(yt_dlp, options, url):
+        client = (options.get("extractor_args") or {}).get("youtube", {}).get("player_client")
+        seen.append((options.get("source_address"), client))
+        if client != ["mweb"]:
+            raise RuntimeError("Sign in to confirm you're not a bot")
+        return {"url": "https://manifest.example/hls.m3u8"}
+
+    monkeypatch.setattr(capture, "_extract", fake_extract)
+    assert capture._resolve_with_ytdlp("https://www.youtube.com/watch?v=x").endswith("hls.m3u8")
+    assert seen == [(None, None), ("0.0.0.0", None), ("0.0.0.0", ["mweb"])]

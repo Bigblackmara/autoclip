@@ -52,6 +52,10 @@ dependencies = [
   "pysubs2>=1.7",
   # GTA Mode text logo (draws the watermark text in Lemon Milk)
   "pillow>=10",
+  # GTA Mode narrator voice (Microsoft neural voices, free, online) and
+  # reading/writing the voice audio
+  "edge-tts>=7.0",
+  "soundfile>=0.12",
   # Providers
   "anthropic>=0.40",
   "openai>=1.55",
@@ -86,6 +90,13 @@ gpu = [
 # uses, so no extra entry is needed for it.
 live = [
   "streamlink>=6.7",
+]
+# Offline narrator voice for GTA Mode (Kokoro, runs on the CPU). Used when a
+# Kokoro voice is picked, or as the fallback when the Microsoft voice can't be
+# reached. Also needs the model files in <AutoClip home>/models/kokoro (see
+# docs/GTA_NARRATOR.md).
+voice-offline = [
+  "kokoro-onnx>=0.4",
 ]
 
 dev = [

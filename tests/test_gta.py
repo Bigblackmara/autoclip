@@ -787,6 +787,40 @@ class TestRealRender:
         assert report.black_frames.ok, report.black_frames.detail
         assert report.facecam.ok and report.passed
 
+    def test_ts_section_with_sparse_keyframes_stays_in_sync(self, tmp_path: Path) -> None:
+        """Regression: a cut starting >1 s before the next keyframe of a live
+        MPEG-TS window lost its first frames, so the picture ran ahead of the
+        voice and ended early (picture 13.5 s vs sound 14.5 s)."""
+        section = tmp_path / "window.ts"
+        subprocess.run(
+            [ffmpeg.ffmpeg_path(), "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=30",
+             "-f", "lavfi", "-i", "sine=f=440:r=48000:d=30",
+             "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-keyint_min", "60",
+             "-sc_threshold", "0", "-c:a", "aac", "-f", "mpegts", str(section)],
+            check=True, capture_output=True,
+        )
+        destination = tmp_path / "clip.mp4"
+        # Keyframes every 2 s: a cut at 13.1 s used to seek to 12.1 s and
+        # get its first frame at 14.0 s.
+        _render(section, destination, tmp_path / "work", 0.0, 13.1, 25.0)
+        video_s, audio_s = qa.track_lengths(destination)
+        assert abs(video_s - audio_s) < qa.MAX_TRACK_GAP_S, (video_s, audio_s)
+        assert video_s == pytest.approx(11.9, abs=0.1)
+
+    def test_qa_fails_picture_shorter_than_sound(self, tmp_path: Path) -> None:
+        clip = tmp_path / "clip.mp4"
+        subprocess.run(
+            [ffmpeg.ffmpeg_path(), "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=s=1080x1920:r=30:d=8",
+             "-f", "lavfi", "-i", "sine=f=440:r=48000:d=9",
+             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(clip)],
+            check=True, capture_output=True,
+        )
+        report = _qa(clip, clip, 0.0, 8.0, face=1.0)
+        assert not report.length.ok and "out of sync" in report.length.detail
+        assert not report.passed
+
     def test_qa_catches_black_frames_and_missing_face(self, tmp_path: Path) -> None:
         section = tmp_path / "section.mp4"
         _make_section(section, black=(5.0, 6.0))
@@ -1145,6 +1179,33 @@ class TestLive:
         fired, why = watch._listen(0.0, 6.0)
         assert fired and "lost it" in why
 
+    def test_reconnect_starts_a_new_buffer_epoch(self, tmp_path: Path, monkeypatch) -> None:
+        """Regression: after a Wi-Fi drop the GTA capture restarted into the
+        same epoch, so windows joined segments from both sides of the break
+        and the judge's audio extraction died on the clashing timestamps."""
+        from autoclip.gta.live import GtaLiveWatch
+        from autoclip.live import capture as capture_mod
+        from autoclip.live.buffer import RingBuffer
+
+        class FakeCapture:
+            def __init__(self, url, buffer, on_event=None) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        monkeypatch.setattr(capture_mod, "StreamCapture", FakeCapture)
+        stream = store.create_stream("https://www.youtube.com/watch?v=live")
+        watch = GtaLiveWatch(stream.id, stream.url)
+        watch._buffer = RingBuffer(tmp_path / "buffer", retain_minutes=6.0, max_disk_mb=64)
+        watch._capture_down = "error: capture stalled"
+        before = watch._buffer._epoch
+        assert watch._reconnect() is True
+        assert watch._buffer._epoch == before + 1
+
     def test_evaluate_judges_and_renders(self, tmp_path: Path, monkeypatch) -> None:
         from autoclip.gta import live
         from autoclip.pipeline import transcribe as transcribe_mod
@@ -1480,3 +1541,152 @@ class TestTextLogo:
         assert ((r > 200) & (g > 180) & (b < 90)).sum() > 20  # yellow "GTA"
         assert ((r > 225) & (g > 225) & (b > 225)).sum() > 40  # white "CLIPGOD"
         assert ((r < 40) & (g < 40) & (b < 40)).sum() > 40  # black outline
+
+
+# -- GTA Live: channel name from the link; Groq fallback --------------------
+
+
+def test_live_name_from_url():
+    from autoclip.gta.live import name_from_url
+
+    assert name_from_url("https://www.twitch.tv/kaicenat") == "kaicenat"
+    assert name_from_url("https://kick.com/adinross/videos") == "adinross"
+    assert name_from_url("https://www.youtube.com/@IShowSpeed/live") == "@IShowSpeed"
+    assert name_from_url("https://www.youtube.com/watch?v=abc") == ""
+    assert name_from_url("https://www.twitch.tv/videos/123") == ""
+
+
+def test_openai_provider_falls_back_to_groq_rotating_keys(monkeypatch):
+    monkeypatch.setattr("autoclip.providers.openai_provider.GROQ_MODELS", ["m"])
+    import asyncio
+
+    from autoclip.providers import openai_provider as op
+    from autoclip.providers.base import DetectionConfig, ProviderError
+
+    used: list[str] = []
+
+    async def fake(self, client, model, system, user, config):
+        base = str(getattr(client, "base_url", ""))
+        if "groq.com" not in base:
+            raise ProviderError("Request failed: 503")
+        used.append(client.api_key)
+        if client.api_key == "k1":
+            raise ProviderError("Rate limit reached.")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(op, "groq_fallback_keys", lambda: ["k1", "k2", "k3"])
+    monkeypatch.setattr(op.OpenAIProvider, "_complete_with", fake)
+    monkeypatch.setattr(op, "_groq_turn", iter(range(100)))
+    provider = op.OpenAIProvider("m", api_key="x", base_url="https://logfare.example/v1")
+    config = DetectionConfig()
+    assert asyncio.run(provider._complete("s", "u", config)) == '{"ok": true}'
+    assert used == ["k1", "k2"]  # k1 rate-limited -> next key
+    used.clear()
+    asyncio.run(provider._complete("s", "u", config))
+    assert used == ["k2"]  # the next call starts at the next key
+
+
+def test_openai_provider_without_fallback_keys_raises(monkeypatch):
+    import asyncio
+
+    import pytest
+    from autoclip.providers import openai_provider as op
+    from autoclip.providers.base import DetectionConfig, ProviderError
+
+    async def fake(self, client, model, system, user, config):
+        raise ProviderError("Request failed: 503")
+
+    monkeypatch.setattr(op, "groq_fallback_keys", lambda: [])
+    monkeypatch.setattr(op.OpenAIProvider, "_complete_with", fake)
+    provider = op.OpenAIProvider("m", api_key="x", base_url="https://logfare.example/v1")
+    with pytest.raises(ProviderError):
+        asyncio.run(provider._complete("s", "u", DetectionConfig()))
+
+
+def test_openai_provider_groq_first_then_backup(monkeypatch):
+    monkeypatch.setattr("autoclip.providers.openai_provider.GROQ_MODELS", ["m"])
+    import asyncio
+
+    from autoclip.providers import openai_provider as op
+    from autoclip.providers.base import DetectionConfig, ProviderError
+
+    calls: list[str] = []
+    groq_up = {"ok": True}
+
+    async def fake(self, client, model, system, user, config):
+        is_groq = "groq.com" in str(getattr(client, "base_url", ""))
+        calls.append("groq" if is_groq else "primary")
+        if is_groq and not groq_up["ok"]:
+            raise ProviderError("Rate limit reached.")
+        return "groq" if is_groq else "primary"
+
+    monkeypatch.setattr(op, "groq_fallback_keys", lambda: ["k1", "k2"])
+    monkeypatch.setattr(op, "utim_key", lambda: None)  # not the real stored key
+    monkeypatch.setattr(op, "groq_first", lambda: True)
+    monkeypatch.setattr(op.OpenAIProvider, "_complete_with", fake)
+    provider = op.OpenAIProvider("m", api_key="x", base_url="https://logfare.example/v1")
+    config = DetectionConfig()
+    assert asyncio.run(provider._complete("s", "u", config)) == "groq"
+    assert calls == ["groq"]
+    calls.clear()
+    groq_up["ok"] = False
+    assert asyncio.run(provider._complete("s", "u", config)) == "primary"
+    assert calls == ["groq", "groq", "primary"]
+
+
+def test_live_judge_now_needs_a_running_watch():
+    from autoclip.gta.live import GtaLiveManager
+
+    assert GtaLiveManager().judge_now("nope") is False
+
+
+def test_ai_usage_tracks_calls_and_rests_on_rate_limit():
+    from autoclip.providers import usage
+
+    usage.reset_for_tests()
+    url, key = "https://api.groq.com/openai/v1", "gsk_testkey1234"
+    usage.record(
+        url,
+        key,
+        tokens_in=100,
+        tokens_out=20,
+        headers={"x-ratelimit-remaining-requests": "999", "x-ratelimit-remaining-tokens": "7000"},
+    )
+    assert usage.resting(url, key) == 0
+    usage.record(url, key, ok=False, status=429, headers={"retry-after": "42"})
+    assert 30 < usage.resting(url, key) <= 42
+    stt = "https://api.groq.com/openai/v1/audio/transcriptions"
+    assert usage.resting(stt, key) == 0  # whisper limits are separate
+    snap = usage.snapshot()
+    (entry,) = [k for k in snap["keys"] if k["label"] == usage.key_label(url, key)]
+    assert entry["today"]["calls"] == 2
+    assert entry["today"]["tokens_in"] == 100
+    assert entry["today"]["rate_limited"] == 1
+    assert usage.parse_duration("2m59.5s") == 179.5
+    assert usage.parse_duration("250ms") == 0.25
+    usage.reset_for_tests()
+
+
+def test_groq_rotation_moves_one_key_per_call_across_models(monkeypatch):
+    """With several Groq models, each call still starts at the next key."""
+    import asyncio
+
+    from autoclip.providers import openai_provider as op
+    from autoclip.providers.base import DetectionConfig
+
+    monkeypatch.setattr(op, "GROQ_MODELS", ["m1", "m2", "m3"])
+    monkeypatch.setattr(op, "groq_fallback_keys", lambda: ["k1", "k2", "k3"])
+    monkeypatch.setattr(op, "utim_key", lambda: "")
+    monkeypatch.setattr(op, "_groq_turn", iter(range(100)))
+    monkeypatch.setattr("autoclip.providers.usage.resting", lambda *a, **k: 0.0)
+    first: list[str] = []
+
+    async def fake(self, client, model, system, user, config):
+        first.append(str(client.api_key))
+        return "{}"
+
+    monkeypatch.setattr(op.OpenAIProvider, "_complete_with", fake)
+    provider = op.OpenAIProvider("x", api_key="k", base_url="https://api.groq.com/openai/v1")
+    for _ in range(3):
+        asyncio.run(provider._complete_groq(op.fast_endpoints(), "s", "u", DetectionConfig()))
+    assert first == ["k1", "k2", "k3"]

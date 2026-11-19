@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from ..gta import store
@@ -431,6 +432,35 @@ async def start_live(payload: LiveIn) -> dict[str, Any]:
     return _stream_out(stream)
 
 
+@router.get("/live/{stream_id}/frame")
+async def live_frame(stream_id: str) -> Response:
+    """A near-live JPEG of a watched stream (the newest finished buffer segment)."""
+    from ..gta.live import latest_frame
+
+    data = await asyncio.to_thread(latest_frame, stream_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No picture from that stream yet.")
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/live/{stream_id}/judge-now")
+async def live_judge_now(stream_id: str) -> dict[str, Any]:
+    """Send the stream's last minute to the AI judge now (a manual end-to-end check)."""
+    from ..gta.live import live_manager
+
+    if not live_manager.judge_now(stream_id):
+        raise HTTPException(status_code=409, detail="That stream isn't being watched.")
+    return {"queued": True}
+
+
+@router.get("/ai-usage")
+async def ai_usage() -> dict[str, Any]:
+    """Calls, tokens, audio seconds and rate-limit headroom per AI key (today + total)."""
+    from ..providers import usage
+
+    return await asyncio.to_thread(usage.snapshot)
+
+
 @router.post("/live/{stream_id}/stop")
 async def stop_live(stream_id: str) -> dict[str, Any]:
     from ..gta.live import live_manager
@@ -604,6 +634,29 @@ async def posting_run_now() -> dict[str, Any]:
 
     poster.notify()
     return {"running": poster.running}
+
+
+class PostNowIn(BaseModel):
+    title: str = Field(default="", max_length=100)
+    #: When set (ISO time with timezone), schedule instead of posting now.
+    publish_at: datetime | None = None
+
+
+@router.post("/clips/{clip_id}/post-now")
+async def post_clip_now(clip_id: str, payload: PostNowIn) -> dict[str, Any]:
+    """Upload a ready clip to YouTube as public right now, with an optional title."""
+    from ..gta.poster import poster
+
+    try:
+        outcome = await poster.post_now(clip_id, payload.title.strip(), payload.publish_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    row = await asyncio.to_thread(store.upload_for_clip, clip_id, "youtube")
+    return {
+        "outcome": outcome,
+        "upload": _upload_out(row),
+        "message": poster.states["youtube"].message,
+    }
 
 
 @router.post("/clips/{clip_id}/posting")

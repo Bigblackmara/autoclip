@@ -31,7 +31,7 @@ from ..db.models import new_id
 from ..pipeline import prepare, transcribe
 from ..pipeline.transcribe import WhisperModelCache
 from ..pipeline.transcript import Transcript, Word
-from . import align, fetch, hype, judging, logo, qa, render, signals, store
+from . import align, fetch, hype, judging, logo, narrate, qa, render, signals, store
 from .gate import gate
 from .settings import GtaSettings, output_root, work_root
 from .settings import load as load_gta_settings
@@ -876,10 +876,22 @@ def render_extras(
         watermark=watermark,
         keywords=settings.keyword_highlight,
         motion=settings.motion,
+        layout=settings.layout,
         flash_forward=settings.flash_forward if flash_forward is None else flash_forward,
         flash_forward_s=settings.flash_forward_s,
         motion_seed=motion_seed,
+        static_caption=settings.static_caption,
     )
+
+
+def narration_context(clip: GtaClip, stream: GtaStream) -> dict:
+    """What the narrator's lines are written from."""
+    return {
+        "streamer": stream.channel or "",
+        "caption": str(clip.localised.get("caption") or "") or clip.caption,
+        "summary": clip.summary,
+        "seed": clip.id,
+    }
 
 
 def render_and_qa(
@@ -902,6 +914,7 @@ def render_and_qa(
     flash_forward: bool | None = None,
     motion_seed: int = 0,
     style_key: str | None = None,
+    narration_context: dict | None = None,
 ) -> dict:
     """Render one clip and run QA, fixing what can be fixed automatically.
 
@@ -913,6 +926,10 @@ def render_and_qa(
     export_settings = load_settings().export
     trim_start = trim_end = 0.0
     report_dict: dict = {}
+    # The narrator's lines are written once (re-renders reuse them).
+    narration, narration_source = narrate.lines_for(
+        settings, hook=hook_title, context=narration_context, words=words
+    )
     with gate.hold(live=live):
         for attempt in range(3):
             if cancelled():
@@ -949,6 +966,18 @@ def render_and_qa(
                 trim_end_s=trim_end,
                 cancelled=cancelled,
             )
+            finished = narrate.finish(
+                result.path,
+                settings=settings,
+                export_settings=export_settings,
+                anchor=result.caption_anchor,
+                lead_s=result.teaser_s,
+                work_dir=work_dir / "narrate",
+                hook=hook_title,
+                narration=narration,
+                source=narration_source,
+            )
+            result.edits.extend(finished.get("edits", []))
             local_start = start_s - section_start_s + trim_start
             local_end = end_s - section_start_s - trim_end
 
@@ -986,6 +1015,7 @@ def render_and_qa(
                 "cut_dead_air_s": round(result.cut_s, 2),
                 "duration_s": round(result.duration_s, 2),
                 "flash_forward_s": result.teaser_s,
+                "narration": {k: v for k, v in finished.items() if k != "edits"},
                 "attempts": attempt + 1,
             }
             if qa_report.black_frames.ok or not qa_report.black_spans:
@@ -1042,6 +1072,7 @@ def stage_render(clip: GtaClip, stream: GtaStream, report: Reporter, settings: G
         flash_forward=flash,
         motion_seed=clip.motion_seed,
         style_key=caption_look(clip, settings),
+        narration_context=narration_context(clip, stream),
     )
     # The caption file next to the clip: one copy-paste away from posting.
     destination.with_suffix(".txt").write_text(post_text(clip) + "\n", encoding="utf-8")

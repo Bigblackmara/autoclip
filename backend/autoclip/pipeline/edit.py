@@ -823,12 +823,43 @@ def measure_loudnorm(
     return measured
 
 
+#: Most gain a quiet clip gets before limiting (beyond this it's mostly noise).
+MAX_GAIN_DB = 24.0
+
+
+def _gain_and_limit(measured: dict[str, str], *, target: float, true_peak: float) -> str:
+    """Even gain + look-ahead limiter, when loudnorm can't stay linear.
+
+    loudnorm only keeps ``linear=true`` if the gain fits under the true-peak
+    ceiling; a quiet stream with loud shouts doesn't, and loudnorm then drops
+    to its dynamic mode, whose first seconds come out loud and crunchy. Here
+    the gain is applied evenly and only the peaks are limited (delay
+    compensated, so audio stays in sync). '' = loudnorm can stay linear.
+    """
+    try:
+        gain = target - float(measured["input_i"])
+        peak = float(measured["input_tp"])
+    except (KeyError, ValueError):
+        return ""
+    if peak + gain <= true_peak:
+        return ""
+    gain = max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain))
+    limit = 10 ** ((true_peak - 0.5) / 20)  # sample-peak limiter, 0.5 dB under the TP ceiling
+    return (
+        f"volume={gain:.2f}dB,"
+        f"alimiter=limit={limit:.4f}:attack=5:release=80:level=false:latency=true"
+    )
+
+
 def loudnorm_filter(
     measured: dict[str, str] | None, *, target: float, true_peak: float, lra: float = LOUDNORM_LRA
 ) -> str:
     base = f"loudnorm=I={target}:TP={true_peak}:LRA={lra:g}"
     if not measured:
         return base
+    limited = _gain_and_limit(measured, target=target, true_peak=true_peak)
+    if limited:
+        return limited
     return (
         f"{base}:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
         f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"

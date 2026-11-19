@@ -638,3 +638,41 @@ class TestCoverageAndLifecycleHelpers:
         assert discard_segment_files(directory) == 3
         assert sorted(p.name for p in directory.iterdir()) == ["notes.txt"]
         assert discard_segment_files(tmp_path / "missing") == 0
+
+
+def test_window_with_late_audio_keeps_and_aligns_audio(tmp_path):
+    """Regression: after a reconnect YouTube's audio feed started ~20 s after
+    the video; the window remux dropped the audio track (ffmpeg's short probe
+    saw none) and the judge failed with "Output file does not contain any
+    stream". The audio must survive and be padded to the video's clock."""
+    import subprocess
+
+    from autoclip.gta.render import section_levels
+    from autoclip.live.buffer import _remux_continuous, _stream_kinds
+    from autoclip.pipeline.prepare import extract_audio
+
+    window = tmp_path / "window.ts"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=30",
+         "-itsoffset", "20", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=10",
+         "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast",
+         "-c:a", "aac", "-f", "mpegts", str(window)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    _remux_continuous(window)
+    assert _stream_kinds(window) == {"video", "audio"}
+
+    wav = extract_audio(window, tmp_path / "window.wav")
+    seconds = float(
+        subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+             str(wav)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    )  # fmt: skip
+    assert seconds == pytest.approx(30.0, abs=0.3)
+
+    levels = section_levels(window, 0.0, 30.0, hop_s=1.0)
+    assert len(levels) == 30
+    assert max(levels[:19]) < -60 and min(levels[21:29]) > -30

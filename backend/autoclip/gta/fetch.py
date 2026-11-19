@@ -63,6 +63,8 @@ class ProbeResult:
     heatmap: list[tuple[float, float, float]] = field(default_factory=list)
     has_live_chat_replay: bool = False
     webpage_url: str = ""
+    #: The stream's thumbnail image URL ("" when the site gives none).
+    thumbnail: str = ""
     #: YouTube's own caption track in the spoken language ({lang, kind, url}),
     #: chosen like the normal pipeline's captions-first path; {} = none.
     caption_track: dict[str, str] = field(default_factory=dict)
@@ -130,6 +132,7 @@ def probe_from_info(info: dict[str, Any], url: str) -> ProbeResult:
         heatmap=parse_heatmap(info.get("heatmap")),
         has_live_chat_replay=isinstance(subtitles, dict) and "live_chat" in subtitles,
         webpage_url=str(info.get("webpage_url") or url),
+        thumbnail=str(info.get("thumbnail") or ""),
         caption_track=({"lang": track.lang, "kind": track.kind, "url": track.url} if track else {}),
     )
 

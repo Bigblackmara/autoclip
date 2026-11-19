@@ -440,6 +440,7 @@ class RingBuffer:
             _concat(paths, target)
         finally:
             self.unpin(start_index)
+        _remux_continuous(target)
         return window
 
     def pin_oldest(self, index: int) -> None:
@@ -687,6 +688,70 @@ def adaptive_timeout_s(
     if longest_segment_s is None or not math.isfinite(longest_segment_s) or longest_segment_s <= 0:
         return base
     return max(base, min(float(ceiling_s), float(segments) * float(longest_segment_s)))
+
+
+def _remux_continuous(target: Path) -> None:
+    """Rewrite a byte-concatenated window with continuous timestamps.
+
+    Segments cut with ``-reset_timestamps`` (and the two-input video+audio
+    capture YouTube live needs) restart their clocks, so a raw concat only
+    *seeks* through its first segment. A stream-copy remux lets ffmpeg's
+    discontinuity correction rebuild one clean timeline. Best effort: on any
+    failure the raw concat stays.
+    """
+    import shutil
+    import subprocess
+
+    exe = shutil.which("ffmpeg")
+    if not exe or not target.exists() or target.stat().st_size == 0:
+        return
+    tmp = target.with_name(target.stem + ".remux" + target.suffix)
+    try:
+        # After a reconnect YouTube's separate audio feed can start ~20 s
+        # after the video; ffmpeg's default few-second probe then finds no
+        # audio parameters and silently DROPS the audio track. Probe deep and
+        # map both kinds explicitly.
+        result = subprocess.run(  # noqa: S603 - fixed argv
+            [exe, "-hide_banner", "-loglevel", "error", "-y", *DEEP_PROBE,
+             "-i", str(target), "-map", "0:v?", "-map", "0:a?",
+             "-c", "copy", "-f", "mpegts", str(tmp)],
+            capture_output=True, timeout=120, check=False,
+        )  # fmt: skip
+        if (
+            result.returncode == 0
+            and tmp.exists()
+            and tmp.stat().st_size > 0
+            and _stream_kinds(tmp) >= _stream_kinds(target)
+        ):
+            tmp.replace(target)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+#: ffmpeg input options that look far enough into a window to find an audio
+#: track that starts late (``analyzeduration`` is in microseconds: 100 s).
+DEEP_PROBE = ("-analyzeduration", "100M", "-probesize", "100M")
+
+
+def _stream_kinds(path: Path) -> set[str]:
+    """{"video", "audio"} present in ``path`` (deep probe); empty on error."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return set()
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv
+            [exe, "-v", "error", *DEEP_PROBE, "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+        ).stdout  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
 
 
 def _concat(sources: list[Path], target: Path) -> None:

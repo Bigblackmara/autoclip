@@ -34,6 +34,7 @@ import {
   type UploadStatus,
 } from '../gta/api'
 import { ClipTools, GtaEditSettings, GtaPickPanel } from '../gta/extras'
+import { AiUsageCard, LiveHealth, LiveStreamName } from '../gta/LivePreview'
 import { YouTubeTab } from '../gta/YouTubeTab'
 import {
   Badge,
@@ -712,7 +713,7 @@ function LiveTab({
                 return (
                   <li key={s.id} className="flex flex-wrap items-start justify-between gap-4 px-5 py-4 sm:px-6">
                     <div className="min-w-[14rem] flex-1">
-                      <p className="truncate text-sm font-semibold text-fg">{s.channel || s.url}</p>
+                      <LiveStreamName stream={s} running={running} />
                       <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-fg-muted">
                         <Badge tone={running ? 'success' : 'neutral'} dot pulse={running}>
                           {STATUS_LABEL[s.status] ?? s.status}
@@ -722,13 +723,25 @@ function LiveTab({
                           · {readyCount} ready · {rejected} rejected
                         </span>
                       </div>
+                      <LiveHealth stream={s} />
                       {s.error && <p className="mt-1.5 whitespace-pre-line text-xs text-danger">{s.error}</p>}
                     </div>
                     <div className="flex gap-2">
                       {running ? (
-                        <Button size="sm" disabled={busy} onClick={() => run(() => gtaApi.stopLive(s.id))}>
-                          Stop
-                        </Button>
+                        <>
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            disabled={busy}
+                            title="Send the last minute to the AI judge now, whatever the loudness says. A quick end-to-end test."
+                            onClick={() => run(() => gtaApi.judgeNow(s.id))}
+                          >
+                            Judge last minute
+                          </Button>
+                          <Button size="sm" disabled={busy} onClick={() => run(() => gtaApi.stopLive(s.id))}>
+                            Stop
+                          </Button>
+                        </>
                       ) : (
                         <>
                           <Button size="sm" variant="primary" disabled={busy} onClick={() => run(() => gtaApi.retry(s.id))}>
@@ -747,6 +760,7 @@ function LiveTab({
           )}
         </div>
       </Card>
+      <AiUsageCard />
       <ClipWall title="Live clips ready" clips={ready} streams={streams} />
     </div>
   )

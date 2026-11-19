@@ -479,8 +479,16 @@ class TestLoudness:
             "input_thresh": "-33.80",
             "target_offset": "0.02",
         }
+        # +9.51 dB would put the -6.02 dBTP peak at +3.49, over the -1.5 ceiling:
+        # loudnorm would drop to its dynamic mode (loud, crunchy opening), so
+        # the gain is applied evenly and only the peaks are limited.
         assert edit.loudnorm_filter(measured, target=-14.0, true_peak=-1.5) == (
-            "loudnorm=I=-14.0:TP=-1.5:LRA=11:measured_I=-23.51:measured_TP=-6.02"
+            "volume=9.51dB,alimiter=limit=0.7943:attack=5:release=80:level=false:latency=true"
+        )
+        # With headroom for the gain, the linear second pass stays.
+        roomy = {**measured, "input_tp": "-14.00"}
+        assert edit.loudnorm_filter(roomy, target=-14.0, true_peak=-1.5) == (
+            "loudnorm=I=-14.0:TP=-1.5:LRA=11:measured_I=-23.51:measured_TP=-14.00"
             ":measured_LRA=3.10:measured_thresh=-33.80:offset=0.02:linear=true"
         )
 
@@ -717,7 +725,7 @@ class TestEditExportArgs:
             measured.append((list(inputs), graph))
             return {
                 "input_i": "-20.0",
-                "input_tp": "-3.0",
+                "input_tp": "-12.0",
                 "input_lra": "4.0",
                 "input_thresh": "-30.0",
                 "target_offset": "0.1",

@@ -31,6 +31,12 @@ MIN_LENGTH_S = 5.0
 OUT_W = 1080
 OUT_H = 1920
 OUT_FPS = 30.0
+#: Picture and sound must end together (one AAC frame + one video frame of
+#: slack). A bigger gap means frames were lost and the voice is out of sync.
+MAX_TRACK_GAP_S = 0.15
+#: Limiter margins below the true-peak ceiling tried by :func:`fix_loudness`
+#: (AAC re-encoding overshoots the limiter; dense audio loses loudness to it).
+LIMIT_HEADROOMS_DB = (1.0, 0.5, 0.0)
 #: Frames sampled for the face-cam check.
 FACE_SAMPLES = 12
 
@@ -94,6 +100,32 @@ def _run(command: list[str], timeout: float = 600) -> subprocess.CompletedProces
     return subprocess.run(  # noqa: S603
         command, capture_output=True, text=True, check=False, timeout=timeout, errors="replace"
     )
+
+
+def track_lengths(path: Path) -> tuple[float, float] | None:
+    """(video seconds, audio seconds) of the file's first streams, or None."""
+    lengths: list[float] = []
+    for stream in ("v:0", "a:0"):
+        result = _run(
+            [
+                ffmpeg.ffprobe_path(),
+                "-v",
+                "error",
+                "-select_streams",
+                stream,
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            timeout=60,
+        )
+        try:
+            lengths.append(float(result.stdout.strip().splitlines()[0]))
+        except (ValueError, IndexError):
+            return None
+    return lengths[0], lengths[1]
 
 
 def measure_loudness(path: Path) -> tuple[float | None, float | None]:
@@ -232,8 +264,16 @@ def run_qa(
         watermark = Check(True, "logo burned in")
     else:
         watermark = Check(False, "no logo set — add yours in GTA Mode settings")
+    tracks = track_lengths(output) if info.has_video and info.has_audio else None
     if not info.has_video or not info.has_audio:
         length = Check(False, "the file is missing its video or audio track", duration)
+    elif tracks is not None and abs(tracks[0] - tracks[1]) > MAX_TRACK_GAP_S:
+        video_s, audio_s = tracks
+        length = Check(
+            False,
+            f"picture {video_s:.2f} s vs sound {audio_s:.2f} s — out of sync, not postable",
+            duration,
+        )
     elif duration >= MAX_LENGTH_S:
         length = Check(False, f"{duration:.1f} s — must be under {MAX_LENGTH_S:.0f} s", duration)
     elif duration < MIN_LENGTH_S:
@@ -297,33 +337,78 @@ def run_qa(
 
 
 def fix_loudness(path: Path, measured_lufs: float, target_lufs: float, true_peak_db: float) -> None:
-    """Re-mux the clip with a gain correction (video stream copied)."""
-    gain = target_lufs - measured_lufs
-    partial = path.with_name(path.stem + ".gain.mp4")
-    ffmpeg.run(
-        [
-            "-i",
-            str(path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0",
-            "-c:v",
-            "copy",
-            "-af",
-            f"volume={gain:.2f}dB,alimiter=limit={10 ** (true_peak_db / 20):.4f}:level=disabled",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-movflags",
-            "+faststart",
-            str(partial),
-        ]
-    )
-    partial.replace(path)
+    """Re-mux the clip with a gain correction (video stream copied).
+
+    A limiter keeps the peaks under the ceiling, but on dense, already
+    squashed stream audio it also eats loudness, and AAC re-encoding then
+    overshoots its ceiling. So try a few limiter headrooms, correcting the
+    gain from each measurement (always encoding from the ORIGINAL audio),
+    and keep the first result that passes QA, else the closest one.
+    """
+    original = path.with_name(path.stem + ".orig.mp4")
+    path.replace(original)
+    best: tuple[float, Path] | None = None
+    tries = 0
+    try:
+        for headroom in LIMIT_HEADROOMS_DB:
+            limit = 10 ** ((true_peak_db - headroom) / 20)
+            gain = target_lufs - measured_lufs
+            for _ in range(2):
+                out = path.with_name(f"{path.stem}.try{tries}.mp4")
+                tries += 1
+                ffmpeg.run(
+                    [
+                        "-i",
+                        str(original),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a:0",
+                        "-c:v",
+                        "copy",
+                        "-af",
+                        f"volume={gain:.2f}dB,alimiter=limit={limit:.4f}"
+                        ":attack=2:release=20:level=disabled",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        "48000",
+                        "-movflags",
+                        "+faststart",
+                        str(out),
+                    ]
+                )
+                lufs, peak = measure_loudness(out)
+                if lufs is None:
+                    out.unlink(missing_ok=True)
+                    break
+                over = max(0.0, (peak if peak is not None else -99.0) - (true_peak_db + 0.3))
+                miss = max(0.0, abs(lufs - target_lufs) - 0.8) + over * 2
+                if best is None or miss < best[0]:
+                    if best is not None:
+                        best[1].unlink(missing_ok=True)
+                    best = (miss, out)
+                else:
+                    out.unlink(missing_ok=True)
+                if miss == 0.0:
+                    break
+                gain += target_lufs - lufs
+            if best is not None and best[0] == 0.0:
+                break
+        if best is None:
+            original.replace(path)
+            return
+        best[1].replace(path)
+        original.unlink(missing_ok=True)
+    except BaseException:
+        if original.exists() and not path.exists():
+            original.replace(path)
+        raise
+    finally:
+        for leftover in path.parent.glob(f"{path.stem}.try*.mp4"):
+            leftover.unlink(missing_ok=True)
 
 
 def edge_trims(

@@ -54,9 +54,25 @@ TITLE_FONT_RATIO = 0.052
 TITLE_STYLE = "GtaHook"
 REACTION_STYLE = "GtaReaction"
 TEXT_CENTRE_Y = 430
+#: Gap between the bottom caption box and the subtitles above it.
+BOX_SUBTITLE_GAP_PX = 24
+#: Reaction text centre when a static caption box takes the top band.
+STATIC_REACTION_Y = 300
 #: Logo row: just under the top safe zone.
 LOGO_TOP_PX = SAFE_TOP_PX + 15
 LOGO_SIDE_PX = 40
+
+
+#: How far before the first kept frame the input is seeked. After ``-ss`` on
+#: a live MPEG-TS window, decoding restarts at the NEXT keyframe (streams
+#: send one every 2-4 s), so the first frames after the seek point are
+#: missing. If the cut started inside that gap, ``setpts=PTS-STARTPTS`` pinned
+#: the first frame that did arrive to t=0: the picture ran up to 2 s ahead of
+#: the voice and ended early. Seeking a whole keyframe interval (plus margin)
+#: early guarantees real frames exist at every cut start.
+SEEK_PAD_S = 8.0
+#: Find an audio track that starts late in a live window (100 s, in µs).
+DEEP_PROBE = ("-analyzeduration", "100M", "-probesize", "100M")
 
 
 class RenderError(RuntimeError):
@@ -70,12 +86,19 @@ class RenderError(RuntimeError):
 
 def section_levels(path: Path, start_s: float, end_s: float, *, hop_s: float = 0.05) -> np.ndarray:
     """RMS level (dBFS) of every ``hop_s`` of the section's audio in a range."""
+    from ..pipeline.prepare import audio_lead_s
+
+    # Audio that starts after ``start_s`` (a live window right after a
+    # reconnect) is padded, so level N is really second start_s + N.
+    late = audio_lead_s(path) - max(0.0, start_s)
+    pad = ["-af", f"adelay={round(late * 1000)}:all=1"] if late > 0.02 else []
     command = [
         ffmpeg.ffmpeg_path(),
         "-hide_banner",
         "-nostdin",
         "-loglevel",
         "error",
+        *DEEP_PROBE,
         "-ss",
         f"{max(0.0, start_s):.3f}",
         "-t",
@@ -83,6 +106,9 @@ def section_levels(path: Path, start_s: float, end_s: float, *, hop_s: float = 0
         "-i",
         str(path),
         "-vn",
+        *pad,
+        "-t",
+        f"{max(0.05, end_s - start_s):.3f}",
         "-ac",
         "1",
         "-ar",
@@ -92,6 +118,9 @@ def section_levels(path: Path, start_s: float, end_s: float, *, hop_s: float = 0
         "-",
     ]
     result = subprocess.run(command, capture_output=True, check=False)  # noqa: S603
+    if result.returncode != 0 and b"does not contain any stream" in result.stderr:
+        # No audio in this stretch (the first seconds after a reconnect).
+        return np.zeros(0, dtype=np.float32)
     if result.returncode != 0:
         raise RenderError(
             f"Could not read the clip audio: {result.stderr.decode(errors='replace')[-400:]}"
@@ -217,6 +246,8 @@ def write_subtitles(
     reaction_window: tuple[float, float] | None = None,
     keywords: Sequence[str] = (),
     title_start_s: float = 0.0,
+    text_centre_y: int = TEXT_CENTRE_Y,
+    caption_margin_px: int = CAPTION_MARGIN_PX,
 ) -> Path:
     """Captions (bottom band, 1-2 lines), hook title and reaction (top band).
 
@@ -233,11 +264,11 @@ def write_subtitles(
         style,
         width=OUT_W,
         height=OUT_H,
-        margin_v_px=CAPTION_MARGIN_PX,
+        margin_v_px=caption_margin_px,
         keywords=keywords,
     )
     title = hook_title.strip()
-    text_y = TEXT_CENTRE_Y
+    text_y = text_centre_y
     title_start = max(0.0, min(title_start_s, duration_s))
     title_end = min(title_start + title_s, duration_s)
     if title and title_end - title_start < 0.3:
@@ -312,8 +343,13 @@ def build_filtergraph(
     punch_in: tuple[float, float, float] | Sequence[tuple[float, float, float]] | None = None,
     watermark: Watermark | None = None,
     motion: FrameMotion | None = None,
+    split: tuple[int, int, int, int, int, int] | None = None,
 ) -> str:
     """Cut + concat, uncropped fit over a blurred fill, subtitles, audio chain.
+
+    ``split`` = (cam x, y, w, h, source w, source h): the webcam is cropped
+    across the top and the gameplay, centre-cropped, fills the rest; punch-ins
+    and motion don't apply to it.
 
     Keep times are section-local; the input is seeked to ``seek_s`` so the
     trims are relative to that. ``punch_in`` = (start, end, zoom) in OUTPUT
@@ -329,9 +365,20 @@ def build_filtergraph(
         a = max(0.0, keep.start - seek_s)
         b = max(a + 0.01, keep.end - seek_s)
         parts.append(f"[0:v]trim=start={a:.4f}:end={b:.4f},setpts=PTS-STARTPTS[v{i}]")
-        parts.append(f"[0:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(
+            f"[0:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS{_edge_fades(b - a)}[a{i}]"
+        )
         labels.append(f"[v{i}][a{i}]")
     parts.append(f"{''.join(labels)}concat=n={len(keeps)}:v=1:a=1[vcat][acat]")
+    if split is not None:
+        cam_h, cam_crop, game_crop = split_geometry(*split)
+        parts.append(f"[vcat]fps={FPS},split=2[camsrc][gamesrc]")
+        parts.append(f"[camsrc]crop={cam_crop},scale={OUT_W}:{cam_h}:flags=lanczos[cam]")
+        parts.append(f"[gamesrc]crop={game_crop},scale={OUT_W}:{OUT_H - cam_h}:flags=lanczos[game]")
+        current = (
+            f"[cam][game]vstack,drawbox=x=0:y={cam_h - 3}:w={OUT_W}:h=6:color=black@0.9:t=fill"
+        )
+        return _finish_graph(parts, current, watermark, subtitle_name, fonts_name, audio_filter)
     spans = _punch_spans(punch_in)
     if spans:
         parts.append(f"[vcat]fps={FPS},split=3[bgsrc][fgsrc][zsrc]")
@@ -359,6 +406,48 @@ def build_filtergraph(
         )
         parts.append(f"{current}[base]")
         current = f"[base][fz]overlay=(W-w)/2:(H-h)/2:enable='{enable}'"
+    return _finish_graph(parts, current, watermark, subtitle_name, fonts_name, audio_filter)
+
+
+#: Webcam band height limits in the 1080x1920 frame (the rest is gameplay).
+SPLIT_CAM_MIN_H = 520
+SPLIT_CAM_MAX_H = 760
+
+
+def split_geometry(cx: int, cy: int, cw: int, ch: int, sw: int, sh: int) -> tuple[int, str, str]:
+    """(cam band height, cam crop, gameplay crop) for the split layout.
+
+    The cam crop is trimmed to the band's aspect around its centre; the
+    gameplay crop is the full source height, centred, as wide as the band
+    below needs (never wider than the source).
+    """
+    band = round(OUT_W * ch / max(1, cw))
+    band = max(SPLIT_CAM_MIN_H, min(SPLIT_CAM_MAX_H, band)) // 2 * 2
+    target = OUT_W / band
+    if cw / max(1, ch) > target:  # cam too wide: trim its sides
+        new_w = ch * target
+        cx, cw = cx + (cw - new_w) / 2, new_w
+    else:  # cam too tall: trim top/bottom
+        new_h = cw / target
+        cy, ch = cy + (ch - new_h) / 2, new_h
+    cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
+    cx = max(0, min(sw - cw, int(cx)))
+    cy = max(0, min(sh - ch, int(cy)))
+    game_h = OUT_H - band
+    gw = min(sw, round(sh * OUT_W / game_h)) // 2 * 2
+    gx = (sw - gw) // 2
+    return band, f"{cw}:{ch}:{cx}:{cy}", f"{gw}:{sh}:{gx}:0"
+
+
+def _finish_graph(
+    parts: list[str],
+    current: str,
+    watermark: Watermark | None,
+    subtitle_name: str | None,
+    fonts_name: str,
+    audio_filter: str,
+) -> str:
+    """Logo, captions and the audio chain on top of the composed frame."""
     if watermark is not None:
         parts.append(f"{current}[pre]")
         parts.append(
@@ -373,6 +462,32 @@ def build_filtergraph(
     return ";".join(parts)
 
 
+def _split_cam(
+    section: Path, start_s: float, end_s: float
+) -> tuple[int, int, int, int, int, int] | None:
+    """The streamer's webcam rect in ``section`` (source px), or None to fit."""
+    try:
+        from ..pipeline.reframe.facecam import detect_facecam
+
+        info = ffmpeg.probe(section)
+        if not info.width or not info.height:
+            return None
+        cam = detect_facecam(
+            section,
+            start_s=start_s,
+            end_s=end_s,
+            source_width=info.width,
+            source_height=info.height,
+        )
+    except Exception:  # detection is best effort: the fit layout always works
+        log.warning("Webcam detection failed; using the fit layout.", exc_info=True)
+        return None
+    if cam is None:
+        log.info("No webcam found in %s; using the fit layout.", section.name)
+        return None
+    return (cam.x, cam.y, cam.width, cam.height, info.width, info.height)
+
+
 def _punch_spans(
     punch_in: tuple[float, float, float] | Sequence[tuple[float, float, float]] | None,
 ) -> list[tuple[float, float, float]]:
@@ -383,13 +498,29 @@ def _punch_spans(
     return [span for span in punch_in if span]  # type: ignore[misc]
 
 
+#: Fade at both ends of every audio piece: a cut mid-waveform clicks, and
+#: dead-air removal makes many cuts. 15 ms is inaudible as a fade.
+EDGE_FADE_S = 0.015
+
+
+def _edge_fades(duration: float) -> str:
+    """',afade=in…,afade=out…' for a piece of ``duration`` seconds ('' if too short)."""
+    if duration <= EDGE_FADE_S * 4:
+        return ""
+    out_at = duration - EDGE_FADE_S
+    fade = f"d={EDGE_FADE_S}:curve=tri"
+    return f",afade=t=in:{fade},afade=t=out:st={out_at:.4f}:{fade}"
+
+
 def _audio_only_graph(keeps: list[Keep], *, seek_s: float, tail: str) -> str:
     parts: list[str] = []
     labels: list[str] = []
     for i, keep in enumerate(keeps):
         a = max(0.0, keep.start - seek_s)
         b = max(a + 0.01, keep.end - seek_s)
-        parts.append(f"[0:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(
+            f"[0:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS{_edge_fades(b - a)}[a{i}]"
+        )
         labels.append(f"[a{i}]")
     parts.append(f"{''.join(labels)}concat=n={len(keeps)}:v=0:a=1[acat]")
     parts.append(f"[acat]{tail}[aout]")
@@ -412,7 +543,7 @@ def measure_loudnorm(
         tail=shared_edit.measure_filter(target=target, true_peak=true_peak),
     )
     return shared_edit.measure_loudnorm(
-        ["-ss", f"{seek_s:.4f}", "-t", f"{span_s:.4f}", "-i", str(source)], graph
+        [*DEEP_PROBE, "-ss", f"{seek_s:.4f}", "-t", f"{span_s:.4f}", "-i", str(source)], graph
     )
 
 
@@ -447,6 +578,11 @@ class Extras:
     flash_forward_s: float = 2.0
     #: A variant's own zoom pattern (0 = the original's).
     motion_seed: int = 0
+    #: "fit" or "split" (webcam on top, gameplay below; needs a found webcam).
+    layout: str = "fit"
+    #: A static caption box is added after the render: the hook title is left
+    #: out (the box carries it) and the reaction text moves above the box.
+    static_caption: bool = False
 
 
 @dataclass(frozen=True)
@@ -700,6 +836,9 @@ class RenderResult:
     watermarked: bool = False
     #: Output length of the flash-forward (0 = none).
     teaser_s: float = 0.0
+    #: Where the static caption box goes: ("bottom", y of its bottom edge),
+    #: just above the platform's bottom bar (the subtitles sit above it).
+    caption_anchor: tuple[str, int] = ("bottom", OUT_H - CAPTION_MARGIN_PX)
 
 
 def render(
@@ -766,7 +905,7 @@ def render(
     played = [teaser, *keeps] if teaser is not None else keeps
     duration = output_duration(played)
 
-    seek = max(0.0, min(k.start for k in played) - 1.0)
+    seek = max(0.0, min(k.start for k in played) - SEEK_PAD_S)
     span = max(k.end for k in played) - seek + 0.5
 
     workspace = job.work_dir
@@ -811,17 +950,29 @@ def render(
     keywords = gta_captions.clip_keywords(out_words, extras.keywords)
     if keywords:
         edits.append("key words")
+    split = _split_cam(job.section, local_start, local_end) if extras.layout == "split" else None
+    # The static caption box sits at the bottom, just above the platform's
+    # bottom bar; the subtitles move up to sit right above it.
+    anchor = ("bottom", OUT_H - CAPTION_MARGIN_PX)
+    subtitle_margin = CAPTION_MARGIN_PX
+    if extras.static_caption and job.hook_title.strip():
+        from .narrate import caption_png
+
+        box_h = caption_png(job.hook_title, workspace / "caption_box.png")[1]
+        subtitle_margin = CAPTION_MARGIN_PX + box_h + BOX_SUBTITLE_GAP_PX
     ass = write_subtitles(
         workspace / "captions.ass",
         out_words,
         style_key=style_key,
-        hook_title=job.hook_title,
+        hook_title="" if extras.static_caption else job.hook_title,
         title_s=title_s,
         duration_s=duration,
         reaction_text=extras.reaction_text,
         reaction_window=window,
         keywords=keywords,
         title_start_s=lead,
+        text_centre_y=STATIC_REACTION_Y if extras.static_caption else TEXT_CENTRE_Y,
+        caption_margin_px=subtitle_margin,
     )
     if extras.reaction_text.strip() and f"{REACTION_STYLE}," in ass.read_text(encoding="utf-8"):
         edits.append("reaction text")
@@ -837,6 +988,9 @@ def render(
     audio_filter = (
         loudnorm_filter(measured, target=loudness_lufs, true_peak=true_peak_db) + ",aresample=48000"
     )
+    if split is not None:
+        punches, motion = [], None
+        edits = [e for e in edits if e not in {"punch-in", "motion"}] + ["split layout"]
     graph = build_filtergraph(
         played,
         seek_s=seek,
@@ -846,6 +1000,7 @@ def render(
         punch_in=punches or None,
         watermark=watermark,
         motion=motion,
+        split=split,
     )
     logo_input = ["-i", str(watermark.path)] if watermark is not None else []
 
@@ -854,6 +1009,7 @@ def render(
 
     def args(video_args: list[str]) -> list[str]:
         return [
+            *DEEP_PROBE,
             "-ss",
             f"{seek:.4f}",
             "-t",
@@ -927,6 +1083,7 @@ def render(
         edits=edits,
         watermarked=watermark is not None,
         teaser_s=round(lead, 3),
+        caption_anchor=anchor,
     )
 
 

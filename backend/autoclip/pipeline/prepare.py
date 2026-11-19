@@ -90,6 +90,47 @@ class Loudness:
         )
 
 
+#: Look far enough into a file to find an audio track that starts late
+#: (``analyzeduration`` is in microseconds: 100 s).
+DEEP_PROBE = ("-analyzeduration", "100M", "-probesize", "100M")
+
+
+def audio_lead_s(source: Path) -> float:
+    """Seconds the first audio starts after the file's start (0 if unknown)."""
+    try:
+        result = subprocess.run(  # noqa: S603
+            [
+                ffmpeg.ffprobe_path(),
+                "-v",
+                "error",
+                *DEEP_PROBE,
+                "-show_entries",
+                "format=start_time:stream=codec_type,start_time",
+                "-of",
+                "json",
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        import json
+
+        data = json.loads(result.stdout or "{}")
+        file_start = float(data.get("format", {}).get("start_time"))
+        audio = [
+            float(s["start_time"])
+            for s in data.get("streams", [])
+            if s.get("codec_type") == "audio" and s.get("start_time") not in (None, "N/A")
+        ]
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        return 0.0
+    if not audio:
+        return 0.0
+    return max(0.0, min(audio) - file_start)
+
+
 def extract_audio(
     source: Path,
     destination: Path,
@@ -108,12 +149,19 @@ def extract_audio(
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.stem + ".partial.wav")
+    lead = audio_lead_s(source)
+    # Word times are read against the file's start: an audio track that
+    # starts late (live capture after a reconnect) is padded with silence so
+    # second N of the WAV is second N of the video.
+    pad = ["-af", f"adelay={round(lead * 1000)}:all=1"] if lead > 0.02 else []
     try:
         ffmpeg.run(
             [
+                *DEEP_PROBE,
                 "-i",
                 str(source),
                 "-vn",
+                *pad,
                 "-ac",
                 "1",
                 "-ar",

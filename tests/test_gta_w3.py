@@ -460,7 +460,10 @@ class TestStageRender:
         monkeypatch.setattr(qa, "face_ratio", lambda *a, **k: 0.9)
         monkeypatch.setattr(pipeline, "load_settings", lambda: _app_settings())
         monkeypatch.setattr(pipeline, "output_root", lambda: tmp_path / "exports")
-        out = pipeline.stage_render(variant, stream, _reporter(stream), GtaSettings())
+        # Hook drawn by the subtitles (no static caption box), so it shows in the .ass.
+        out = pipeline.stage_render(
+            variant, stream, _reporter(stream), GtaSettings(static_caption=False)
+        )
         assert out["qa"]["passed"], out["qa"]
         ass = (pipeline.Workspace(stream.id).render_dir(variant.id) / "captions.ass").read_text(
             encoding="utf-8"

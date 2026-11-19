@@ -228,6 +228,12 @@ Optional uploads go out through the official YouTube and Instagram APIs using yo
 
 Detection runs on your configured LLM provider (Ollama still supported), per-stream judge budgets cap the spend, and everything the loop does is bounded: rolling buffers (5 min / 512 MB per stream), a clip queue that drops overflow with a recorded reason, and a global disk ceiling. See [docs/LIVE_WATCH.md](docs/LIVE_WATCH.md) for the full loop, settings, and — honestly — what is verified so far and what isn't yet.
 
+### GTA Mode caption box and narrator
+
+GTA clips get a white caption box near the bottom and an AI narrator (free
+Microsoft neural voice via `edge-tts`, or Kokoro offline). Setup and settings:
+[docs/GTA_NARRATOR.md](docs/GTA_NARRATOR.md).
+
 ## Troubleshooting
 
 Everything here is a real failure hit during development, not hypothetical.

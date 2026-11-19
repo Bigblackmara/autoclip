@@ -280,11 +280,18 @@ export const gtaApi = {
   retry: (id: string) => request<GtaStream>(`/api/gta/streams/${id}/retry`, { method: 'POST' }),
   remove: (id: string) => request<void>(`/api/gta/streams/${id}`, { method: 'DELETE' }),
   clips: () => request<GtaClip[]>('/api/gta/clips'),
+  aiUsage: () => request<AiUsage>('/api/gta/ai-usage'),
+  postNow: (clipId: string, title: string, publishAt?: string) =>
+    request<{ outcome: string; upload: GtaUpload | null; message: string }>(`/api/gta/clips/${clipId}/post-now`, {
+      method: 'POST',
+      body: JSON.stringify(publishAt ? { title, publish_at: publishAt } : { title }),
+    }),
   videoUrl: (clipId: string) => `/api/gta/clips/${clipId}/video`,
   logoUrl: (version: string) => `/api/gta/logo?v=${encodeURIComponent(version)}`,
   startLive: (url: string) =>
     request<GtaStream>('/api/gta/live', { method: 'POST', body: JSON.stringify({ url }) }),
   stopLive: (id: string) => request<GtaStream>(`/api/gta/live/${id}/stop`, { method: 'POST' }),
+  judgeNow: (id: string) => request<{ queued: boolean }>(`/api/gta/live/${id}/judge-now`, { method: 'POST' }),
   settings: () => request<GtaSettings>('/api/gta/settings'),
   saveSettings: (patch: Partial<GtaSettings>) =>
     request<GtaSettings>('/api/gta/settings', { method: 'PUT', body: JSON.stringify(patch) }),
@@ -401,3 +408,30 @@ export const LIVE_RUNNING: ReadonlySet<StreamStatus> = new Set<StreamStatus>([
   'live_connecting',
   'live_watching',
 ])
+
+export interface AiUsageCounters {
+  calls: number
+  errors: number
+  rate_limited: number
+  tokens_in: number
+  tokens_out: number
+  audio_s: number
+}
+
+export interface AiUsageKey {
+  label: string
+  host: string
+  today: AiUsageCounters
+  total: AiUsageCounters
+  limits: Record<string, Record<string, string | number>>
+  resting_s: number
+  resting_kind: string
+  last_at: number | null
+  last_error: { at: number; kind: string; text: string } | null
+}
+
+export interface AiUsage {
+  day: string
+  now: number
+  keys: AiUsageKey[]
+}
